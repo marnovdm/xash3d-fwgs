@@ -50,6 +50,7 @@ void Test_RunBmodel( void );
 void Test_RunTitles( void );
 void Test_RunVRUsercmdSidecar( void );
 void Test_RunVRInputPolicy( void );
+void Test_RunConfig( void );
 
 #define TEST_LIST_0 \
 	Test_RunLibCommon(); \
@@ -69,7 +70,8 @@ void Test_RunVRInputPolicy( void );
 	Test_RunGamma();
 
 #define TEST_LIST_1 \
-	Test_RunImagelib();
+	Test_RunImagelib(); \
+	Test_RunConfig();
 
 #define TEST_LIST_1_CLIENT \
 	Test_RunVOX(); \
