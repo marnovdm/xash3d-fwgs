@@ -206,6 +206,7 @@ static cvar_t *vr_mirror_eye;
 static cvar_t *vr_hud_hands;
 static cvar_t *vr_hud_hand_scale;
 static cvar_t *vr_hud_hand_tilt;
+static cvar_t *vr_hud_hand_yaw;
 static cvar_t *vr_hud_rect[GL_OPENXR_HUD_BOX_COUNT];
 static cvar_t *vr_hud_offset[GL_OPENXR_HAND_HUD_COUNT];
 
@@ -232,8 +233,10 @@ void GL_OpenXRInit( void )
 		"show health/suit on the off hand and ammo on the weapon hand instead of on the head-locked HUD" );
 	vr_hud_hand_scale = gEngfuncs.Cvar_Get( "vr_hud_hand_scale", "0.0005", FCVAR_ARCHIVE,
 		"hand HUD size: metres per HUD pixel (0.0005 = HUD digits about 1.2 cm tall)" );
-	vr_hud_hand_tilt = gEngfuncs.Cvar_Get( "vr_hud_hand_tilt", "-40", FCVAR_ARCHIVE,
+	vr_hud_hand_tilt = gEngfuncs.Cvar_Get( "vr_hud_hand_tilt", "-45", FCVAR_ARCHIVE,
 		"hand HUD panel tilt in degrees about the controller's sideways axis (negative = face more upwards)" );
+	vr_hud_hand_yaw = gEngfuncs.Cvar_Get( "vr_hud_hand_yaw", "90", FCVAR_ARCHIVE,
+		"hand HUD panels turned inwards in degrees, mirrored per hand (90 = facing your body, like a watch)" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0 0.06 0.02", FCVAR_ARCHIVE,
 		"health/suit panel position relative to the off-hand grip, metres: right up back" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_offset", "0 0.05 0.08", FCVAR_ARCHIVE,
@@ -1937,6 +1940,9 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	const uint32_t slot = xr.hud.width / GL_OPENXR_HAND_HUD_COUNT;
 	float metres = bound( 0.00005f, vr_hud_hand_scale->value, 0.005f );
 	float tilt = DEG2RAD( bound( -90.0f, vr_hud_hand_tilt->value, 90.0f ));
+	/* inwards = towards +X (right) on the left hand, -X on the right hand */
+	float yaw = DEG2RAD( bound( -180.0f, vr_hud_hand_yaw->value, 180.0f )) * ( hand == REF_VR_HAND_LEFT ? 1.0f : -1.0f );
+	XrQuaternionf turn = { 0.0f, 0.0f, 0.0f, 1.0f }, lean = { 0.0f, 0.0f, 0.0f, 1.0f };
 	float offset[3] = { 0.0f, 0.0f, 0.0f };
 
 	if( !xr.hud.ready || !xr.hand_hud[index].valid || xr.actions.grip_spaces[hand] == XR_NULL_HANDLE )
@@ -1950,10 +1956,13 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	quad->subImage.imageRect.offset.x = index * slot;
 	quad->subImage.imageRect.extent.width = xr.hand_hud[index].width;
 	quad->subImage.imageRect.extent.height = xr.hand_hud[index].height;
-	/* grip space: +X right, +Y up, -Z forward along the controller; the quad faces +Z (back towards you),
-	 * tilted about X so it faces up towards your eyes when the controller is held in front of you */
-	quad->pose.orientation.x = sinf( tilt * 0.5f );
-	quad->pose.orientation.w = cosf( tilt * 0.5f );
+	/* grip space: +X right, +Y up, -Z forward along the controller. The quad faces +Z (back towards you); it is
+	 * tilted about X to face upwards, then turned about Y towards your body (yaw after tilt keeps "up") */
+	lean.x = sinf( tilt * 0.5f );
+	lean.w = cosf( tilt * 0.5f );
+	turn.y = sinf( yaw * 0.5f );
+	turn.w = cosf( yaw * 0.5f );
+	quad->pose.orientation = GL_OpenXRQuatMultiply( turn, lean );
 	quad->pose.position.x = bound( -0.5f, offset[0], 0.5f );
 	quad->pose.position.y = bound( -0.5f, offset[1], 0.5f );
 	quad->pose.position.z = bound( -0.5f, offset[2], 0.5f );
