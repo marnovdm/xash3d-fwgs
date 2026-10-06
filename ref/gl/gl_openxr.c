@@ -1874,7 +1874,7 @@ static void GL_OpenXRCaptureHandHUD( void )
 	}
 	if( !any )
 		return;
-	/* panel content = its boxes stacked, scaled uniformly (in HUD pixels) to fit the slot */
+	/* panel content = its boxes stacked, stretched to fill the slot */
 	for( int p = 0; p < GL_OPENXR_HAND_HUD_COUNT; ++p )
 	{
 		int width = 0, height = 0;
@@ -1888,12 +1888,15 @@ static void GL_OpenXRCaptureHandHUD( void )
 		}
 		if( width <= 0 || height <= 0 )
 			continue;
-		scale[p] = Q_min( (float)slot / width, (float)xr.hud.height / height );
+		/* stretched to fill the whole slot: SteamVR counts imageRect from the top, our content was at the
+		 * bottom (GL), so a short panel showed only empty texture. The quad's physical size (HUD pixels times
+		 * vr_hud_hand_scale) restores the aspect. */
+		scale[p] = (float)xr.hud.height / height;
 		xr.hand_hud[p].valid = true;
 		xr.hand_hud[p].hud_width = width;
 		xr.hand_hud[p].hud_height = height;
-		xr.hand_hud[p].width = (uint32_t)( width * scale[p] );
-		xr.hand_hud[p].height = (uint32_t)( height * scale[p] );
+		xr.hand_hud[p].width = slot;
+		xr.hand_hud[p].height = xr.hud.height;
 	}
 
 	if( !GL_OpenXRCheck( xrAcquireSwapchainImage( xr.hud.swapchain, &acquire_info, &xr.hud.image_index ),
@@ -1929,7 +1932,7 @@ static void GL_OpenXRCaptureHandHUD( void )
 				continue;
 			y0 = (int)( top - sizes[b][1] * scale[p] );
 			pglBlitFramebuffer( rects[b][0], rects[b][1], rects[b][2], rects[b][3],
-				x0, y0, x0 + (int)( sizes[b][0] * scale[p] ), y1, GL_COLOR_BUFFER_BIT, GL_LINEAR );
+				x0, y0, x0 + (int)( slot * (float)sizes[b][0] / xr.hand_hud[p].hud_width ), y1, GL_COLOR_BUFFER_BIT, GL_LINEAR );
 			top = y0;
 		}
 	}
