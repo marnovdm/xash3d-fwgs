@@ -1966,7 +1966,7 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	XrQuaternionf turn = { 0.0f, 0.0f, 0.0f, 1.0f }, lean = { 0.0f, 0.0f, 0.0f, 1.0f };
 	float offset[3] = { 0.0f, 0.0f, 0.0f };
 
-	XrQuaternionf orientation;
+	XrQuaternionf orientation, frame;
 	XrVector3f along;
 
 	if( !xr.hud.ready || !xr.hand_hud[index].valid || !xr.hand_pose[hand].grip_valid || !xr.hand_pose[hand].aim_valid )
@@ -1994,11 +1994,20 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 		const XrQuaternionf flip = { 0.0f, 0.0f, 1.0f, 0.0f };
 		orientation = GL_OpenXRQuatMultiply( orientation, flip );
 	}
-	quad->pose.orientation = GL_OpenXRQuatMultiply( xr.hand_pose[hand].aim.orientation, orientation );
+	/* the weapon hand follows the gun model, which the client points vr_weapon_pitchadjust degrees off the
+	 * controller (-20 = 20 degrees down; skipped there only for two-handed aim) */
+	frame = xr.hand_pose[hand].aim.orientation;
+	if( index == GL_OPENXR_HAND_HUD_AMMO )
+	{
+		const float adjust = DEG2RAD( bound( -90.0f, gEngfuncs.pfnGetCvarFloat( "vr_weapon_pitchadjust" ), 90.0f ));
+		const XrQuaternionf pitch = { sinf( adjust * 0.5f ), 0.0f, 0.0f, cosf( adjust * 0.5f ) };
+		frame = GL_OpenXRQuatMultiply( frame, pitch );
+	}
+	quad->pose.orientation = GL_OpenXRQuatMultiply( frame, orientation );
 	along.x = bound( -0.5f, offset[0], 0.5f );
 	along.y = bound( -0.5f, offset[1], 0.5f );
 	along.z = bound( -0.5f, offset[2], 0.5f );
-	along = GL_OpenXRRotateVector( xr.hand_pose[hand].aim.orientation, along );
+	along = GL_OpenXRRotateVector( frame, along );
 	quad->pose.position.x = xr.hand_pose[hand].grip.position.x + along.x;
 	quad->pose.position.y = xr.hand_pose[hand].grip.position.y + along.y;
 	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
