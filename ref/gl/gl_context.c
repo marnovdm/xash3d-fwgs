@@ -583,4 +583,5 @@ const ref_interface_t gReffuncs =
 	GL_OpenXREndUI,
 	GL_OpenXRFrameEnd,
 	GL_OpenXRHaptic,
+	GL_OpenXRDrawEyeFade,
 };

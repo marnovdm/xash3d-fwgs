@@ -349,6 +349,11 @@ static int Host_CalcSleep( void )
 		return host_sleeptime.value;
 	}
 
+	/* VR: the desktop window's focus is irrelevant (launched from the headset it often never gets
+	 * it); throttling to 20 ms frames starved the headset, e.g. in the main menu */
+	if( Cvar_VariableValue( "vr_enable" ) != 0.0f )
+		return host_sleeptime.value;
+
 	switch( host.status )
 	{
 	case HOST_NOFOCUS:

@@ -22,6 +22,12 @@ static CVAR_DEFINE_AUTO( vr_comfort_moving, "0", 0, "whether VR locomotion is ac
 static CVAR_DEFINE_AUTO( vr_turn_angle, "45", FCVAR_ARCHIVE, "snap-turn angle, or smooth-turn speed basis" );
 static CVAR_DEFINE_AUTO( vr_smoothturn, "0", FCVAR_ARCHIVE, "use continuous turning instead of snap turning" );
 static CVAR_DEFINE_AUTO( vr_walkdirection, "1", FCVAR_ARCHIVE, "movement direction: 0 off-hand, 1 head" );
+static CVAR_DEFINE_AUTO( vr_swap_jumpduck, "1", FCVAR_ARCHIVE, "1: primary (Cross/A) jumps, secondary (Circle/B) ducks, like HL2VR; 0: Lambda1VR layout" );
+static CVAR_DEFINE_AUTO( vr_weapon_stick_threshold, "0.85", FCVAR_ARCHIVE, "stick deflection (0-1) that opens/steps the weapon menu; must also be mostly vertical" );
+static CVAR_DEFINE_AUTO( vr_ladder_aim, "0", FCVAR_ARCHIVE, "ladder climb direction: 0 look up/down (head), 1 point the off-hand controller" );
+static CVAR_DEFINE_AUTO( vr_weapon_stick_hold, "0.15", FCVAR_ARCHIVE, "seconds the stick must be held up/down to OPEN the weapon menu (steps inside it are immediate)" );
+static CVAR_DEFINE_AUTO( vr_laser_doubleclick, "0.35", FCVAR_ARCHIVE, "max seconds between the two off-hand stick clicks that cycle the laser sight (or scope smoothing); one click is use" );
+static CVAR_DEFINE_AUTO( vr_notify, "0", FCVAR_ARCHIVE, "show console notify lines (top left) over the VR HUD" );
 static CVAR_DEFINE_AUTO( vr_reloadtimeoutms, "200", FCVAR_ARCHIVE, "maximum squeeze tap duration used for reload" );
 static CVAR_DEFINE_AUTO( vr_enable_crouching, "0.85", FCVAR_ARCHIVE,
 	"physical crouch standing-height multiplier; active from 0 to 0.98" );
@@ -33,10 +39,10 @@ static CVAR_DEFINE_AUTO( vr_gesture_triggered_use, "1", FCVAR_ARCHIVE, "reach aw
 static CVAR_DEFINE_AUTO( vr_use_gesture_boundary, "0.35", FCVAR_ARCHIVE, "horizontal use-gesture boundary in metres" );
 static CVAR_DEFINE_AUTO( vr_controller_tracking_haptic, "1", FCVAR_ARCHIVE, "haptic feedback for tracked interaction boundaries" );
 static CVAR_DEFINE_AUTO( vr_backpack_weapon, "weapon_crowbar", FCVAR_ARCHIVE, "weapon selected by the dominant-hand backpack gesture" );
-static CVAR_DEFINE_AUTO( vr_lasersight, "0", FCVAR_ARCHIVE, "laser sight mode" );
+static CVAR_DEFINE_AUTO( vr_lasersight, "1", FCVAR_ARCHIVE, "laser sight mode" );
 static CVAR_DEFINE_AUTO( vr_mirror_weapons, "0", FCVAR_ARCHIVE, "mirror weapon viewmodels for left-handed use" );
 static CVAR_DEFINE_AUTO( vr_weapon_backface_culling, "0", FCVAR_ARCHIVE, "enable back-face culling on weapon viewmodels" );
-static CVAR_DEFINE_AUTO( vr_height_adjust, "0", FCVAR_ARCHIVE, "additional VR eye height in metres" );
+static CVAR_DEFINE_AUTO( vr_height_adjust, "0.1", FCVAR_ARCHIVE, "additional VR eye height in metres" );
 static CVAR_DEFINE_AUTO( vr_headtorch, "0", FCVAR_ARCHIVE, "attach the flashlight beam to the HMD" );
 static CVAR_DEFINE_AUTO( vr_reversetorch, "0", FCVAR_ARCHIVE, "reverse the tracked flashlight direction" );
 
@@ -67,6 +73,12 @@ static qboolean vr_physical_crouched;
 static double vr_last_jump_press;
 static qboolean vr_selecting_weapon;
 static qboolean vr_confirm_attack_release;
+static qboolean vr_stick_selecting; /* stick opened the HUD weapon menu (schemes 0/2) */
+static qboolean vr_weapon_trigger_down;
+static qboolean vr_offhand_stick_chord; /* both sticks down during this off-hand click: menu chord */
+static double vr_offhand_stick_since; /* when the current off-hand click went down, 0 when up */
+static double vr_offhand_stick_last; /* press time of the previous plain off-hand click, 0 = none */
+static qboolean vr_offhand_stick_second; /* the current click came within vr_laser_doubleclick of the last */
 static int vr_weapon_scroll_count;
 static qboolean vr_scope_zoom_latched;
 static qboolean vr_menu_active;
@@ -82,6 +94,74 @@ static float vr_body_view_yaw;
 static qboolean vr_body_view_valid;
 
 static void CL_VRTransformVector( const vec3_t in, const ref_vr_pose_t *origin, vec3_t out );
+
+/* Standing eye height assumed for physical crouch: OpenXR LOCAL space has its origin at
+ * head height, not on the floor, so only the drop below the recentre height is known. */
+#define VR_ASSUMED_STANDING_HEIGHT 1.7f
+
+/* The recentre reference keeps only the head's yaw. Keeping its pitch/roll would tilt the
+ * whole world for the session whenever the head was not level at the moment of recentring. */
+static void CL_VRFlattenPose( ref_vr_pose_t *pose )
+{
+	vec3_t forward;
+	float length;
+
+	VectorSet( forward, pose->forward[0], pose->forward[1], 0.0f );
+	length = VectorNormalizeLength( forward );
+	if( length < 0.1f ) /* looking straight up or down: take the heading from the right vector */
+	{
+		VectorSet( forward, -pose->right[1], pose->right[0], 0.0f );
+		VectorNormalize( forward );
+	}
+	VectorCopy( forward, pose->forward );
+	VectorSet( pose->right, forward[1], -forward[0], 0.0f );
+	VectorSet( pose->up, 0.0f, 0.0f, 1.0f );
+}
+
+static void CL_VRRelativePose( const ref_vr_pose_t *pose, const ref_vr_pose_t *origin, ref_vr_pose_t *out );
+
+/* Debug: where a tilted horizon could come from (recentre reference, raw head, body view angles). */
+static void CL_VRPoseInfo_f( void )
+{
+	vec3_t angles;
+	ref_vr_pose_t relative;
+
+	Con_Printf( "cl.viewangles (body) %.1f %.1f %.1f\n", cl.viewangles[PITCH], cl.viewangles[YAW], cl.viewangles[ROLL] );
+	if( !vr_center_valid || !FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ))
+	{
+		Con_Printf( "no valid VR centre/head\n" );
+		return;
+	}
+	VectorsAngles( vr_center.forward, vr_center.right, vr_center.up, angles );
+	Con_Printf( "centre angles %.1f %.1f %.1f pos %.2f %.2f %.2f\n", angles[PITCH], angles[YAW], angles[ROLL],
+		vr_center.position[0], vr_center.position[1], vr_center.position[2] );
+	VectorsAngles( vr_frame.head.forward, vr_frame.head.right, vr_frame.head.up, angles );
+	Con_Printf( "raw head (LOCAL space) %.1f %.1f %.1f pos %.2f %.2f %.2f\n", angles[PITCH], angles[YAW], angles[ROLL],
+		vr_frame.head.position[0], vr_frame.head.position[1], vr_frame.head.position[2] );
+	CL_VRRelativePose( &vr_frame.head, &vr_center, &relative );
+	VectorsAngles( relative.forward, relative.right, relative.up, angles );
+	Con_Printf( "head rel. to centre %.1f %.1f %.1f\n", angles[PITCH], angles[YAW], angles[ROLL] );
+}
+
+/* Debug: pulse both controllers so haptics can be tested without game events. */
+static void CL_VRTestHaptic_f( void )
+{
+	float amplitude = Cmd_Argc() > 1 ? Q_atof( Cmd_Argv( 1 )) : 1.0f;
+	float frequency = Cmd_Argc() > 2 ? Q_atof( Cmd_Argv( 2 )) : 0.0f;
+
+	for( int hand = 0; hand < REF_VR_MAX_HANDS; ++hand )
+	{
+		/* stop first: a previous pulse would otherwise make this one a no-op */
+		CL_VRHaptic( hand, 0.0f, 0.0f, 0.0f );
+		Con_Printf( "vr_testhaptic: hand %d amplitude %.2f frequency %.0f -> %s\n", hand, amplitude, frequency,
+			CL_VRHaptic( hand, 0.5f, frequency, amplitude ) ? "accepted" : "FAILED" );
+	}
+}
+
+static void CL_VRRecenter_f( void )
+{
+	vr_center_valid = false; /* the next valid head pose becomes the new reference */
+}
 
 void CL_VRRegisterCvars( void )
 {
@@ -105,8 +185,17 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_mirror_weapons );
 	Cvar_RegisterVariable( &vr_weapon_backface_culling );
 	Cvar_RegisterVariable( &vr_height_adjust );
+	Cvar_RegisterVariable( &vr_swap_jumpduck );
+	Cvar_RegisterVariable( &vr_ladder_aim );
+	Cvar_RegisterVariable( &vr_weapon_stick_hold );
+	Cvar_RegisterVariable( &vr_laser_doubleclick );
+	Cvar_RegisterVariable( &vr_notify );
+	Cvar_RegisterVariable( &vr_weapon_stick_threshold );
 	Cvar_RegisterVariable( &vr_headtorch );
 	Cvar_RegisterVariable( &vr_reversetorch );
+	Cmd_AddCommand( "vr_poseinfo", CL_VRPoseInfo_f, "print VR head/centre/body angles (tilt debugging)" );
+	Cmd_AddCommand( "vr_testhaptic", CL_VRTestHaptic_f, "pulse both controllers for 0.5 s: vr_testhaptic [amplitude 0-1] [frequency Hz]" );
+	Cmd_AddCommand( "vr_recenter", CL_VRRecenter_f, "make the current head position and heading the VR reference" );
 }
 
 static qboolean CL_VRHandPosition( int hand, vec3_t position )
@@ -169,7 +258,8 @@ static void CL_VRUpdatePhysicalCrouch( void )
 		return;
 	}
 	vr_physical_crouched = CL_VRPhysicalCrouchState( vr_physical_crouched, vr_enable_crouching.value,
-		vr_center.position[2], vr_frame.head.position[2] );
+		VR_ASSUMED_STANDING_HEIGHT,
+		VR_ASSUMED_STANDING_HEIGHT - ( vr_center.position[2] - vr_frame.head.position[2] ));
 }
 
 static qboolean CL_VRUseGesture( int hand )
@@ -240,6 +330,12 @@ static void CL_VRResetInputState( qboolean release_menu )
 	vr_last_jump_press = 0.0;
 	vr_selecting_weapon = false;
 	vr_confirm_attack_release = false;
+	vr_stick_selecting = false;
+	vr_weapon_trigger_down = false;
+	vr_offhand_stick_chord = false;
+	vr_offhand_stick_since = 0.0;
+	vr_offhand_stick_last = 0.0;
+	vr_offhand_stick_second = false;
 	vr_weapon_scroll_count = 0;
 	vr_scope_zoom_latched = false;
 	vr_menu_active = false;
@@ -362,6 +458,15 @@ void CL_VRFrameBegin( void )
 		return;
 	}
 
+	{
+		/* menu/console open: tell the renderer to keep the UI panel fixed in the room. Also while
+		 * a map loads/connects: the menu closes on "New game" and the panel (menu image / loading
+		 * plaque) used to snap to the head until the level was running. */
+		convar_t *ui_world = Cvar_FindVar( "vr_ui_world" );
+		const qboolean want = CL_VRUIActive() || cls.state != ca_active || cls.disable_screen != 0.0f;
+		if( ui_world && ( ui_world->value != 0.0f ) != want )
+			Cvar_DirectSet( ui_world, want ? "1" : "0" );
+	}
 	vr_frame_begun = ref.dllFuncs.R_VRFrameBegin( &vr_frame );
 	if( !vr_frame_begun || !FBitSet( vr_frame.flags, REF_VR_FRAME_SESSION_ACTIVE ))
 	{
@@ -372,10 +477,32 @@ void CL_VRFrameBegin( void )
 		return;
 	}
 
+	/* VR session is running from here on (CL_VRIsActive() is false before R_VRFrameBegin) */
+	{
+		/* SDL also sees the Sense controllers as a gamepad: its look/move axes and button binds
+		 * would act on top of the VR controls (right stick up/down pitched the body). */
+		convar_t *joy = Cvar_FindVar( "joy_enable" );
+		if( joy && joy->value != 0.0f )
+		{
+			Cvar_DirectSet( joy, "0" );
+			Con_Printf( "VR: SDL gamepad input disabled (joy_enable 0); the VR controllers are read via OpenXR\n" );
+		}
+	}
+	{
+		/* the desktop window rarely has focus in VR; muting on focus loss silenced the game */
+		convar_t *mute = Cvar_FindVar( "snd_mute_losefocus" );
+		if( mute && mute->value != 0.0f )
+		{
+			Cvar_DirectSet( mute, "0" );
+			Con_Printf( "VR: snd_mute_losefocus 0 (sound keeps playing when the desktop window loses focus)\n" );
+		}
+	}
+
 	if( FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ) &&
 		( !vr_center_valid || FBitSet( vr_frame.flags, REF_VR_FRAME_REFERENCE_CHANGED )))
 	{
 		vr_center = vr_frame.head;
+		CL_VRFlattenPose( &vr_center );
 		vr_center_valid = true;
 		vr_previous_head_valid = false;
 		VectorClear( vr_head_delta );
@@ -435,6 +562,12 @@ void CL_VRFrameBegin( void )
 	menu = (( vr_frame.hands[0].buttons | vr_frame.hands[1].buttons ) & REF_VR_BUTTON_MENU ) != 0 ||
 		( FBitSet( vr_frame.hands[0].buttons, REF_VR_BUTTON_STICK ) &&
 		FBitSet( vr_frame.hands[1].buttons, REF_VR_BUTTON_STICK ));
+	/* the menu chord is two stick clicks: mark it here, before the UI early return below, so the
+	 * off-hand release afterwards is not taken as an L3 laser toggle (the menu opens/closes a
+	 * frame later, and the stick-up frames were never seen by the chord check further down) */
+	if( FBitSet( vr_frame.hands[0].buttons, REF_VR_BUTTON_STICK ) &&
+		FBitSet( vr_frame.hands[1].buttons, REF_VR_BUTTON_STICK ))
+		vr_offhand_stick_chord = true;
 	if( menu != old_menu ) Key_Event( K_ESCAPE, menu );
 	vr_menu_active = menu;
 	if( CL_VRUIActive() )
@@ -463,19 +596,41 @@ void CL_VRFrameBegin( void )
 			vr_previous_buttons[i] = vr_frame.hands[i].buttons;
 		return;
 	}
-	/* Lambda1VR assigns the off-hand stick click to the laser sight while
-	 * unscoped, and to scope smoothing while scoped. Do not also toggle it
-	 * when both stick clicks are being used as the desktop menu fallback. */
-	if( !( old_offhand_buttons & REF_VR_BUTTON_STICK ) &&
-		FBitSet( vr_frame.hands[offhand].buttons, REF_VR_BUTTON_STICK ) &&
-		!FBitSet( vr_frame.hands[dominant].buttons, REF_VR_BUTTON_STICK ))
+	/* The off-hand stick click is use from the off hand (like R3 for the dominant hand, see the
+	 * +use2 block below); a double click cycles the laser sight while unscoped, or scope smoothing
+	 * while scoped (Lambda1VR used a single click for that). The toggle is decided on the second
+	 * release and skipped if the dominant stick went down during either click: the two sticks of
+	 * the menu chord never go down in the same frame. */
+	if( FBitSet( vr_frame.hands[offhand].buttons, REF_VR_BUTTON_STICK ))
 	{
-		if( Cvar_VariableValue( "vr_scope_engaged" ) != 0.0f )
-			Cvar_SetValue( "vr_scope_stabilise",
-				Cvar_VariableValue( "vr_scope_stabilise" ) == 0.0f ? 1.0f : 0.0f );
-		else
-			Cvar_SetValue( vr_lasersight.name, (int)( vr_lasersight.value + 1.0f ) % 3 );
+		if( FBitSet( vr_frame.hands[dominant].buttons, REF_VR_BUTTON_STICK ))
+			vr_offhand_stick_chord = true;
+		if( vr_offhand_stick_since == 0.0 )
+		{
+			vr_offhand_stick_since = host.realtime;
+			vr_offhand_stick_second = vr_offhand_stick_last != 0.0 &&
+				host.realtime - vr_offhand_stick_last <= vr_laser_doubleclick.value;
+		}
 	}
+	else if( vr_offhand_stick_since != 0.0 )
+	{
+		if( vr_offhand_stick_chord )
+			vr_offhand_stick_last = 0.0;
+		else if( vr_offhand_stick_second )
+		{
+			vr_offhand_stick_last = 0.0;
+			if( Cvar_VariableValue( "vr_scope_engaged" ) != 0.0f )
+				Cvar_SetValue( "vr_scope_stabilise",
+					Cvar_VariableValue( "vr_scope_stabilise" ) == 0.0f ? 1.0f : 0.0f );
+			else
+				Cvar_SetValue( vr_lasersight.name, (int)( vr_lasersight.value + 1.0f ) % 3 );
+		}
+		else vr_offhand_stick_last = vr_offhand_stick_since;
+		vr_offhand_stick_chord = false;
+		vr_offhand_stick_since = 0.0;
+		vr_offhand_stick_second = false;
+	}
+	else vr_offhand_stick_chord = false; /* chord pressed and released while the menu was up */
 	if( vr_confirm_attack_release )
 	{
 		Cbuf_AddText( "-attack\n" );
@@ -549,10 +704,19 @@ void CL_VRFrameBegin( void )
 	{
 		if( !( old_offhand_buttons & REF_VR_BUTTON_PRIMARY ) &&
 			( vr_frame.hands[offhand].buttons & REF_VR_BUTTON_PRIMARY ))
+		{
+			/* feedback: the gesture is done blind behind the shoulder */
 			Cbuf_AddText( "savequick\n" );
+			CL_VRHaptic( offhand, 0.0f, 0.0f, 0.0f );
+			CL_VRHaptic( offhand, 0.25f, 0.0f, 0.9f );
+		}
 		if( !( old_offhand_buttons & REF_VR_BUTTON_SECONDARY ) &&
 			( vr_frame.hands[offhand].buttons & REF_VR_BUTTON_SECONDARY ))
+		{
 			Cbuf_AddText( "loadquick\n" );
+			CL_VRHaptic( offhand, 0.0f, 0.0f, 0.0f );
+			CL_VRHaptic( offhand, 0.25f, 0.0f, 0.9f );
+		}
 	}
 	else
 	{
@@ -569,9 +733,14 @@ void CL_VRFrameBegin( void )
 			if( !( old_screen & REF_VR_BUTTON_SECONDARY ) &&
 				( vr_frame.hands[screen_hand].buttons & REF_VR_BUTTON_SECONDARY ))
 			{
-				vr_scoreboard_active = !vr_scoreboard_active;
+				/* multiplayer: scoreboard (Lambda1VR); single player has none, so the button
+				 * (left Triangle / Y) switches to the previous weapon instead */
 				if( cl.maxclients > 1 )
+				{
+					vr_scoreboard_active = !vr_scoreboard_active;
 					Cbuf_AddText( vr_scoreboard_active ? "+showscores\n" : "-showscores\n" );
+				}
+				else Cbuf_AddText( "lastinv\n" );
 			}
 		}
 	}
@@ -579,8 +748,9 @@ void CL_VRFrameBegin( void )
 	{
 		int jump_hand = variant == 2 ? offhand : dominant;
 		uint32_t old_jump = jump_hand == dominant ? old_dominant_buttons : old_offhand_buttons;
-		qboolean jump = FBitSet( vr_frame.hands[jump_hand].buttons, REF_VR_BUTTON_SECONDARY );
-		qboolean old_jump_pressed = FBitSet( old_jump, REF_VR_BUTTON_SECONDARY );
+		uint32_t jump_button = vr_swap_jumpduck.value ? REF_VR_BUTTON_PRIMARY : REF_VR_BUTTON_SECONDARY;
+		qboolean jump = FBitSet( vr_frame.hands[jump_hand].buttons, jump_button );
+		qboolean old_jump_pressed = FBitSet( old_jump, jump_button );
 
 		if( jump && !old_jump_pressed )
 		{
@@ -597,7 +767,9 @@ void CL_VRFrameBegin( void )
 	}
 
 	{
-		qboolean use = CL_VRUseGesture( offhand ) &&
+		qboolean click = FBitSet( vr_frame.hands[offhand].buttons, REF_VR_BUTTON_STICK ) &&
+			!vr_offhand_stick_chord;
+		qboolean use = ( click || CL_VRUseGesture( offhand )) &&
 			Cvar_VariableValue( "vr_weapon_stabilised" ) == 0.0f && Cmd_Exists( "+use2" );
 		if( use != vr_offhand_use_active )
 			Cbuf_AddText( use ? "+use2\n" : "-use2\n" );
@@ -634,23 +806,58 @@ void CL_VRFrameBegin( void )
 	else
 	{
 		int selector = variant == 2 ? offhand : dominant;
-		float threshold = variant == 2 ? 0.75f : 0.65f;
+		/* Deadzone: a deliberate, mostly vertical push opens the weapon menu; diagonal
+		 * pushes while turning or a stick resting near the threshold do not. The latch
+		 * only releases once the stick is back near the centre (hysteresis). */
+		float threshold = vr_weapon_stick_threshold.value;
 		float xaxis = vr_frame.hands[selector].stick[0];
 		float yaxis = vr_frame.hands[selector].stick[1];
-		qboolean choose = fabs( yaxis ) > threshold ||
-			( vr_turn_angle.value == 0.0f && fabs( xaxis ) > threshold );
+		qboolean choose = ( fabs( yaxis ) > threshold && fabs( yaxis ) > 2.0f * fabs( xaxis )) ||
+			( vr_turn_angle.value == 0.0f && fabs( xaxis ) > threshold && fabs( xaxis ) > 2.0f * fabs( yaxis ));
+		qboolean centred = fabs( xaxis ) < 0.3f && fabs( yaxis ) < 0.3f;
+		static double choose_since, last_step;
+
+		/* Opening the menu needs the push held for vr_weapon_stick_hold seconds, so brushing the
+		 * stick while turning/moving does not open it; once open, each push steps immediately. */
+		if( !choose ) choose_since = 0.0;
+		else if( choose_since == 0.0 ) choose_since = host.realtime;
+		if( vr_stick_selecting && host.realtime - last_step > 4.0 )
+			vr_stick_selecting = false;	/* menu may have closed some other way: require the hold again */
+		if( choose && !vr_stick_selecting && !vr_weapon_latched &&
+			host.realtime - choose_since < vr_weapon_stick_hold.value )
+			choose = false;
 
 		if( choose )
 		{
 			if( !vr_weapon_latched )
 			{
-				if( fabs( yaxis ) > threshold )
-					Cbuf_AddText( yaxis > 0.0f ? "invprev\n" : "invnext\n" );
-				else Cbuf_AddText( xaxis > 0.0f ? "invprevslot\n" : "invnextslot\n" );
+				/* stick up = next weapon, down = previous (user preference; Lambda1VR had it reversed) */
+				const char *select = fabs( yaxis ) > threshold ? ( yaxis > 0.0f ? "invnext\n" : "invprev\n" ) :
+					( xaxis > 0.0f ? "invprevslot\n" : "invnextslot\n" );
+				Cbuf_AddText( select );
 				vr_weapon_latched = true;
+				vr_stick_selecting = true;
+				last_step = host.realtime;
 			}
 		}
-		else vr_weapon_latched = false;
+		else if( centred ) vr_weapon_latched = false;
+	}
+
+	/* The HUD weapon menu confirms on the client's +attack key state
+	 * (CL_ButtonBits), which the trigger never touches: it only sets IN_ATTACK in
+	 * the usercmd. Confirm like scheme 1 does, and keep the trigger from also
+	 * firing until it is released. */
+	{
+		qboolean trigger_down = vr_frame.hands[dominant].trigger >= 0.55f;
+
+		if( variant != 1 && vr_stick_selecting && trigger_down && !vr_weapon_trigger_down )
+		{
+			Cbuf_AddText( "+attack\n" );
+			vr_confirm_attack_release = true;
+			vr_stick_selecting = false;
+			vr_ui_trigger_blocked = true;
+		}
+		vr_weapon_trigger_down = trigger_down;
 	}
 
 	for( int i = 0; i < REF_VR_MAX_HANDS; ++i )
@@ -719,7 +926,12 @@ void CL_VRApplyHeadPose( ref_viewpass_t *rvp )
 	VectorCopy( rvp->vieworigin, vr_body_view_origin );
 	vr_body_view_yaw = rvp->viewangles[YAW];
 	vr_body_view_valid = true;
-	AngleVectors( rvp->viewangles, body_forward, body_right, body_up );
+	{
+		/* the body carries the head pitch for gameplay (swimming, ladders); the view gets
+		 * pitch/roll from the head pose below, so compose with the body yaw only */
+		vec3_t body_angles = { 0.0f, rvp->viewangles[YAW], 0.0f };
+		AngleVectors( body_angles, body_forward, body_right, body_up );
+	}
 	VectorMA( rvp->vieworigin, vr_height_adjust.value * vr_worldscale.value, body_up, rvp->vieworigin );
 	VectorCopy( rvp->vieworigin, head_start );
 	VectorMA( head_start, relative.position[0] * vr_worldscale.value, body_forward, desired_origin );
@@ -780,12 +992,34 @@ static void CL_VROneControllerMoveAxis( const ref_vr_hand_t *weapon, float *x, f
 	*y = filtered * average_y;
 }
 
+/* Heading (degrees, relative to the recentre reference) the stick moves along: the off-hand
+ * controller or the head (vr_walkdirection). Shared by movement and the ladder direction so both
+ * use one frame. */
+static float CL_VRMoveHeading( const ref_vr_hand_t *move, int variant )
+{
+	ref_vr_pose_t relative;
+	vec3_t angles;
+
+	if( variant == 3 )
+		return 0.0f;
+	if( vr_walkdirection.value < 0.5f && FBitSet( move->flags, REF_VR_HAND_AIM_VALID ))
+		CL_VRRelativePose( &move->aim, &vr_center, &relative );
+	else if( FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ))
+		CL_VRRelativePose( &vr_frame.head, &vr_center, &relative );
+	else return 0.0f;
+	VectorsAngles( relative.forward, relative.right, relative.up, angles );
+	return angles[YAW];
+}
+
 void CL_VRAppendMove( float frametime, usercmd_t *cmd, qboolean active )
 {
 	int dominant, offhand, variant;
+	uint32_t duck_button;
 	ref_vr_hand_t *weapon, *move, *turn;
 	float x, y, heading, sine, cosine;
 	float forward_speed, side_speed;
+	float key_forward, key_side;
+	float stick_x, stick_y;
 	vec3_t head_delta;
 	ref_vr_pose_t relative_aim, relative_head;
 	vec3_t aim_angles, head_angles;
@@ -821,21 +1055,33 @@ void CL_VRAppendMove( float frametime, usercmd_t *cmd, qboolean active )
 		x = y = 0.0f;
 	Cvar_SetValue( vr_comfort_moving.name, fabs( x ) + fabs( y ) > 0.01f ||
 		( variant != 3 && vr_smoothturn.value && fabs( turn->stick[0] ) > 0.6f ) ? 1.0f : 0.0f );
-	heading = 0.0f;
-	if( variant != 3 && vr_walkdirection.value < 0.5f && FBitSet( move->flags, REF_VR_HAND_AIM_VALID ) &&
-		FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ))
+	/* cmd->viewangles carries only the body yaw (stick turning); the head yaw is applied
+	 * to the view alone. Rotate the stick into the head's (or off-hand's) heading. */
+	/* off-hand trigger = walk, like Shift on a keyboard: HL scales keyboard movement by
+	 * cl_movespeedkey in the client, which the VR stick bypasses (the IN_RUN bit set below does
+	 * nothing in movement code) */
+	stick_x = x;	/* movement buttons use the unscaled stick (ladders must work while walking) */
+	stick_y = y;
+	if( variant != 3 && move->trigger >= 0.55f )
 	{
-		CL_VRRelativePose( &move->aim, &vr_center, &relative_aim );
-		CL_VRRelativePose( &vr_frame.head, &vr_center, &relative_head );
-		VectorsAngles( relative_aim.forward, relative_aim.right, relative_aim.up, aim_angles );
-		VectorsAngles( relative_head.forward, relative_head.right, relative_head.up, head_angles );
-		heading = DEG2RAD( aim_angles[YAW] - head_angles[YAW] );
+		float walk = Cvar_VariableValue( "cl_movespeedkey" );
+		if( walk <= 0.0f || walk > 1.0f ) walk = 0.3f;
+		x *= walk;
+		y *= walk;
 	}
+	heading = DEG2RAD( CL_VRMoveHeading( move, variant ));
 	SinCos( heading, &sine, &cosine );
 	forward_speed = Cvar_VariableValue( "cl_forwardspeed" );
 	side_speed = Cvar_VariableValue( "cl_sidespeed" );
 	if( forward_speed <= 0.0f ) forward_speed = 400.0f;
 	if( side_speed <= 0.0f ) side_speed = 400.0f;
+	/* Movement buttons come from deliberate input only: keyboard (already in cmd) and the raw,
+	 * unrotated stick. They are all-or-nothing and ladders climb/strafe at full speed on them, so
+	 * deriving them from the head-rotated or room-scale totals pressed a strafe button whenever the
+	 * head was turned from the body (left while climbing, right while descending) or the player
+	 * swayed. The ladder direction uses the same heading as the stick (sidecar ladder yaw). */
+	key_forward = cmd->forwardmove;
+	key_side = cmd->sidemove;
 	cmd->sidemove += ( x * cosine - y * sine ) * side_speed;
 	cmd->forwardmove += ( y * cosine + x * sine ) * forward_speed;
 
@@ -861,10 +1107,10 @@ void CL_VRAppendMove( float frametime, usercmd_t *cmd, qboolean active )
 		}
 	}
 	ClearBits( cmd->buttons, IN_FORWARD | IN_BACK | IN_MOVERIGHT | IN_MOVELEFT );
-	if( cmd->forwardmove > 1.0f ) SetBits( cmd->buttons, IN_FORWARD );
-	else if( cmd->forwardmove < -1.0f ) SetBits( cmd->buttons, IN_BACK );
-	if( cmd->sidemove > 1.0f ) SetBits( cmd->buttons, IN_MOVERIGHT );
-	else if( cmd->sidemove < -1.0f ) SetBits( cmd->buttons, IN_MOVELEFT );
+	if( key_forward > 1.0f || stick_y > 0.3f ) SetBits( cmd->buttons, IN_FORWARD );
+	else if( key_forward < -1.0f || stick_y < -0.3f ) SetBits( cmd->buttons, IN_BACK );
+	if( key_side > 1.0f || stick_x > 0.3f ) SetBits( cmd->buttons, IN_MOVERIGHT );
+	else if( key_side < -1.0f || stick_x < -0.3f ) SetBits( cmd->buttons, IN_MOVELEFT );
 
 	if( variant == 3 )
 	{
@@ -884,8 +1130,9 @@ void CL_VRAppendMove( float frametime, usercmd_t *cmd, qboolean active )
 	}
 	if( CL_VRUseGesture( dominant ) && Cvar_VariableValue( "vr_weapon_stabilised" ) == 0.0f )
 		SetBits( cmd->buttons, IN_USE );
-	if(( variant == 3 ? vr_one_controller_duck_toggled : variant == 2 ? FBitSet( vr_frame.hands[offhand].buttons, REF_VR_BUTTON_PRIMARY ) :
-		FBitSet( weapon->buttons, REF_VR_BUTTON_PRIMARY )) || vr_quick_crouch )
+	duck_button = vr_swap_jumpduck.value ? REF_VR_BUTTON_SECONDARY : REF_VR_BUTTON_PRIMARY;
+	if(( variant == 3 ? vr_one_controller_duck_toggled : variant == 2 ? FBitSet( vr_frame.hands[offhand].buttons, duck_button ) :
+		FBitSet( weapon->buttons, duck_button )) || vr_quick_crouch )
 		SetBits( cmd->buttons, IN_DUCK );
 	if( variant == 3 && vr_one_controller_jump_time != 0.0 )
 	{
@@ -951,6 +1198,17 @@ void CL_VRAppendMove( float frametime, usercmd_t *cmd, qboolean active )
 		else if( fabs( x ) < 0.2f ) vr_turn_latched = false;
 	}
 
+	/* Body pitch = the headset's pitch, set every frame: HL swims and (with vr_ladder_aim 0) climbs
+	 * along the view pitch, and nothing else (mouse, SDL gamepad) can accumulate pitch any more.
+	 * The rendered view ignores body pitch (CL_VRApplyHeadPose), so it is not applied twice. */
+	cmd->viewangles[PITCH] = 0.0f;
+	if( FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ))
+	{
+		CL_VRRelativePose( &vr_frame.head, &vr_center, &relative_head );
+		VectorsAngles( relative_head.forward, relative_head.right, relative_head.up, head_angles );
+		cmd->viewangles[PITCH] = bound( -89.0f, head_angles[PITCH], 89.0f );
+	}
+	cmd->viewangles[ROLL] = 0.0f;
 	COM_NormalizeAngles( cmd->viewangles );
 	VectorCopy( cmd->viewangles, cl.viewangles );
 }
@@ -973,11 +1231,25 @@ void CL_VRBuildUsercmdSidecar( const usercmd_t *cmd, vr_usercmd_sidecar_t *sampl
 	support = dominant == REF_VR_HAND_LEFT ? REF_VR_HAND_RIGHT : REF_VR_HAND_LEFT;
 	offhand = &vr_frame.hands[support];
 	if( Cvar_VariableValue( "vr_controller_ladders" ) != 0.0f &&
-		FBitSet( offhand->flags, REF_VR_HAND_AIM_VALID ))
+		( vr_ladder_aim.value < 0.5f ? FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ) :
+		FBitSet( offhand->flags, REF_VR_HAND_AIM_VALID )))
 	{
-		CL_VRRelativePose( &offhand->aim, &vr_center, &relativeOffhand );
-		VectorsAngles( relativeOffhand.forward, relativeOffhand.right, relativeOffhand.up, offhandAngles );
-		offhandAngles[YAW] += cmd->viewangles[YAW];
+		if( vr_ladder_aim.value < 0.5f )
+			offhandAngles[PITCH] = cmd->viewangles[PITCH]; /* look up/down to climb (= head pitch) */
+		else
+		{
+			CL_VRRelativePose( &offhand->aim, &vr_center, &relativeOffhand );
+			VectorsAngles( relativeOffhand.forward, relativeOffhand.right, relativeOffhand.up, offhandAngles );
+		}
+		{
+			/* yaw in the same frame as the movement buttons (see CL_VRAppendMove); the
+			 * off-hand only contributes the climb pitch */
+			int variant = (int)vr_control_scheme.value % 10;
+			const ref_vr_hand_t *move;
+			if( variant < 0 || variant > 3 ) variant = 0;
+			move = &vr_frame.hands[variant == 2 || variant == 3 ? dominant : support];
+			offhandAngles[YAW] = CL_VRMoveHeading( move, variant ) + cmd->viewangles[YAW];
+		}
 		COM_NormalizeAngles( offhandAngles );
 		if( offhandAngles[PITCH] == offhandAngles[PITCH] && offhandAngles[YAW] == offhandAngles[YAW] )
 		{
@@ -1104,5 +1376,43 @@ void Test_RunVRInputPolicy( void )
 	vr_center_valid = false;
 	CL_VRUpdatePhysicalCrouch();
 	TASSERT( !vr_physical_crouched );
+
+	{
+		/* Recentre keeps only the yaw: head facing +y (left), pitched 30 degrees down. */
+		ref_vr_pose_t pose;
+		const float c = cos( DEG2RAD( 30.0f )), s = sin( DEG2RAD( 30.0f ));
+		VectorSet( pose.forward, 0.0f, c, -s );
+		VectorSet( pose.right, 1.0f, 0.0f, 0.0f );
+		VectorSet( pose.up, 0.0f, s, c );
+		CL_VRFlattenPose( &pose );
+		TASSERT( fabs( pose.forward[0] ) < 0.0001f && fabs( pose.forward[1] - 1.0f ) < 0.0001f && pose.forward[2] == 0.0f );
+		TASSERT( fabs( pose.right[0] - 1.0f ) < 0.0001f && fabs( pose.right[1] ) < 0.0001f && pose.right[2] == 0.0f );
+		TASSERT( pose.up[0] == 0.0f && pose.up[1] == 0.0f && pose.up[2] == 1.0f );
+
+		/* Looking straight down: the heading comes from the right vector. */
+		VectorSet( pose.forward, 0.0f, 0.0f, -1.0f );
+		VectorSet( pose.right, 0.0f, -1.0f, 0.0f );
+		VectorSet( pose.up, 1.0f, 0.0f, 0.0f );
+		CL_VRFlattenPose( &pose );
+		TASSERT( fabs( pose.forward[0] - 1.0f ) < 0.0001f && fabs( pose.forward[1] ) < 0.0001f );
+
+		/* Physical crouch: relative to the recentre height, not LOCAL space's zero. */
+		float saved_crouching = vr_enable_crouching.value;
+		vr_enable_crouching.value = 0.85f; /* cvar default; not registered in the test host */
+		vr_center_valid = true;
+		vr_physical_crouched = false;
+		vr_center.position[2] = 0.0f;
+		vr_frame.flags = REF_VR_FRAME_HEAD_VALID;
+		vr_frame.head.position[2] = -0.05f; /* small head bob: stays standing */
+		CL_VRUpdatePhysicalCrouch();
+		TASSERT( !vr_physical_crouched );
+		vr_frame.head.position[2] = -0.40f; /* real crouch */
+		CL_VRUpdatePhysicalCrouch();
+		TASSERT( vr_physical_crouched );
+		vr_enable_crouching.value = saved_crouching;
+		vr_center_valid = false;
+		vr_physical_crouched = false;
+		memset( &vr_frame, 0, sizeof( vr_frame ));
+	}
 }
 #endif

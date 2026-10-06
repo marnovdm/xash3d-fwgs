@@ -1800,7 +1800,9 @@ static void Con_DrawNotify( void )
 
 	int x = con.curFont->charWidths[' ']; // offset one space at left screen side
 
-	if( host.allow_console && !Con_BackgroundMapActive( ))
+	/* VR: no console lines over the HUD (model/map loading etc.); the console keeps them, vr_notify 1 shows them */
+	if( host.allow_console && !Con_BackgroundMapActive( ) &&
+		!( Cvar_VariableValue( "vr_enable" ) != 0.0f && Cvar_VariableValue( "vr_notify" ) == 0.0f ))
 	{
 		for( int i = Q_max( 0, CON_LINES_COUNT - con.num_times ); i < CON_LINES_COUNT; i++ )
 		{

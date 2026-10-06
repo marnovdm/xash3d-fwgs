@@ -52,6 +52,15 @@ CVAR_DEFINE_AUTO( s_lerping, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "apply interpo
 static CVAR_DEFINE( s_ambient_level, "ambient_level", "0.3", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "volume of environment noises (water and wind)" );
 static CVAR_DEFINE( s_ambient_fade, "ambient_fade", "1000", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "rate of volume fading when client is moving" );
 CVAR_DEFINE_AUTO( snd_mute_losefocus, "1", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "silence the audio when game window loses focus" );
+static CVAR_DEFINE_AUTO( snd_effects_scale, "0.75", FCVAR_ARCHIVE, "volume of everything except speech (CHAN_VOICE, sentences), so voices stand out; 1 = stock" );
+
+/* Speech already plays at the 255 cap, so it cannot be made louder; scale the rest down instead. */
+static float S_EffectsScale( int chan, const sfx_t *sfx )
+{
+	if( chan == CHAN_VOICE || ( sfx && ( sfx->name[0] == '!' || sfx->name[0] == '#' )))
+		return 1.0f;
+	return bound( 0.0f, snd_effects_scale.value, 1.0f );
+}
 CVAR_DEFINE_AUTO( s_test, "0", 0, "engine developer cvar for quick testing new features" );
 CVAR_DEFINE_AUTO( s_samplecount, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "sample count (0 for default value)" );
 CVAR_DEFINE_AUTO( s_warn_late_precache, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "warn about late precached sounds on client-side" );
@@ -630,7 +639,7 @@ void S_StartSound( const vec3_t pos, int ent, int chan, sound_t handle, float fv
 	sfx = S_GetSfxByHandle( handle );
 	if( !sfx ) return;
 
-	vol = bound( 0, fvol * 255, 255 );
+	vol = bound( 0, fvol * S_EffectsScale( chan, sfx ) * 255, 255 );
 	if( pitch <= 1 ) pitch = PITCH_NORM; // Invasion issues
 
 	if( flags & ( SND_STOP|SND_CHANGE_VOL|SND_CHANGE_PITCH ))
@@ -753,7 +762,7 @@ void S_RestoreSound( const vec3_t pos, int ent, int chan, sound_t handle, float 
 	sfx = S_GetSfxByHandle( handle );
 	if( !sfx ) return;
 
-	vol = bound( 0, fvol * 255, 255 );
+	vol = bound( 0, fvol * S_EffectsScale( chan, sfx ) * 255, 255 );
 	if( pitch <= 1 ) pitch = PITCH_NORM; // Invasion issues
 
 	// pick a channel to play on
@@ -890,7 +899,7 @@ void S_AmbientSound( const vec3_t pos, int ent, sound_t handle, float fvol, floa
 	sfx = S_GetSfxByHandle( handle );
 	if( !sfx ) return;
 
-	vol = bound( 0, fvol * 255, 255 );
+	vol = bound( 0, fvol * S_EffectsScale( CHAN_STATIC, sfx ) * 255, 255 );
 	if( pitch <= 1 ) pitch = PITCH_NORM; // Invasion issues
 
 	if( flags & (SND_STOP|SND_CHANGE_VOL|SND_CHANGE_PITCH))
@@ -1986,6 +1995,7 @@ qboolean S_Init( void )
 	Cvar_RegisterVariable( &s_ambient_level );
 	Cvar_RegisterVariable( &s_ambient_fade );
 	Cvar_RegisterVariable( &snd_mute_losefocus );
+	Cvar_RegisterVariable( &snd_effects_scale );
 	Cvar_RegisterVariable( &s_test );
 	Cvar_RegisterVariable( &s_samplecount );
 	Cvar_RegisterVariable( &s_warn_late_precache );

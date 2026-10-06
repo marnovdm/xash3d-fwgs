@@ -2706,14 +2706,19 @@ static void Mod_TextureReplacementReport( const char *modelname, const char *tex
 static qboolean Mod_SearchForTextureReplacement( char *out, size_t size, const char *modelname, const char *texname, const char *type )
 {
 	const char *subdirs[] = { modelname, "common" };
+	// imagelib picks the decoder by extension; PNG covers AI-upscaled packs (e.g. the Half-Life: VR mod's)
+	const char *exts[] = { "dds", "png", "tga" };
 
 	for( int i = 0; i < ARRAYSIZE( subdirs ); i++ )
 	{
-		if( Q_snprintf( out, size, "materials/%s/%s%s.tga", subdirs[i], texname, type ) < 0 )
-			continue; // truncated name
+		for( int e = 0; e < ARRAYSIZE( exts ); e++ )
+		{
+			if( Q_snprintf( out, size, "materials/%s/%s%s.%s", subdirs[i], texname, type, exts[e] ) < 0 )
+				continue; // truncated name
 
-		if( g_fsapi.FileExists( out, false ))
-			return true; // found, load it
+			if( g_fsapi.FileExists( out, false ))
+				return true; // found, load it
+		}
 	}
 
 	Mod_TextureReplacementReport( modelname, texname, type, -1, "not found" );

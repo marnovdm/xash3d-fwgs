@@ -564,7 +564,11 @@ void R_SetupGL( qboolean set_gl_state )
 		int y = floor( gpGlobals->height - RI.rvp.viewport[1] * gpGlobals->height / gpGlobals->height );
 		int y2 = ceil( gpGlobals->height - ( RI.rvp.viewport[1] + RI.rvp.viewport[3] ) * gpGlobals->height / gpGlobals->height );
 
-		if( tr.rotation & 1 )
+		int eye_width, eye_height;
+
+		if( GL_OpenXRGetEyeSize( &eye_width, &eye_height ))
+			pglViewport( 0, 0, eye_width, eye_height ); // VR eye: the whole swapchain image
+		else if( tr.rotation & 1 )
 			pglViewport( y2, x, y - y2, x2 - x );
 		else pglViewport( x, y2, x2 - x, y - y2 );
 	}

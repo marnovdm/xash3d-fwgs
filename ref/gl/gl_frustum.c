@@ -75,19 +75,19 @@ void GL_FrustumInitProjAsymmetric( gl_frustum_t *out, float flZNear, float flZFa
 {
 	vec3_t normal, iforward, point;
 
-	VectorMAM( -leftTan, RI.cull_vforward, -1.0f, RI.cull_vright, normal );
+	VectorMAM( -leftTan, RI.cull_vforward, 1.0f, RI.cull_vright, normal ); // inward normals: keeps x >= leftTan
 	VectorNormalize( normal );
 	GL_FrustumSetPlane( out, FRUSTUM_LEFT, normal, DotProduct( RI.cullorigin, normal ));
 
-	VectorMAM( rightTan, RI.cull_vforward, 1.0f, RI.cull_vright, normal );
+	VectorMAM( rightTan, RI.cull_vforward, -1.0f, RI.cull_vright, normal ); // keeps x <= rightTan
 	VectorNormalize( normal );
 	GL_FrustumSetPlane( out, FRUSTUM_RIGHT, normal, DotProduct( RI.cullorigin, normal ));
 
-	VectorMAM( -downTan, RI.cull_vforward, -1.0f, RI.cull_vup, normal );
+	VectorMAM( -downTan, RI.cull_vforward, 1.0f, RI.cull_vup, normal ); // keeps y >= downTan
 	VectorNormalize( normal );
 	GL_FrustumSetPlane( out, FRUSTUM_BOTTOM, normal, DotProduct( RI.cullorigin, normal ));
 
-	VectorMAM( upTan, RI.cull_vforward, 1.0f, RI.cull_vup, normal );
+	VectorMAM( upTan, RI.cull_vforward, -1.0f, RI.cull_vup, normal ); // keeps y <= upTan
 	VectorNormalize( normal );
 	GL_FrustumSetPlane( out, FRUSTUM_TOP, normal, DotProduct( RI.cullorigin, normal ));
 

@@ -859,6 +859,7 @@ void CL_UnloadProgs( void );
 qboolean CL_LoadProgs( const char *name );
 void CL_LinkUserMessage( char *pszName, const int svc_num, int iSize );
 void CL_DrawHUD( int state );
+void CL_VRDrawEyeScreenFade( void );
 void CL_InitEdicts( int maxclients );
 void CL_FreeEdicts( void );
 void CL_ClearWorld( void );

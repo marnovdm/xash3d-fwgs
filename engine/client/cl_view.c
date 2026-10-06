@@ -331,7 +331,8 @@ qboolean V_PreRender( void )
 	if( !ref.initialized )
 		return false;
 
-	if( host.status == HOST_SLEEP )
+	/* minimized window: skip drawing, except in VR where the headset still needs frames */
+	if( host.status == HOST_SLEEP && Cvar_VariableValue( "vr_enable" ) == 0.0f )
 		return false;
 
 	// if the screen is disabled (loading plaque is up)
@@ -429,6 +430,7 @@ void V_RenderView( void )
 				COM_SetRandomSeed( render_seed );
 				rvp = base_rvp;
 				GL_RenderFrame( &rvp );
+				CL_VRDrawEyeScreenFade();
 				CL_VREndEye( eye );
 			}
 		}

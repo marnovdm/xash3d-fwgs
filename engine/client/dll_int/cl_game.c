@@ -29,6 +29,7 @@ GNU General Public License for more details.
 #include "demo_api.h"
 #include "ivoicetweak.h"
 #include "pm_local.h"
+#include "vr/vr_client.h"
 #include "cl_tent.h"
 #include "input.h"
 #include "shake.h"
@@ -525,10 +526,55 @@ fill screen with specfied color
 can be modulated
 =============
 */
-static void CL_DrawScreenFade( void )
+static qboolean CL_ScreenFadeColor( byte rgba[4], qboolean *modulate )
 {
 	screenfade_t	*sf = &clgame.fade;
 	int alpha = V_FadeAlpha( sf );
+
+	if( !alpha )
+		return false;
+	*modulate = FBitSet( sf->fadeFlags, FFADE_MODULATE ) && !Host_IsQuakeCompatible();
+	if( *modulate )
+	{
+		rgba[0] = (uint16_t)( sf->fader * alpha + ( 255 - alpha ) * 255 ) >> 8;
+		rgba[1] = (uint16_t)( sf->fadeg * alpha + ( 255 - alpha ) * 255 ) >> 8;
+		rgba[2] = (uint16_t)( sf->fadeb * alpha + ( 255 - alpha ) * 255 ) >> 8;
+		rgba[3] = 255;
+	}
+	else
+	{
+		rgba[0] = sf->fader;
+		rgba[1] = sf->fadeg;
+		rgba[2] = sf->fadeb;
+		rgba[3] = alpha;
+	}
+	return true;
+}
+
+/* VR: the fade covers each eye's whole view (called between CL_VRBeginEye and CL_VREndEye);
+ * CL_DrawScreenFade then leaves the HUD panel alone. */
+void CL_VRDrawEyeScreenFade( void )
+{
+	byte rgba[4];
+	qboolean modulate;
+
+	if( cls.state != ca_active || !ref.dllFuncs.R_VRDrawEyeFade )
+		return;
+	if( CL_ScreenFadeColor( rgba, &modulate ))
+		ref.dllFuncs.R_VRDrawEyeFade( rgba, modulate );
+}
+
+static void CL_DrawScreenFade( void )
+{
+	screenfade_t	*sf = &clgame.fade;
+	int alpha;
+
+	if( CL_VRIsActive() && ref.dllFuncs.R_VRDrawEyeFade )
+	{
+		V_FadeAlpha( sf ); /* keep its FFADE_STAYOUT bookkeeping running */
+		return;
+	}
+	alpha = V_FadeAlpha( sf );
 
 	if( !alpha )
 		return;

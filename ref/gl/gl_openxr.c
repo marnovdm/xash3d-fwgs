@@ -61,6 +61,15 @@ extern XVisualInfo *glXGetVisualFromFBConfig( Display *display, GLXFBConfig conf
 #ifndef GL_FRAMEBUFFER_COMPLETE
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #endif
+#ifndef GL_RENDERBUFFER
+#define GL_RENDERBUFFER 0x8D41
+#endif
+#ifndef GL_DEPTH24_STENCIL8
+#define GL_DEPTH24_STENCIL8 0x88F0
+#endif
+#ifndef GL_DEPTH_STENCIL_ATTACHMENT
+#define GL_DEPTH_STENCIL_ATTACHMENT 0x821A
+#endif
 #ifndef GL_SRGB8_ALPHA8
 #define GL_SRGB8_ALPHA8 0x8C43
 #endif
@@ -69,6 +78,9 @@ extern XVisualInfo *glXGetVisualFromFBConfig( Display *display, GLXFBConfig conf
 #endif
 #ifndef GL_SCISSOR_BOX
 #define GL_SCISSOR_BOX 0x0C10
+#endif
+#ifndef GL_VIEWPORT
+#define GL_VIEWPORT 0x0BA2
 #endif
 
 typedef struct gl_openxr_eye_s
@@ -80,6 +92,7 @@ typedef struct gl_openxr_eye_s
 	uint32_t image_index;
 	XrSwapchainImageOpenGLKHR *images;
 	GLuint *framebuffers;
+	GLuint depth_stencil; /* eyes render straight into the swapchain at full size, so they need their own depth */
 	qboolean acquired;
 	qboolean waited;
 	qboolean ready;
@@ -136,9 +149,20 @@ typedef struct gl_openxr_state_s
 	XrView views[REF_VR_MAX_EYES];
 	XrPosef head_pose;
 	gl_openxr_eye_t eyes[REF_VR_MAX_EYES];
+	qboolean mirror_warned;
 	gl_openxr_eye_t ui;
 	gl_openxr_actions_t actions;
 	qboolean ui_active;
+	qboolean ui_world_active;
+	XrPosef ui_anchor; /* level head pose captured when a menu opened (local space) */
+	gl_openxr_eye_t beam; /* tiny solid-colour swapchain for the menu pointer beam */
+	struct
+	{
+		qboolean valid;
+		float u, v;           /* cursor on the UI panel, 0..1 */
+		XrVector3f origin;    /* controller aim position (local space) */
+		XrVector3f hit;       /* where the aim ray meets the panel (local space) */
+	} ui_pointer[REF_VR_MAX_HANDS];
 	int ui_source_width;
 	int ui_source_height;
 	float ui_clear_color[4];
@@ -153,18 +177,30 @@ static cvar_t *vr_enable;
 static cvar_t *vr_supersampling;
 static cvar_t *vr_worldscale;
 static cvar_t *vr_ui_distance;
+static cvar_t *vr_ui_offset_x;
+static cvar_t *vr_ui_height;
+static cvar_t *vr_ui_offset_y;
+static cvar_t *vr_ui_world;
 static cvar_t *vr_ui_width;
+static cvar_t *vr_ui_glow_curve;
 static cvar_t *vr_comfort_mask;
 static cvar_t *vr_comfort_moving;
 static cvar_t *vr_scope_engaged;
+static cvar_t *vr_mirror_eye;
 
 void GL_OpenXRInit( void )
 {
 	vr_enable = gEngfuncs.Cvar_Get( "vr_enable", "0", FCVAR_ARCHIVE, "enable desktop OpenXR rendering" );
 	vr_supersampling = gEngfuncs.Cvar_Get( "vr_supersampling", "1.0", FCVAR_ARCHIVE, "OpenXR eye resolution scale" );
+	vr_mirror_eye = gEngfuncs.Cvar_Get( "vr_mirror_eye", "0", 0, "eye shown in the desktop window (0 left, 1 right)" );
 	vr_worldscale = gEngfuncs.Cvar_Get( "vr_worldscale", "40", FCVAR_ARCHIVE, "game units per physical metre" );
 	vr_ui_distance = gEngfuncs.Cvar_Get( "vr_ui_distance", "1.5", FCVAR_ARCHIVE, "head-relative VR UI distance in metres" );
-	vr_ui_width = gEngfuncs.Cvar_Get( "vr_ui_width", "2.0", FCVAR_ARCHIVE, "head-relative VR UI width in metres" );
+	vr_ui_offset_x = gEngfuncs.Cvar_Get( "vr_ui_offset_x", "-0.1", FCVAR_ARCHIVE, "VR UI panel offset to the right in metres (negative = left), clamped to +-1" );
+	vr_ui_height = gEngfuncs.Cvar_Get( "vr_ui_height", "0", FCVAR_ARCHIVE, "VR UI panel height in metres; 0 = from the width and the UI texture aspect (16:9)" );
+	vr_ui_offset_y = gEngfuncs.Cvar_Get( "vr_ui_offset_y", "0", FCVAR_ARCHIVE, "VR UI panel offset upwards in metres (negative = down), clamped to +-1" );
+	vr_ui_world = gEngfuncs.Cvar_Get( "vr_ui_world", "0", 0, "set by the engine while a menu/console is open: the UI panel stays put in the room" );
+	vr_ui_width = gEngfuncs.Cvar_Get( "vr_ui_width", "2.6", FCVAR_ARCHIVE, "head-relative VR UI width in metres" );
+	vr_ui_glow_curve = gEngfuncs.Cvar_Get( "vr_ui_glow_curve", "1.6", FCVAR_ARCHIVE, "VR HUD: opacity of additive (glowing) HUD pixels = brightness^curve; 1 = old look, higher hides faint fringes" );
 	vr_comfort_mask = gEngfuncs.Cvar_Get( "vr_comfort_mask", "0.0", FCVAR_ARCHIVE,
 		"movement comfort mask: 0 disables it, 1 fully obscures the view edges" );
 	vr_comfort_moving = gEngfuncs.Cvar_Get( "vr_comfort_moving", "0", 0,
@@ -354,17 +390,69 @@ static qboolean GL_OpenXRCreateActionSpaces( void )
 	return true;
 }
 
+/* The UI quad layer is composited with premultiplied alpha. GoldSrc draws most HUD
+ * elements and title/credit text additively; with one blend function for colour and
+ * alpha those writes also set the layer's alpha to 1, turning every sprite into a black
+ * box over the world. While the UI layer is bound, route pglBlendFunc through
+ * glBlendFuncSeparate: additive keeps the destination alpha (pure glow), normal alpha
+ * blending accumulates coverage. */
+static void (APIENTRY *gl_openxr_blendfunc)( GLenum sfactor, GLenum dfactor );
+static void (APIENTRY *gl_openxr_blendfunc_separate)( GLenum srgb, GLenum drgb, GLenum salpha, GLenum dalpha );
+static GLenum gl_openxr_blend_src = GL_ONE, gl_openxr_blend_dst = GL_ZERO;
+static qboolean gl_openxr_ui_blend;
+
+static void GL_OpenXRApplyBlend( void )
+{
+	GLenum src = gl_openxr_blend_src, dst = gl_openxr_blend_dst;
+
+	if( !gl_openxr_ui_blend || !gl_openxr_blendfunc_separate )
+		gl_openxr_blendfunc( src, dst );
+	else if( dst == GL_ONE )
+		gl_openxr_blendfunc_separate( src, dst, GL_ZERO, GL_ONE );
+	else if( src == GL_SRC_ALPHA && dst == GL_ONE_MINUS_SRC_ALPHA )
+		gl_openxr_blendfunc_separate( src, dst, GL_ONE, GL_ONE_MINUS_SRC_ALPHA );
+	else gl_openxr_blendfunc( src, dst );
+}
+
+static void APIENTRY GL_OpenXRBlendFunc( GLenum sfactor, GLenum dfactor )
+{
+	gl_openxr_blend_src = sfactor;
+	gl_openxr_blend_dst = dfactor;
+	GL_OpenXRApplyBlend();
+}
+
+static void GL_OpenXRSetUIBlend( qboolean active )
+{
+	if( !gl_openxr_blendfunc )
+		return;
+	gl_openxr_ui_blend = active;
+	GL_OpenXRApplyBlend();
+}
+
 static qboolean GL_OpenXRLoadGLFunctions( void )
 {
+	if( !gl_openxr_blendfunc && pglBlendFunc && pglBlendFunc != GL_OpenXRBlendFunc )
+	{
+		gl_openxr_blendfunc = pglBlendFunc;
+		gl_openxr_blendfunc_separate = gEngfuncs.GL_GetProcAddress( "glBlendFuncSeparate" );
+		pglBlendFunc = GL_OpenXRBlendFunc;
+	}
 	if( !pglGenFramebuffers ) pglGenFramebuffers = gEngfuncs.GL_GetProcAddress( "glGenFramebuffers" );
 	if( !pglDeleteFramebuffers ) pglDeleteFramebuffers = gEngfuncs.GL_GetProcAddress( "glDeleteFramebuffers" );
 	if( !pglBindFramebuffer ) pglBindFramebuffer = gEngfuncs.GL_GetProcAddress( "glBindFramebuffer" );
 	if( !pglFramebufferTexture2D ) pglFramebufferTexture2D = gEngfuncs.GL_GetProcAddress( "glFramebufferTexture2D" );
 	if( !pglCheckFramebufferStatus ) pglCheckFramebufferStatus = gEngfuncs.GL_GetProcAddress( "glCheckFramebufferStatus" );
 	if( !pglBlitFramebuffer ) pglBlitFramebuffer = gEngfuncs.GL_GetProcAddress( "glBlitFramebuffer" );
+	if( !pglGenRenderbuffers ) pglGenRenderbuffers = gEngfuncs.GL_GetProcAddress( "glGenRenderbuffers" );
+	if( !pglDeleteRenderbuffers ) pglDeleteRenderbuffers = gEngfuncs.GL_GetProcAddress( "glDeleteRenderbuffers" );
+	if( !pglBindRenderbuffer ) pglBindRenderbuffer = gEngfuncs.GL_GetProcAddress( "glBindRenderbuffer" );
+	if( !pglRenderbufferStorage ) pglRenderbufferStorage = gEngfuncs.GL_GetProcAddress( "glRenderbufferStorage" );
+	if( !pglFramebufferRenderbuffer ) pglFramebufferRenderbuffer = gEngfuncs.GL_GetProcAddress( "glFramebufferRenderbuffer" );
 
 	if( pglGenFramebuffers && pglDeleteFramebuffers && pglBindFramebuffer &&
-		pglFramebufferTexture2D && pglCheckFramebufferStatus && pglBlitFramebuffer )
+		pglFramebufferTexture2D && pglCheckFramebufferStatus && pglBlitFramebuffer &&
+		pglGenRenderbuffers && pglDeleteRenderbuffers && pglBindRenderbuffer &&
+		pglRenderbufferStorage && pglFramebufferRenderbuffer )
 		return true;
 
 	gEngfuncs.Con_Printf( S_ERROR "OpenXR: required framebuffer functions are unavailable\n" );
@@ -487,8 +575,38 @@ static qboolean GL_OpenXRGetVector2Action( XrAction action, XrPath hand_path, fl
 	return true;
 }
 
-static void GL_OpenXRFillUICursor( const XrPosef *aim, ref_vr_hand_t *out )
+static float GL_OpenXRUIHeight( float width )
 {
+	if( vr_ui_height->value > 0.0f )
+		return bound( 0.25f, vr_ui_height->value, 8.0f );
+	return width * (float)xr.ui.height / (float)xr.ui.width;
+}
+
+/* Reference pose the UI panel hangs off: the head (HUD) or the anchor captured when a menu opened. */
+static XrPosef GL_OpenXRUIReference( void )
+{
+	return xr.ui_world_active ? xr.ui_anchor : xr.head_pose;
+}
+
+/* Level (yaw-only) copy of a pose, so a world-locked menu does not tilt with the head. */
+static XrPosef GL_OpenXRLevelPose( const XrPosef *pose )
+{
+	const XrVector3f forward = { 0.0f, 0.0f, -1.0f };
+	XrVector3f f = GL_OpenXRRotateVector( pose->orientation, forward );
+	float yaw = atan2f( -f.x, -f.z );
+	XrPosef out;
+
+	out.position = pose->position;
+	out.orientation.x = 0.0f;
+	out.orientation.y = sinf( yaw * 0.5f );
+	out.orientation.z = 0.0f;
+	out.orientation.w = cosf( yaw * 0.5f );
+	return out;
+}
+
+static void GL_OpenXRFillUICursor( int hand, const XrPosef *aim, ref_vr_hand_t *out )
+{
+	const XrPosef reference = GL_OpenXRUIReference();
 	XrVector3f world_origin;
 	XrVector3f aim_forward = { 0.0f, 0.0f, -1.0f };
 	XrVector3f world_direction;
@@ -496,28 +614,43 @@ static void GL_OpenXRFillUICursor( const XrPosef *aim, ref_vr_hand_t *out )
 	XrVector3f local_direction;
 	float distance = bound( 0.2f, vr_ui_distance->value, 10.0f );
 	float width = bound( 0.25f, vr_ui_width->value, 8.0f );
-	float height = width * (float)xr.ui.height / (float)xr.ui.width;
+	float height = GL_OpenXRUIHeight( width );
 	float t, x, y;
 
-	world_origin.x = aim->position.x - xr.head_pose.position.x;
-	world_origin.y = aim->position.y - xr.head_pose.position.y;
-	world_origin.z = aim->position.z - xr.head_pose.position.z;
+	world_origin.x = aim->position.x - reference.position.x;
+	world_origin.y = aim->position.y - reference.position.y;
+	world_origin.z = aim->position.z - reference.position.z;
 	world_direction = GL_OpenXRRotateVector( aim->orientation, aim_forward );
-	local_origin = GL_OpenXRRotateVector( GL_OpenXRQuatConjugate( xr.head_pose.orientation ), world_origin );
-	local_direction = GL_OpenXRRotateVector( GL_OpenXRQuatConjugate( xr.head_pose.orientation ), world_direction );
+	local_origin = GL_OpenXRRotateVector( GL_OpenXRQuatConjugate( reference.orientation ), world_origin );
+	local_direction = GL_OpenXRRotateVector( GL_OpenXRQuatConjugate( reference.orientation ), world_direction );
 
 	if( local_direction.z >= -0.0001f )
 		return;
 	t = ( -distance - local_origin.z ) / local_direction.z;
 	if( t <= 0.0f )
 		return;
-	x = local_origin.x + local_direction.x * t;
-	y = local_origin.y + local_direction.y * t;
+	x = local_origin.x + local_direction.x * t - bound( -1.0f, vr_ui_offset_x->value, 1.0f );
+	y = local_origin.y + local_direction.y * t - bound( -1.0f, vr_ui_offset_y->value, 1.0f );
 	out->ui_cursor[0] = x / width + 0.5f;
 	out->ui_cursor[1] = 0.5f - y / height;
 	if( out->ui_cursor[0] >= 0.0f && out->ui_cursor[0] <= 1.0f &&
 		out->ui_cursor[1] >= 0.0f && out->ui_cursor[1] <= 1.0f )
+	{
+		XrVector3f panel_hit, world_hit;
 		SetBits( out->flags, REF_VR_HAND_UI_VALID );
+		/* remember the ray for the menu pointer dot and beam */
+		panel_hit.x = local_origin.x + local_direction.x * t;
+		panel_hit.y = local_origin.y + local_direction.y * t;
+		panel_hit.z = -distance;
+		world_hit = GL_OpenXRRotateVector( reference.orientation, panel_hit );
+		xr.ui_pointer[hand].valid = true;
+		xr.ui_pointer[hand].u = out->ui_cursor[0];
+		xr.ui_pointer[hand].v = out->ui_cursor[1];
+		xr.ui_pointer[hand].origin = aim->position;
+		xr.ui_pointer[hand].hit.x = reference.position.x + world_hit.x;
+		xr.ui_pointer[hand].hit.y = reference.position.y + world_hit.y;
+		xr.ui_pointer[hand].hit.z = reference.position.z + world_hit.z;
+	}
 }
 
 static qboolean GL_OpenXRFillHandPose( int hand, XrAction action, XrSpace space, uint32_t flag, qboolean include_velocity,
@@ -538,13 +671,17 @@ static qboolean GL_OpenXRFillHandPose( int hand, XrAction action, XrSpace space,
 	if( include_velocity )
 		location.next = &velocity;
 	if( !GL_OpenXRCheck( xrLocateSpace( space, xr.local_space, xr.frame_state.predictedDisplayTime, &location ),
-		"xrLocateSpace(controller)" ) || ( location.locationFlags & required ) != required )
+		"xrLocateSpace(controller)" ))
 		return false;
+	/* A controller out of tracking only loses its own pose flag; failing here would
+	   drop the whole frame's actions (both sticks, all buttons) on every tracking hiccup. */
+	if(( location.locationFlags & required ) != required )
+		return true;
 
 	GL_OpenXRFillPose( &location.pose, flag == REF_VR_HAND_GRIP_VALID ? &out->grip : &out->aim );
 	SetBits( out->flags, flag );
 	if( flag == REF_VR_HAND_AIM_VALID && xr.views_valid )
-		GL_OpenXRFillUICursor( &location.pose, out );
+		GL_OpenXRFillUICursor( hand, &location.pose, out );
 	if( include_velocity )
 	{
 		if( velocity.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT )
@@ -616,6 +753,8 @@ static void GL_OpenXRDestroyEye( gl_openxr_eye_t *eye )
 
 	if( eye->framebuffers )
 		pglDeleteFramebuffers( eye->image_count, eye->framebuffers );
+	if( eye->depth_stencil )
+		pglDeleteRenderbuffers( 1, &eye->depth_stencil );
 	if( eye->swapchain != XR_NULL_HANDLE )
 		GL_OpenXRCheck( xrDestroySwapchain( eye->swapchain ), "xrDestroySwapchain" );
 
@@ -663,6 +802,7 @@ void GL_OpenXRShutdown( void )
 	for( int i = 0; i < REF_VR_MAX_EYES; ++i )
 		GL_OpenXRDestroyEye( &xr.eyes[i] );
 	GL_OpenXRDestroyEye( &xr.ui );
+	GL_OpenXRDestroyEye( &xr.beam );
 
 	for( int i = 0; i < REF_VR_MAX_HANDS; ++i )
 	{
@@ -721,11 +861,17 @@ static qboolean GL_OpenXRCreateEye( gl_openxr_eye_t *eye, const XrViewConfigurat
 		(XrSwapchainImageBaseHeader *)eye->images ), "xrEnumerateSwapchainImages" ))
 		return false;
 
+	pglGenRenderbuffers( 1, &eye->depth_stencil );
+	pglBindRenderbuffer( GL_RENDERBUFFER, eye->depth_stencil );
+	pglRenderbufferStorage( GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, eye->width, eye->height );
+	pglBindRenderbuffer( GL_RENDERBUFFER, 0 );
+
 	pglGenFramebuffers( image_count, eye->framebuffers );
 	for( uint32_t i = 0; i < image_count; ++i )
 	{
 		pglBindFramebuffer( GL_FRAMEBUFFER, eye->framebuffers[i] );
 		pglFramebufferTexture2D( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, eye->images[i].image, 0 );
+		pglFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, eye->depth_stencil );
 		if( pglCheckFramebufferStatus( GL_FRAMEBUFFER ) != GL_FRAMEBUFFER_COMPLETE )
 		{
 			gEngfuncs.Con_Printf( S_ERROR "OpenXR: incomplete eye framebuffer %u\n", i );
@@ -771,7 +917,7 @@ static qboolean GL_OpenXRInitialize( void )
 	instance_info.applicationInfo.applicationVersion = 1;
 	Q_strncpy( instance_info.applicationInfo.engineName, "Xash3D FWGS", XR_MAX_ENGINE_NAME_SIZE );
 	instance_info.applicationInfo.engineVersion = 1;
-	instance_info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+	instance_info.applicationInfo.apiVersion = XR_API_VERSION_1_0; // SteamVR rejects 1.1 (XR_ERROR_API_VERSION_UNSUPPORTED)
 	instance_info.enabledExtensionCount = ARRAYSIZE( extensions );
 	instance_info.enabledExtensionNames = extensions;
 
@@ -892,6 +1038,17 @@ static qboolean GL_OpenXRInitialize( void )
 		ui_config.recommendedImageRectHeight = 720;
 		if( !GL_OpenXRCreateEye( &xr.ui, &ui_config, selected_format ))
 			goto cleanup;
+	}
+	{
+		/* optional: without it the menu just has no pointer beam */
+		XrViewConfigurationView beam_config = { XR_TYPE_VIEW_CONFIGURATION_VIEW };
+		beam_config.recommendedImageRectWidth = 8;
+		beam_config.recommendedImageRectHeight = 8;
+		if( !GL_OpenXRCreateEye( &xr.beam, &beam_config, selected_format ))
+		{
+			GL_OpenXRDestroyEye( &xr.beam );
+			memset( &xr.beam, 0, sizeof( xr.beam ));
+		}
 	}
 
 	xr.initialized = true;
@@ -1092,6 +1249,18 @@ qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame )
 	}
 	else xr.views_valid = false;
 
+	if( vr_ui_world->value != 0.0f && xr.views_valid )
+	{
+		if( !xr.ui_world_active )
+			xr.ui_anchor = GL_OpenXRLevelPose( &xr.head_pose );
+		xr.ui_world_active = true;
+	}
+	else if( vr_ui_world->value == 0.0f )
+		xr.ui_world_active = false;
+
+	for( int i = 0; i < REF_VR_MAX_HANDS; ++i )
+		xr.ui_pointer[i].valid = false;
+
 	if( frame )
 	{
 		frame->frame_id = ++xr.frame_id;
@@ -1127,28 +1296,16 @@ qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame )
 
 qboolean GL_OpenXRBeginEye( int eye )
 {
+	gl_openxr_eye_t *target;
+	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+
 	if( !xr.frame_begun || !xr.frame_state.shouldRender || !xr.views_valid || eye < 0 || eye >= REF_VR_MAX_EYES )
 		return false;
 
-	xr.current_eye = eye;
-	return true;
-}
-
-qboolean GL_OpenXREndEye( int eye, int source_width, int source_height )
-{
-	gl_openxr_eye_t *target;
-	GLenum blit_error;
-	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-	XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-	XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-
-	if( eye != xr.current_eye || eye < 0 || eye >= REF_VR_MAX_EYES )
-		return false;
+	/* Render the eye straight into its swapchain image at the runtime's recommended size
+	   instead of into the desktop back buffer (which capped the eye at the window size). */
 	target = &xr.eyes[eye];
-	xr.current_eye = -1;
-
-	if( source_width <= 0 || source_height <= 0 )
-		return false;
 	if( !GL_OpenXRCheck( xrAcquireSwapchainImage( target->swapchain, &acquire_info, &target->image_index ), "xrAcquireSwapchainImage" ))
 		return false;
 	target->acquired = true;
@@ -1162,23 +1319,94 @@ qboolean GL_OpenXREndEye( int eye, int source_width, int source_height )
 	}
 	target->waited = true;
 
-	pglBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
-	pglReadBuffer( GL_BACK );
-	pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, target->framebuffers[target->image_index] );
-	while(( blit_error = pglGetError() ) != GL_NO_ERROR )
-		gEngfuncs.Con_Reportf( S_NOTE "OpenXR: clearing GL error 0x%x before eye blit\n", blit_error );
-	pglBlitFramebuffer( 0, 0, source_width, source_height, 0, 0, target->width, target->height,
-		GL_COLOR_BUFFER_BIT, GL_LINEAR );
-	blit_error = pglGetError();
-	if( blit_error != GL_NO_ERROR )
-	{
-		gEngfuncs.Con_Printf( S_ERROR "OpenXR: eye %d blit failed with GL error 0x%x; "
-			"set gl_msaa_samples 0 and restart video\n", eye, blit_error );
-		pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
-		pglViewport( 0, 0, source_width, source_height );
-		GL_OpenXRShutdown();
-		xr.failed = true;
+	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	pglViewport( 0, 0, target->width, target->height );
+	xr.current_eye = eye;
+	return true;
+}
+
+qboolean GL_OpenXRGetEyeSize( int *width, int *height )
+{
+	if( xr.current_eye < 0 || xr.current_eye >= REF_VR_MAX_EYES || !xr.eyes[xr.current_eye].acquired )
+		return false; /* only between BeginEye and EndEye (xr is zeroed, i.e. current_eye 0, before VR init) */
+	*width = xr.eyes[xr.current_eye].width;
+	*height = xr.eyes[xr.current_eye].height;
+	return true;
+}
+
+/* Screen fades (env_fade, death, damage flashes, the expansions' black title screen) are 2D, so in VR they
+ * landed on the floating HUD panel as a coloured box. The engine draws them here instead, over the whole
+ * eye image, with the same blend as the desktop path (modulate = multiply). */
+void GL_OpenXRDrawEyeFade( const byte *rgba, qboolean modulate )
+{
+	const gl_openxr_eye_t *target;
+
+	if( !rgba || xr.current_eye < 0 || xr.current_eye >= REF_VR_MAX_EYES || !xr.eyes[xr.current_eye].acquired )
+		return;
+	target = &xr.eyes[xr.current_eye];
+
+	pglPushAttrib( GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_VIEWPORT_BIT | GL_CURRENT_BIT | GL_TEXTURE_BIT | GL_FOG_BIT );
+	pglViewport( 0, 0, target->width, target->height );
+	pglMatrixMode( GL_PROJECTION );
+	pglPushMatrix();
+	pglLoadIdentity();
+	pglMatrixMode( GL_MODELVIEW );
+	pglPushMatrix();
+	pglLoadIdentity();
+	pglDisable( GL_TEXTURE_2D );
+	pglDisable( GL_DEPTH_TEST );
+	pglDisable( GL_ALPHA_TEST );
+	pglDisable( GL_CULL_FACE );
+	pglDisable( GL_FOG );
+	pglDisable( GL_SCISSOR_TEST );
+	pglDepthMask( GL_FALSE );
+	pglEnable( GL_BLEND );
+	if( modulate )
+		pglBlendFunc( GL_ZERO, GL_SRC_COLOR );
+	else pglBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+	pglColor4ub( rgba[0], rgba[1], rgba[2], rgba[3] );
+	pglBegin( GL_QUADS );
+	pglVertex2f( -1.0f, -1.0f );
+	pglVertex2f( 1.0f, -1.0f );
+	pglVertex2f( 1.0f, 1.0f );
+	pglVertex2f( -1.0f, 1.0f );
+	pglEnd();
+	pglMatrixMode( GL_PROJECTION );
+	pglPopMatrix();
+	pglMatrixMode( GL_MODELVIEW );
+	pglPopMatrix();
+	pglPopAttrib();
+	pglColor4ub( 255, 255, 255, 255 );
+}
+
+qboolean GL_OpenXREndEye( int eye, int source_width, int source_height )
+{
+	gl_openxr_eye_t *target;
+	GLenum blit_error;
+	XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+
+	if( eye != xr.current_eye || eye < 0 || eye >= REF_VR_MAX_EYES )
 		return false;
+	target = &xr.eyes[eye];
+	xr.current_eye = -1;
+
+	if( !target->acquired || !target->waited || source_width <= 0 || source_height <= 0 )
+		return false;
+
+	if( eye == ( vr_mirror_eye->value ? 1 : 0 ))
+	{
+		/* desktop mirror only; a failure here (e.g. multisampled back buffer) is harmless */
+		while( pglGetError() != GL_NO_ERROR ) {}
+		pglBindFramebuffer( GL_READ_FRAMEBUFFER, target->framebuffers[target->image_index] );
+		pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, 0 );
+		pglBlitFramebuffer( 0, 0, target->width, target->height, 0, 0, source_width, source_height,
+			GL_COLOR_BUFFER_BIT, GL_LINEAR );
+		blit_error = pglGetError();
+		if( blit_error != GL_NO_ERROR && !xr.mirror_warned )
+		{
+			gEngfuncs.Con_Reportf( S_NOTE "OpenXR: desktop mirror blit failed with GL error 0x%x\n", blit_error );
+			xr.mirror_warned = true;
+		}
 	}
 	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
 	pglColorMask( GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE );
@@ -1241,6 +1469,288 @@ qboolean GL_OpenXREndEye( int eye, int source_width, int source_height )
 	return true;
 }
 
+/* SteamVR drops UI-layer pixels whose alpha is 0, so additively drawn HUD elements (alpha
+ * kept at 0 by GL_OpenXRBlendFunc) vanished. Before submitting, rewrite each pixel as
+ * unpremultiplied colour with alpha = max( a, r, g, b ): normal blended content (rgb <= a,
+ * premultiplied) is unchanged, an additive glow c becomes c over the world at opacity max(c). *
+ * 2026-10-06: the layer is sRGB and SteamVR blends it in linear light, so faint additive fringes
+ * (1-3/255 around text and sprite boxes, invisible on the desktop) became full-white pixels at ~1%
+ * opacity, ~10x brighter than meant: visible lines around HUD text. Glow opacity is now
+ * max(c)^vr_ui_glow_curve (1 = old behaviour) with the hue normalised, so fringes drop to 0. */
+static struct
+{
+	qboolean tried, ok;
+	GLhandleARB program;
+	GLint curve_location;
+	GLuint copy;
+	int copy_width, copy_height;
+} xr_ui_fix;
+
+static qboolean GL_OpenXRInitUIAlphaFix( void )
+{
+	static const char *vs =
+		"void main() { gl_TexCoord[0] = gl_MultiTexCoord0; gl_Position = gl_Vertex; }\n";
+	static const char *fs =
+		"uniform sampler2D ui;\n"
+		"uniform float curve;\n"
+		"void main() {\n"
+		"	vec4 c = texture2D( ui, gl_TexCoord[0].xy );\n"
+		"	float m = max( c.r, max( c.g, c.b ));\n"
+		"	if( c.a >= m ) {\n"
+		"		gl_FragColor = c.a > 0.0 ? vec4( c.rgb / c.a, c.a ) : vec4( 0.0 );\n"
+		"		return;\n"
+		"	}\n"
+		"	float a = max( c.a, pow( m, curve ));\n"
+		"	gl_FragColor = a > 0.5 / 255.0 ? vec4( c.rgb / m, a ) : vec4( 0.0 );\n"
+		"}\n";
+	GLhandleARB shaders[2];
+	GLint status = 0;
+
+	if( xr_ui_fix.tried )
+		return xr_ui_fix.ok;
+	xr_ui_fix.tried = true;
+	if( !pglCreateShaderObjectARB || !pglCreateProgramObjectARB || !pglUseProgramObjectARB || !pglCopyTexSubImage2D )
+	{
+		gEngfuncs.Con_Printf( S_WARN "OpenXR: no GLSL, VR HUD alpha fix disabled\n" );
+		return false;
+	}
+	shaders[0] = pglCreateShaderObjectARB( GL_VERTEX_SHADER_ARB );
+	shaders[1] = pglCreateShaderObjectARB( GL_FRAGMENT_SHADER_ARB );
+	pglShaderSourceARB( shaders[0], 1, &vs, NULL );
+	pglShaderSourceARB( shaders[1], 1, &fs, NULL );
+	xr_ui_fix.program = pglCreateProgramObjectARB();
+	for( int i = 0; i < 2; ++i )
+	{
+		pglCompileShaderARB( shaders[i] );
+		pglGetObjectParameterivARB( shaders[i], GL_OBJECT_COMPILE_STATUS_ARB, &status );
+		if( !status )
+		{
+			char log[1024] = "";
+			pglGetInfoLogARB( shaders[i], sizeof( log ), NULL, log );
+			gEngfuncs.Con_Printf( S_ERROR "OpenXR: VR HUD alpha fix shader: %s\n", log );
+			return false;
+		}
+		pglAttachObjectARB( xr_ui_fix.program, shaders[i] );
+	}
+	pglLinkProgramARB( xr_ui_fix.program );
+	pglGetObjectParameterivARB( xr_ui_fix.program, GL_OBJECT_LINK_STATUS_ARB, &status );
+	if( !status )
+	{
+		gEngfuncs.Con_Printf( S_ERROR "OpenXR: VR HUD alpha fix shader did not link\n" );
+		return false;
+	}
+	pglUseProgramObjectARB( xr_ui_fix.program );
+	pglUniform1iARB( pglGetUniformLocationARB( xr_ui_fix.program, "ui" ), 0 );
+	xr_ui_fix.curve_location = pglGetUniformLocationARB( xr_ui_fix.program, "curve" );
+	pglUseProgramObjectARB( 0 );
+	pglGenTextures( 1, &xr_ui_fix.copy );
+	xr_ui_fix.ok = true;
+	return true;
+}
+
+/* Runs with the UI framebuffer bound; leaves GL state (and Xash's state cache) as it found it. */
+static void GL_OpenXRFixUIAlpha( void )
+{
+	GLint old_texture = 0;
+	int old_tmu = glState.activeTMU;
+
+	if( !GL_OpenXRInitUIAlphaFix() )
+		return;
+
+	GL_SelectTexture( 0 );
+	pglGetIntegerv( GL_TEXTURE_BINDING_2D, &old_texture );
+	pglPushAttrib( GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_TEXTURE_BIT );
+	pglBindTexture( GL_TEXTURE_2D, xr_ui_fix.copy );
+	if( xr_ui_fix.copy_width != xr.ui.width || xr_ui_fix.copy_height != xr.ui.height )
+	{
+		pglTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA8, xr.ui.width, xr.ui.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL );
+		pglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+		pglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+		pglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+		pglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+		xr_ui_fix.copy_width = xr.ui.width;
+		xr_ui_fix.copy_height = xr.ui.height;
+	}
+	pglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, 0, 0, xr.ui.width, xr.ui.height );
+
+	pglDisable( GL_BLEND );
+	pglDisable( GL_DEPTH_TEST );
+	pglDisable( GL_ALPHA_TEST );
+	pglDisable( GL_CULL_FACE );
+	pglDisable( GL_SCISSOR_TEST );
+	pglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+	pglUseProgramObjectARB( xr_ui_fix.program );
+	if( xr_ui_fix.curve_location >= 0 && pglUniform1fARB )
+	{
+		float curve = vr_ui_glow_curve ? vr_ui_glow_curve->value : 1.6f;
+		pglUniform1fARB( xr_ui_fix.curve_location, curve > 0.1f ? curve : 1.6f );
+	}
+	pglBegin( GL_QUADS );
+	pglTexCoord2f( 0.0f, 0.0f ); pglVertex2f( -1.0f, -1.0f );
+	pglTexCoord2f( 1.0f, 0.0f ); pglVertex2f( 1.0f, -1.0f );
+	pglTexCoord2f( 1.0f, 1.0f ); pglVertex2f( 1.0f, 1.0f );
+	pglTexCoord2f( 0.0f, 1.0f ); pglVertex2f( -1.0f, 1.0f );
+	pglEnd();
+	pglUseProgramObjectARB( 0 );
+
+	pglPopAttrib();
+	pglBindTexture( GL_TEXTURE_2D, old_texture );
+	GL_SelectTexture( old_tmu );
+}
+
+/* The menu pointer follows the engine's dominant hand (right unless a left-handed control scheme). */
+static int GL_OpenXRPointerHand( void )
+{
+	return gEngfuncs.pfnGetCvarFloat( "vr_control_scheme" ) >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT;
+}
+
+/* Cursor dot drawn into the UI panel (2D pass still active, ortho in gpGlobals->width/height units). */
+static void GL_OpenXRDrawUIPointerDot( void )
+{
+	const int hand = GL_OpenXRPointerHand();
+	float x, y, radius;
+
+	if( !xr.ui_world_active || !xr.ui_pointer[hand].valid )
+		return;
+	x = xr.ui_pointer[hand].u * gpGlobals->width;
+	y = xr.ui_pointer[hand].v * gpGlobals->height;
+	radius = gpGlobals->width * 0.007f;
+
+	pglPushAttrib( GL_ENABLE_BIT | GL_CURRENT_BIT | GL_COLOR_BUFFER_BIT );
+	pglDisable( GL_TEXTURE_2D );
+	pglDisable( GL_BLEND );
+	pglDisable( GL_ALPHA_TEST );
+	pglDisable( GL_DEPTH_TEST );
+	pglDisable( GL_CULL_FACE );
+	for( int ring = 0; ring < 2; ++ring )
+	{
+		const float r = ring ? radius * 0.45f : radius;
+		if( ring ) pglColor4f( 1.0f, 1.0f, 1.0f, 1.0f );
+		else pglColor4f( 0.9f, 0.15f, 0.12f, 1.0f );
+		pglBegin( GL_TRIANGLE_FAN );
+		pglVertex2f( x, y );
+		for( int i = 0; i <= 20; ++i )
+		{
+			const float a = (float)i * ( 2.0f * (float)M_PI / 20.0f );
+			pglVertex2f( x + cosf( a ) * r, y + sinf( a ) * r );
+		}
+		pglEnd();
+	}
+	pglPopAttrib();
+}
+
+/* Fill the beam swapchain with a solid colour; the quad layer stretches it along the ray. */
+static qboolean GL_OpenXRPrepareBeam( void )
+{
+	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	GLfloat old_clear[4];
+	GLint old_viewport[4];
+
+	if( xr.beam.swapchain == XR_NULL_HANDLE )
+		return false;
+	if( !GL_OpenXRCheck( xrAcquireSwapchainImage( xr.beam.swapchain, &acquire_info, &xr.beam.image_index ),
+		"xrAcquireSwapchainImage(beam)" ))
+		return false;
+	wait_info.timeout = XR_INFINITE_DURATION;
+	if( !GL_OpenXRCheck( xrWaitSwapchainImage( xr.beam.swapchain, &wait_info ), "xrWaitSwapchainImage(beam)" ))
+		return false;
+	pglGetFloatv( GL_COLOR_CLEAR_VALUE, old_clear );
+	pglGetIntegerv( GL_VIEWPORT, old_viewport );
+	pglBindFramebuffer( GL_FRAMEBUFFER, xr.beam.framebuffers[xr.beam.image_index] );
+	pglViewport( 0, 0, xr.beam.width, xr.beam.height );
+	pglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+	pglClearColor( 0.95f, 0.2f, 0.15f, 0.85f );
+	pglClear( GL_COLOR_BUFFER_BIT );
+	pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
+	pglViewport( old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3] );
+	pglClearColor( old_clear[0], old_clear[1], old_clear[2], old_clear[3] );
+	return GL_OpenXRCheck( xrReleaseSwapchainImage( xr.beam.swapchain, &release_info ), "xrReleaseSwapchainImage(beam)" );
+}
+
+/* Quad layer from the controller to the hit point, rotated about the ray to face the head. */
+static qboolean GL_OpenXRBuildBeamLayer( XrCompositionLayerQuad *beam )
+{
+	const int hand = GL_OpenXRPointerHand();
+	XrVector3f o, d, mid, to_head, xa, ya, za;
+	float length, dot, len, m00, m01, m02, m10, m11, m12, m20, m21, m22, trace, sq;
+
+	if( !xr.ui_world_active || !xr.ui_pointer[hand].valid )
+		return false;
+	o = xr.ui_pointer[hand].origin;
+	d.x = xr.ui_pointer[hand].hit.x - o.x;
+	d.y = xr.ui_pointer[hand].hit.y - o.y;
+	d.z = xr.ui_pointer[hand].hit.z - o.z;
+	length = sqrtf( d.x * d.x + d.y * d.y + d.z * d.z );
+	if( length < 0.02f || !GL_OpenXRPrepareBeam() )
+		return false;
+
+	ya.x = d.x / length; ya.y = d.y / length; ya.z = d.z / length;
+	mid.x = o.x + d.x * 0.5f; mid.y = o.y + d.y * 0.5f; mid.z = o.z + d.z * 0.5f;
+	to_head.x = xr.head_pose.position.x - mid.x;
+	to_head.y = xr.head_pose.position.y - mid.y;
+	to_head.z = xr.head_pose.position.z - mid.z;
+	dot = to_head.x * ya.x + to_head.y * ya.y + to_head.z * ya.z;
+	za.x = to_head.x - ya.x * dot; za.y = to_head.y - ya.y * dot; za.z = to_head.z - ya.z * dot;
+	len = sqrtf( za.x * za.x + za.y * za.y + za.z * za.z );
+	if( len < 0.0001f )
+		return false; /* looking straight down the beam */
+	za.x /= len; za.y /= len; za.z /= len;
+	xa.x = ya.y * za.z - ya.z * za.y; /* x = y cross z */
+	xa.y = ya.z * za.x - ya.x * za.z;
+	xa.z = ya.x * za.y - ya.y * za.x;
+
+	/* rotation matrix with columns x, y, z -> quaternion */
+	m00 = xa.x; m01 = ya.x; m02 = za.x;
+	m10 = xa.y; m11 = ya.y; m12 = za.y;
+	m20 = xa.z; m21 = ya.z; m22 = za.z;
+	trace = m00 + m11 + m22;
+	if( trace > 0.0f )
+	{
+		sq = sqrtf( trace + 1.0f ) * 2.0f;
+		beam->pose.orientation.w = 0.25f * sq;
+		beam->pose.orientation.x = ( m21 - m12 ) / sq;
+		beam->pose.orientation.y = ( m02 - m20 ) / sq;
+		beam->pose.orientation.z = ( m10 - m01 ) / sq;
+	}
+	else if( m00 > m11 && m00 > m22 )
+	{
+		sq = sqrtf( 1.0f + m00 - m11 - m22 ) * 2.0f;
+		beam->pose.orientation.w = ( m21 - m12 ) / sq;
+		beam->pose.orientation.x = 0.25f * sq;
+		beam->pose.orientation.y = ( m01 + m10 ) / sq;
+		beam->pose.orientation.z = ( m02 + m20 ) / sq;
+	}
+	else if( m11 > m22 )
+	{
+		sq = sqrtf( 1.0f + m11 - m00 - m22 ) * 2.0f;
+		beam->pose.orientation.w = ( m02 - m20 ) / sq;
+		beam->pose.orientation.x = ( m01 + m10 ) / sq;
+		beam->pose.orientation.y = 0.25f * sq;
+		beam->pose.orientation.z = ( m12 + m21 ) / sq;
+	}
+	else
+	{
+		sq = sqrtf( 1.0f + m22 - m00 - m11 ) * 2.0f;
+		beam->pose.orientation.w = ( m10 - m01 ) / sq;
+		beam->pose.orientation.x = ( m02 + m20 ) / sq;
+		beam->pose.orientation.y = ( m12 + m21 ) / sq;
+		beam->pose.orientation.z = 0.25f * sq;
+	}
+	beam->pose.position = mid;
+	beam->space = xr.local_space;
+	beam->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+		XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+	beam->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+	beam->subImage.swapchain = xr.beam.swapchain;
+	beam->subImage.imageRect.extent.width = xr.beam.width;
+	beam->subImage.imageRect.extent.height = xr.beam.height;
+	beam->size.width = 0.004f;
+	beam->size.height = length;
+	return true;
+}
+
 qboolean GL_OpenXRBeginUI( int width, int height )
 {
 	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -1271,6 +1781,7 @@ qboolean GL_OpenXRBeginUI( int width, int height )
 	pglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
 	pglClearColor( 0.0f, 0.0f, 0.0f, 0.0f );
 	pglClear( GL_COLOR_BUFFER_BIT );
+	GL_OpenXRSetUIBlend( true );
 	return true;
 }
 
@@ -1281,6 +1792,9 @@ void GL_OpenXREndUI( void )
 	if( !xr.ui_active )
 		return;
 
+	GL_OpenXRDrawUIPointerDot();
+	GL_OpenXRFixUIAlpha();
+	GL_OpenXRSetUIBlend( false );
 	pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
 	pglViewport( 0, 0, xr.ui_source_width, xr.ui_source_height );
 	pglClearColor( xr.ui_clear_color[0], xr.ui_clear_color[1], xr.ui_clear_color[2], xr.ui_clear_color[3] );
@@ -1301,9 +1815,14 @@ void GL_OpenXRFrameEnd( void )
 	XrCompositionLayerProjectionView projection_views[REF_VR_MAX_EYES];
 	XrCompositionLayerProjection projection = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
 	XrCompositionLayerQuad ui = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-	const XrCompositionLayerBaseHeader *layers[2];
+	const XrCompositionLayerBaseHeader *layers[3];
+	XrCompositionLayerQuad beam = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
-	qboolean submit = xr.frame_begun && xr.frame_state.shouldRender && xr.views_valid;
+	/* The world view and the head-locked UI quad are submitted independently: in the main menu
+	 * (no map loaded) no eye is rendered, and requiring both eyes left the headset black. */
+	const qboolean frame_ok = xr.frame_begun && xr.frame_state.shouldRender && xr.views_valid;
+	qboolean eyes_ok = frame_ok;
+	qboolean submit;
 	uint32_t layer_count = 0;
 
 	if( !xr.frame_begun )
@@ -1322,15 +1841,15 @@ void GL_OpenXRFrameEnd( void )
 				"xrReleaseSwapchainImage(interrupted eye)" );
 			xr.eyes[i].acquired = false;
 			xr.eyes[i].waited = false;
-			submit = false;
+			eyes_ok = false;
 		}
 	}
 
 	for( int i = 0; i < REF_VR_MAX_EYES; ++i )
-		submit = submit && xr.eyes[i].ready;
+		eyes_ok = eyes_ok && xr.eyes[i].ready;
 
 	memset( projection_views, 0, sizeof( projection_views ));
-	if( submit )
+	if( eyes_ok )
 	{
 		projection.space = xr.local_space;
 		projection.viewCount = REF_VR_MAX_EYES;
@@ -1345,23 +1864,48 @@ void GL_OpenXRFrameEnd( void )
 			projection_views[i].subImage.imageRect.extent.height = xr.eyes[i].height;
 		}
 		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&projection;
-		if( xr.ui.ready )
+	}
+	if( frame_ok && xr.ui.ready )
+	{
 		{
 			float width = bound( 0.25f, vr_ui_width->value, 8.0f );
+			/* GL_OpenXRFixUIAlpha leaves unpremultiplied colour */
 			ui.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
 				XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
-			ui.space = xr.head_space;
 			ui.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 			ui.subImage.swapchain = xr.ui.swapchain;
 			ui.subImage.imageRect.extent.width = xr.ui.width;
 			ui.subImage.imageRect.extent.height = xr.ui.height;
-			ui.pose.orientation.w = 1.0f;
-			ui.pose.position.z = -bound( 0.2f, vr_ui_distance->value, 10.0f );
+			{
+				XrVector3f offset;
+				offset.x = bound( -1.0f, vr_ui_offset_x->value, 1.0f );
+				offset.y = bound( -1.0f, vr_ui_offset_y->value, 1.0f );
+				offset.z = -bound( 0.2f, vr_ui_distance->value, 10.0f );
+				if( xr.ui_world_active )
+				{
+					/* menu/console: hangs in the room where it opened */
+					XrVector3f rotated = GL_OpenXRRotateVector( xr.ui_anchor.orientation, offset );
+					ui.space = xr.local_space;
+					ui.pose.orientation = xr.ui_anchor.orientation;
+					ui.pose.position.x = xr.ui_anchor.position.x + rotated.x;
+					ui.pose.position.y = xr.ui_anchor.position.y + rotated.y;
+					ui.pose.position.z = xr.ui_anchor.position.z + rotated.z;
+				}
+				else
+				{
+					ui.space = xr.head_space;
+					ui.pose.orientation.w = 1.0f;
+					ui.pose.position = offset;
+				}
+			}
 			ui.size.width = width;
-			ui.size.height = width * (float)xr.ui.height / (float)xr.ui.width;
+			ui.size.height = GL_OpenXRUIHeight( width );
 			layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&ui;
 		}
 	}
+	if( frame_ok && layer_count > 0 && GL_OpenXRBuildBeamLayer( &beam ))
+		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&beam;
+	submit = layer_count > 0;
 
 	end_info.displayTime = xr.frame_state.predictedDisplayTime;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1369,7 +1913,7 @@ void GL_OpenXRFrameEnd( void )
 	end_info.layers = submit ? layers : NULL;
 	if( GL_OpenXRCheck( xrEndFrame( xr.session, &end_info ), "xrEndFrame" ) && submit )
 	{
-		if( !xr.submitted_once )
+		if( eyes_ok && !xr.submitted_once )
 		{
 			xr.submitted_once = true;
 			gEngfuncs.Con_Printf( "OpenXR: first stereo frame submitted\n" );
@@ -1432,6 +1976,13 @@ qboolean GL_OpenXRHaptic( int hand, float duration, float frequency, float ampli
 		(const XrHapticBaseHeader *)&vibration ), "xrApplyHapticFeedback" );
 	if( succeeded )
 	{
+		static qboolean logged;
+		if( !logged )
+		{
+			gEngfuncs.Con_Printf( "OpenXR: first haptic pulse accepted (hand %d, %.2f s, amplitude %.2f)\n",
+				hand, duration, vibration.amplitude );
+			logged = true;
+		}
 		xr.haptic_sustained[hand] = duration < 0.0f;
 		xr.haptic_until[hand] = duration < 0.0f ? 0.0 : now + clamped_duration;
 	}

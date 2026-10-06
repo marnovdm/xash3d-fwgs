@@ -736,6 +736,8 @@ typedef struct ref_interface_s
 	void (*R_VREndUI)( void );
 	void (*R_VRFrameEnd)( void );
 	qboolean (*R_VRHaptic)( int hand, float duration, float frequency, float amplitude );
+	// Screen fade over the whole current eye image (between R_VRBeginEye and R_VREndEye).
+	void (*R_VRDrawEyeFade)( const byte *rgba, qboolean modulate );
 } ref_interface_t;
 
 typedef int (*REFAPI)( int version, ref_interface_t *pFunctionTable, ref_api_t* engfuncs, ref_globals_t *pGlobals );
