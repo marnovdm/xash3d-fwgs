@@ -207,6 +207,7 @@ static cvar_t *vr_hud_hands;
 static cvar_t *vr_hud_hand_scale;
 static cvar_t *vr_hud_hand_tilt;
 static cvar_t *vr_hud_hand_yaw;
+static cvar_t *vr_hud_right_flip;
 static cvar_t *vr_hud_rect[GL_OPENXR_HUD_BOX_COUNT];
 static cvar_t *vr_hud_offset[GL_OPENXR_HAND_HUD_COUNT];
 
@@ -237,6 +238,8 @@ void GL_OpenXRInit( void )
 		"hand HUD panel tilt in degrees about the controller's sideways axis (negative = face more upwards)" );
 	vr_hud_hand_yaw = gEngfuncs.Cvar_Get( "vr_hud_hand_yaw", "90", FCVAR_ARCHIVE,
 		"hand HUD panels turned inwards in degrees, mirrored per hand (90 = facing your body, like a watch)" );
+	vr_hud_right_flip = gEngfuncs.Cvar_Get( "vr_hud_right_flip", "1", FCVAR_ARCHIVE,
+		"turn the right-hand HUD panel 180 degrees in its plane, so both panels read forwards along the arm when turned inwards" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0 0.06 0.02", FCVAR_ARCHIVE,
 		"health/suit panel position relative to the off-hand grip, metres: right up back" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_offset", "0 0.05 0.08", FCVAR_ARCHIVE,
@@ -1963,6 +1966,12 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	turn.y = sinf( yaw * 0.5f );
 	turn.w = cosf( yaw * 0.5f );
 	quad->pose.orientation = GL_OpenXRQuatMultiply( turn, lean );
+	if( hand == REF_VR_HAND_RIGHT && vr_hud_right_flip->value != 0.0f )
+	{
+		/* turned inwards, the panels are mirror images: the right one read backwards along the arm */
+		const XrQuaternionf flip = { 0.0f, 0.0f, 1.0f, 0.0f };
+		quad->pose.orientation = GL_OpenXRQuatMultiply( quad->pose.orientation, flip );
+	}
 	quad->pose.position.x = bound( -0.5f, offset[0], 0.5f );
 	quad->pose.position.y = bound( -0.5f, offset[1], 0.5f );
 	quad->pose.position.z = bound( -0.5f, offset[2], 0.5f );
