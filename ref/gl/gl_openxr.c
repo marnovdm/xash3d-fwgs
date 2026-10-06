@@ -83,6 +83,15 @@ extern XVisualInfo *glXGetVisualFromFBConfig( Display *display, GLXFBConfig conf
 #define GL_VIEWPORT 0x0BA2
 #endif
 
+/* Hand HUD panels (vr_hud_hands): the client reports where it drew health, suit and ammo
+ * (vr_hud_health_rect / vr_hud_suit_rect / vr_hud_ammo_rect). We copy those boxes out of the UI texture
+ * onto two small quads anchored to the controllers (health stacked above suit on the off hand, ammo on
+ * the weapon hand) and erase them from the head-locked panel. */
+enum { GL_OPENXR_HAND_HUD_STATUS, GL_OPENXR_HAND_HUD_AMMO, GL_OPENXR_HAND_HUD_COUNT };
+enum { GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_AMMO, GL_OPENXR_HUD_BOX_COUNT };
+#define GL_OPENXR_HAND_HUD_SLOT_WIDTH  512
+#define GL_OPENXR_HAND_HUD_SLOT_HEIGHT 192
+
 typedef struct gl_openxr_eye_s
 {
 	XrSwapchain swapchain;
@@ -156,6 +165,13 @@ typedef struct gl_openxr_state_s
 	qboolean ui_world_active;
 	XrPosef ui_anchor; /* level head pose captured when a menu opened (local space) */
 	gl_openxr_eye_t beam; /* tiny solid-colour swapchain for the menu pointer beam */
+	gl_openxr_eye_t hud;  /* hand HUD: status (health/suit) in the left half, ammo in the right half */
+	struct
+	{
+		qboolean valid;
+		int hud_width, hud_height; /* content size in HUD pixels (square on the desktop) */
+		uint32_t width, height;  /* used part of the panel's slot in the hand HUD swapchain */
+	} hand_hud[GL_OPENXR_HAND_HUD_COUNT];
 	struct
 	{
 		qboolean valid;
@@ -187,6 +203,11 @@ static cvar_t *vr_comfort_mask;
 static cvar_t *vr_comfort_moving;
 static cvar_t *vr_scope_engaged;
 static cvar_t *vr_mirror_eye;
+static cvar_t *vr_hud_hands;
+static cvar_t *vr_hud_hand_scale;
+static cvar_t *vr_hud_hand_tilt;
+static cvar_t *vr_hud_rect[GL_OPENXR_HUD_BOX_COUNT];
+static cvar_t *vr_hud_offset[GL_OPENXR_HAND_HUD_COUNT];
 
 void GL_OpenXRInit( void )
 {
@@ -207,6 +228,22 @@ void GL_OpenXRInit( void )
 		"internal VR movement state" );
 	vr_scope_engaged = gEngfuncs.Cvar_Get( "vr_scope_engaged", "0", 0,
 		"internal VR scope state" );
+	vr_hud_hands = gEngfuncs.Cvar_Get( "vr_hud_hands", "1", FCVAR_ARCHIVE,
+		"show health/suit on the off hand and ammo on the weapon hand instead of on the head-locked HUD" );
+	vr_hud_hand_scale = gEngfuncs.Cvar_Get( "vr_hud_hand_scale", "0.0005", FCVAR_ARCHIVE,
+		"hand HUD size: metres per HUD pixel (0.0005 = HUD digits about 1.2 cm tall)" );
+	vr_hud_hand_tilt = gEngfuncs.Cvar_Get( "vr_hud_hand_tilt", "-40", FCVAR_ARCHIVE,
+		"hand HUD panel tilt in degrees about the controller's sideways axis (negative = face more upwards)" );
+	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0 0.06 0.02", FCVAR_ARCHIVE,
+		"health/suit panel position relative to the off-hand grip, metres: right up back" );
+	vr_hud_offset[GL_OPENXR_HAND_HUD_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_offset", "0 0.05 0.08", FCVAR_ARCHIVE,
+		"ammo panel position relative to the weapon-hand grip, metres: right up back" );
+	vr_hud_rect[GL_OPENXR_HUD_BOX_HEALTH] = gEngfuncs.Cvar_Get( "vr_hud_health_rect", "", 0,
+		"set by the client: health HUD box \"x y w h screenwidth screenheight\"" );
+	vr_hud_rect[GL_OPENXR_HUD_BOX_SUIT] = gEngfuncs.Cvar_Get( "vr_hud_suit_rect", "", 0,
+		"set by the client: suit HUD box \"x y w h screenwidth screenheight\"" );
+	vr_hud_rect[GL_OPENXR_HUD_BOX_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_rect", "", 0,
+		"set by the client: ammo HUD box \"x y w h screenwidth screenheight\"" );
 }
 
 static void GL_OpenXRLogResult( const char *operation, XrResult result )
@@ -803,6 +840,7 @@ void GL_OpenXRShutdown( void )
 		GL_OpenXRDestroyEye( &xr.eyes[i] );
 	GL_OpenXRDestroyEye( &xr.ui );
 	GL_OpenXRDestroyEye( &xr.beam );
+	GL_OpenXRDestroyEye( &xr.hud );
 
 	for( int i = 0; i < REF_VR_MAX_HANDS; ++i )
 	{
@@ -1051,6 +1089,19 @@ static qboolean GL_OpenXRInitialize( void )
 		}
 	}
 
+	{
+		/* optional: without it the HUD simply stays on the head-locked panel */
+		XrViewConfigurationView hud_config = { XR_TYPE_VIEW_CONFIGURATION_VIEW };
+		float scale = bound( 0.5f, vr_supersampling->value, 2.0f );
+		hud_config.recommendedImageRectWidth = (uint32_t)( GL_OPENXR_HAND_HUD_SLOT_WIDTH * GL_OPENXR_HAND_HUD_COUNT / scale );
+		hud_config.recommendedImageRectHeight = (uint32_t)( GL_OPENXR_HAND_HUD_SLOT_HEIGHT / scale );
+		if( !GL_OpenXRCreateEye( &xr.hud, &hud_config, selected_format ))
+		{
+			GL_OpenXRDestroyEye( &xr.hud );
+			memset( &xr.hud, 0, sizeof( xr.hud ));
+		}
+	}
+
 	xr.initialized = true;
 #if defined( _WIN32 )
 	gEngfuncs.Con_Printf( "OpenXR: initialized Windows/WGL stereo session (%ux%u per eye)\n",
@@ -1225,6 +1276,7 @@ qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame )
 	xr.current_eye = -1;
 	xr.ui_active = false;
 	xr.ui.ready = false;
+	xr.hud.ready = false;
 	for( int i = 0; i < REF_VR_MAX_EYES; ++i )
 		xr.eyes[i].ready = false;
 	actions_synced = GL_OpenXRSyncActions();
@@ -1751,6 +1803,165 @@ static qboolean GL_OpenXRBuildBeamLayer( XrCompositionLayerQuad *beam )
 	return true;
 }
 
+/* "x y w h screenwidth screenheight" (HUD pixels, y down) -> UI texture pixels (GL, y up), with a small margin
+ * for the glow around the digits. */
+static qboolean GL_OpenXRParseHandHUDRect( const cvar_t *cv, int rect[4], int size[2] )
+{
+	int x, y, w, h, sw, sh;
+
+	if( !cv || sscanf( cv->string, "%d %d %d %d %d %d", &x, &y, &w, &h, &sw, &sh ) != 6 ||
+		w <= 0 || h <= 0 || sw <= 0 || sh <= 0 )
+		return false;
+	x -= 2; y -= 2; w += 4; h += 4;
+	size[0] = w;
+	size[1] = h;
+	rect[0] = bound( 0, x * (int)xr.ui.width / sw, (int)xr.ui.width );
+	rect[2] = bound( 0, ( x + w ) * (int)xr.ui.width / sw, (int)xr.ui.width );
+	rect[1] = bound( 0, (int)xr.ui.height - ( y + h ) * (int)xr.ui.height / sh, (int)xr.ui.height );
+	rect[3] = bound( 0, (int)xr.ui.height - y * (int)xr.ui.height / sh, (int)xr.ui.height );
+	return rect[2] > rect[0] && rect[3] > rect[1];
+}
+
+/* Runs with the finished UI framebuffer bound (after the alpha fix-up): copies the status and ammo boxes into the
+ * hand HUD swapchain and erases them from the head-locked UI. */
+static void GL_OpenXRCaptureHandHUD( void )
+{
+	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	/* boxes per panel, top to bottom */
+	static const int panel_boxes[GL_OPENXR_HAND_HUD_COUNT][2] = {
+		{ GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT },
+		{ GL_OPENXR_HUD_BOX_AMMO, -1 },
+	};
+	int rects[GL_OPENXR_HUD_BOX_COUNT][4], sizes[GL_OPENXR_HUD_BOX_COUNT][2];
+	qboolean box_valid[GL_OPENXR_HUD_BOX_COUNT];
+	float scale[GL_OPENXR_HAND_HUD_COUNT];
+	qboolean any = false;
+	const uint32_t slot = xr.hud.width / GL_OPENXR_HAND_HUD_COUNT;
+
+	xr.hand_hud[0].valid = xr.hand_hud[1].valid = false;
+	if( vr_hud_hands->value == 0.0f || xr.ui_world_active || xr.hud.swapchain == XR_NULL_HANDLE )
+		return;
+	for( int i = 0; i < GL_OPENXR_HUD_BOX_COUNT; ++i )
+	{
+		box_valid[i] = GL_OpenXRParseHandHUDRect( vr_hud_rect[i], rects[i], sizes[i] );
+		any = any || box_valid[i];
+	}
+	if( !any )
+		return;
+	/* panel content = its boxes stacked, scaled uniformly (in HUD pixels) to fit the slot */
+	for( int p = 0; p < GL_OPENXR_HAND_HUD_COUNT; ++p )
+	{
+		int width = 0, height = 0;
+		for( int j = 0; j < 2; ++j )
+		{
+			const int b = panel_boxes[p][j];
+			if( b < 0 || !box_valid[b] )
+				continue;
+			width = Q_max( width, sizes[b][0] );
+			height += sizes[b][1];
+		}
+		if( width <= 0 || height <= 0 )
+			continue;
+		scale[p] = Q_min( (float)slot / width, (float)xr.hud.height / height );
+		xr.hand_hud[p].valid = true;
+		xr.hand_hud[p].hud_width = width;
+		xr.hand_hud[p].hud_height = height;
+		xr.hand_hud[p].width = (uint32_t)( width * scale[p] );
+		xr.hand_hud[p].height = (uint32_t)( height * scale[p] );
+	}
+
+	if( !GL_OpenXRCheck( xrAcquireSwapchainImage( xr.hud.swapchain, &acquire_info, &xr.hud.image_index ),
+		"xrAcquireSwapchainImage(hand HUD)" ))
+		return;
+	wait_info.timeout = XR_INFINITE_DURATION;
+	if( !GL_OpenXRCheck( xrWaitSwapchainImage( xr.hud.swapchain, &wait_info ), "xrWaitSwapchainImage(hand HUD)" ))
+	{
+		xrReleaseSwapchainImage( xr.hud.swapchain, &release_info );
+		return;
+	}
+
+	pglPushAttrib( GL_ENABLE_BIT | GL_SCISSOR_BIT | GL_COLOR_BUFFER_BIT | GL_VIEWPORT_BIT );
+	pglDisable( GL_SCISSOR_TEST );
+	pglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+	pglClearColor( 0.0f, 0.0f, 0.0f, 0.0f );
+	pglBindFramebuffer( GL_FRAMEBUFFER, xr.hud.framebuffers[xr.hud.image_index] );
+	pglViewport( 0, 0, xr.hud.width, xr.hud.height );
+	pglClear( GL_COLOR_BUFFER_BIT );
+	pglBindFramebuffer( GL_READ_FRAMEBUFFER, xr.ui.framebuffers[xr.ui.image_index] );
+	pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, xr.hud.framebuffers[xr.hud.image_index] );
+	for( int p = 0; p < GL_OPENXR_HAND_HUD_COUNT; ++p )
+	{
+		/* GL images are bottom-up: the panel uses the bottom-left of its slot, first box on top */
+		float top = (float)xr.hand_hud[p].height;
+		if( !xr.hand_hud[p].valid )
+			continue;
+		for( int j = 0; j < 2; ++j )
+		{
+			const int b = panel_boxes[p][j];
+			int x0 = p * slot, y1 = (int)top, y0;
+			if( b < 0 || !box_valid[b] )
+				continue;
+			y0 = (int)( top - sizes[b][1] * scale[p] );
+			pglBlitFramebuffer( rects[b][0], rects[b][1], rects[b][2], rects[b][3],
+				x0, y0, x0 + (int)( sizes[b][0] * scale[p] ), y1, GL_COLOR_BUFFER_BIT, GL_LINEAR );
+			top = y0;
+		}
+	}
+	pglBindFramebuffer( GL_FRAMEBUFFER, xr.ui.framebuffers[xr.ui.image_index] );
+	pglEnable( GL_SCISSOR_TEST );
+	for( int i = 0; i < GL_OPENXR_HUD_BOX_COUNT; ++i )
+	{
+		if( !box_valid[i] )
+			continue;
+		pglScissor( rects[i][0], rects[i][1], rects[i][2] - rects[i][0], rects[i][3] - rects[i][1] );
+		pglClear( GL_COLOR_BUFFER_BIT );
+	}
+	pglPopAttrib();
+
+	if( !GL_OpenXRCheck( xrReleaseSwapchainImage( xr.hud.swapchain, &release_info ), "xrReleaseSwapchainImage(hand HUD)" ))
+	{
+		xr.hand_hud[0].valid = xr.hand_hud[1].valid = false;
+		return;
+	}
+	xr.hud.ready = true;
+}
+
+/* Quad for one hand HUD panel, in that controller's grip space so the compositor keeps it on the hand. */
+static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *quad )
+{
+	const int weapon_hand = GL_OpenXRPointerHand();
+	const int off_hand = weapon_hand == REF_VR_HAND_LEFT ? REF_VR_HAND_RIGHT : REF_VR_HAND_LEFT;
+	const int hand = index == GL_OPENXR_HAND_HUD_AMMO ? weapon_hand : off_hand;
+	const uint32_t slot = xr.hud.width / GL_OPENXR_HAND_HUD_COUNT;
+	float metres = bound( 0.00005f, vr_hud_hand_scale->value, 0.005f );
+	float tilt = DEG2RAD( bound( -90.0f, vr_hud_hand_tilt->value, 90.0f ));
+	float offset[3] = { 0.0f, 0.0f, 0.0f };
+
+	if( !xr.hud.ready || !xr.hand_hud[index].valid || xr.actions.grip_spaces[hand] == XR_NULL_HANDLE )
+		return false;
+	sscanf( vr_hud_offset[index]->string, "%f %f %f", &offset[0], &offset[1], &offset[2] );
+
+	quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+	quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+	quad->space = xr.actions.grip_spaces[hand];
+	quad->subImage.swapchain = xr.hud.swapchain;
+	quad->subImage.imageRect.offset.x = index * slot;
+	quad->subImage.imageRect.extent.width = xr.hand_hud[index].width;
+	quad->subImage.imageRect.extent.height = xr.hand_hud[index].height;
+	/* grip space: +X right, +Y up, -Z forward along the controller; the quad faces +Z (back towards you),
+	 * tilted about X so it faces up towards your eyes when the controller is held in front of you */
+	quad->pose.orientation.x = sinf( tilt * 0.5f );
+	quad->pose.orientation.w = cosf( tilt * 0.5f );
+	quad->pose.position.x = bound( -0.5f, offset[0], 0.5f );
+	quad->pose.position.y = bound( -0.5f, offset[1], 0.5f );
+	quad->pose.position.z = bound( -0.5f, offset[2], 0.5f );
+	quad->size.width = metres * xr.hand_hud[index].hud_width;
+	quad->size.height = metres * xr.hand_hud[index].hud_height;
+	return true;
+}
+
 qboolean GL_OpenXRBeginUI( int width, int height )
 {
 	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -1794,6 +2005,7 @@ void GL_OpenXREndUI( void )
 
 	GL_OpenXRDrawUIPointerDot();
 	GL_OpenXRFixUIAlpha();
+	GL_OpenXRCaptureHandHUD();
 	GL_OpenXRSetUIBlend( false );
 	pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
 	pglViewport( 0, 0, xr.ui_source_width, xr.ui_source_height );
@@ -1815,8 +2027,9 @@ void GL_OpenXRFrameEnd( void )
 	XrCompositionLayerProjectionView projection_views[REF_VR_MAX_EYES];
 	XrCompositionLayerProjection projection = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
 	XrCompositionLayerQuad ui = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-	const XrCompositionLayerBaseHeader *layers[3];
+	const XrCompositionLayerBaseHeader *layers[3 + GL_OPENXR_HAND_HUD_COUNT];
 	XrCompositionLayerQuad beam = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+	XrCompositionLayerQuad hand_hud[GL_OPENXR_HAND_HUD_COUNT];
 	XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
 	/* The world view and the head-locked UI quad are submitted independently: in the main menu
 	 * (no map loaded) no eye is rendered, and requiring both eyes left the headset black. */
@@ -1905,6 +2118,13 @@ void GL_OpenXRFrameEnd( void )
 	}
 	if( frame_ok && layer_count > 0 && GL_OpenXRBuildBeamLayer( &beam ))
 		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&beam;
+	for( int i = 0; i < GL_OPENXR_HAND_HUD_COUNT; ++i )
+	{
+		memset( &hand_hud[i], 0, sizeof( hand_hud[i] ));
+		hand_hud[i].type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+		if( frame_ok && eyes_ok && GL_OpenXRBuildHandHUDLayer( i, &hand_hud[i] ))
+			layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&hand_hud[i];
+	}
 	submit = layer_count > 0;
 
 	end_info.displayTime = xr.frame_state.predictedDisplayTime;
