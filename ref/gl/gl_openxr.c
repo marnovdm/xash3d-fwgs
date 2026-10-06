@@ -179,6 +179,11 @@ typedef struct gl_openxr_state_s
 		XrVector3f origin;    /* controller aim position (local space) */
 		XrVector3f hit;       /* where the aim ray meets the panel (local space) */
 	} ui_pointer[REF_VR_MAX_HANDS];
+	struct
+	{
+		qboolean grip_valid, aim_valid;
+		XrPosef grip, aim;     /* local space, this frame's predicted display time */
+	} hand_pose[REF_VR_MAX_HANDS];
 	int ui_source_width;
 	int ui_source_height;
 	float ui_clear_color[4];
@@ -234,16 +239,16 @@ void GL_OpenXRInit( void )
 		"show health/suit on the off hand and ammo on the weapon hand instead of on the head-locked HUD" );
 	vr_hud_hand_scale = gEngfuncs.Cvar_Get( "vr_hud_hand_scale", "0.0005", FCVAR_ARCHIVE,
 		"hand HUD size: metres per HUD pixel (0.0005 = HUD digits about 1.2 cm tall)" );
-	vr_hud_hand_tilt = gEngfuncs.Cvar_Get( "vr_hud_hand_tilt", "-45", FCVAR_ARCHIVE,
+	vr_hud_hand_tilt = gEngfuncs.Cvar_Get( "vr_hud_hand_tilt", "-20", FCVAR_ARCHIVE,
 		"hand HUD panel tilt in degrees about the controller's sideways axis (negative = face more upwards)" );
 	vr_hud_hand_yaw = gEngfuncs.Cvar_Get( "vr_hud_hand_yaw", "90", FCVAR_ARCHIVE,
 		"hand HUD panels turned inwards in degrees, mirrored per hand (90 = facing your body, like a watch)" );
 	vr_hud_right_flip = gEngfuncs.Cvar_Get( "vr_hud_right_flip", "1", FCVAR_ARCHIVE,
 		"turn the right-hand HUD panel 180 degrees in its plane, so both panels read forwards along the arm when turned inwards" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0 0.06 0.02", FCVAR_ARCHIVE,
-		"health/suit panel position relative to the off-hand grip, metres: right up back" );
+		"health/suit panel position from the off-hand palm, metres along the aim axes: right up back" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_offset", "0 0.05 0.08", FCVAR_ARCHIVE,
-		"ammo panel position relative to the weapon-hand grip, metres: right up back" );
+		"ammo panel position from the weapon-hand palm, metres along the aim axes: right up back" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_HEALTH] = gEngfuncs.Cvar_Get( "vr_hud_health_rect", "", 0,
 		"set by the client: health HUD box \"x y w h screenwidth screenheight\"" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_SUIT] = gEngfuncs.Cvar_Get( "vr_hud_suit_rect", "", 0,
@@ -723,6 +728,16 @@ static qboolean GL_OpenXRFillHandPose( int hand, XrAction action, XrSpace space,
 
 	GL_OpenXRFillPose( &location.pose, flag == REF_VR_HAND_GRIP_VALID ? &out->grip : &out->aim );
 	SetBits( out->flags, flag );
+	if( flag == REF_VR_HAND_GRIP_VALID )
+	{
+		xr.hand_pose[hand].grip = location.pose;
+		xr.hand_pose[hand].grip_valid = true;
+	}
+	else
+	{
+		xr.hand_pose[hand].aim = location.pose;
+		xr.hand_pose[hand].aim_valid = true;
+	}
 	if( flag == REF_VR_HAND_AIM_VALID && xr.views_valid )
 		GL_OpenXRFillUICursor( hand, &location.pose, out );
 	if( include_velocity )
@@ -1317,7 +1332,10 @@ qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame )
 		xr.ui_world_active = false;
 
 	for( int i = 0; i < REF_VR_MAX_HANDS; ++i )
+	{
 		xr.ui_pointer[i].valid = false;
+		xr.hand_pose[i].grip_valid = xr.hand_pose[i].aim_valid = false;
+	}
 
 	if( frame )
 	{
@@ -1948,33 +1966,42 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	XrQuaternionf turn = { 0.0f, 0.0f, 0.0f, 1.0f }, lean = { 0.0f, 0.0f, 0.0f, 1.0f };
 	float offset[3] = { 0.0f, 0.0f, 0.0f };
 
-	if( !xr.hud.ready || !xr.hand_hud[index].valid || xr.actions.grip_spaces[hand] == XR_NULL_HANDLE )
+	XrQuaternionf orientation;
+	XrVector3f along;
+
+	if( !xr.hud.ready || !xr.hand_hud[index].valid || !xr.hand_pose[hand].grip_valid || !xr.hand_pose[hand].aim_valid )
 		return false;
 	sscanf( vr_hud_offset[index]->string, "%f %f %f", &offset[0], &offset[1], &offset[2] );
 
 	quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
 	quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-	quad->space = xr.actions.grip_spaces[hand];
+	quad->space = xr.local_space;
 	quad->subImage.swapchain = xr.hud.swapchain;
 	quad->subImage.imageRect.offset.x = index * slot;
 	quad->subImage.imageRect.extent.width = xr.hand_hud[index].width;
 	quad->subImage.imageRect.extent.height = xr.hand_hud[index].height;
-	/* grip space: +X right, +Y up, -Z forward along the controller. The quad faces +Z (back towards you); it is
-	 * tilted about X to face upwards, then turned about Y towards your body (yaw after tilt keeps "up") */
+	/* Axes of the aim pose (+X right, +Y up, -Z where the gun points; SteamVR's grip pose points along the
+	 * handle, steeply down), positioned at the grip (palm). The quad faces +Z (back towards you); it is tilted
+	 * about X to face upwards, then turned about Y towards your body (yaw after tilt keeps "up"). */
 	lean.x = sinf( tilt * 0.5f );
 	lean.w = cosf( tilt * 0.5f );
 	turn.y = sinf( yaw * 0.5f );
 	turn.w = cosf( yaw * 0.5f );
-	quad->pose.orientation = GL_OpenXRQuatMultiply( turn, lean );
+	orientation = GL_OpenXRQuatMultiply( turn, lean );
 	if( hand == REF_VR_HAND_RIGHT && vr_hud_right_flip->value != 0.0f )
 	{
 		/* turned inwards, the panels are mirror images: the right one read backwards along the arm */
 		const XrQuaternionf flip = { 0.0f, 0.0f, 1.0f, 0.0f };
-		quad->pose.orientation = GL_OpenXRQuatMultiply( quad->pose.orientation, flip );
+		orientation = GL_OpenXRQuatMultiply( orientation, flip );
 	}
-	quad->pose.position.x = bound( -0.5f, offset[0], 0.5f );
-	quad->pose.position.y = bound( -0.5f, offset[1], 0.5f );
-	quad->pose.position.z = bound( -0.5f, offset[2], 0.5f );
+	quad->pose.orientation = GL_OpenXRQuatMultiply( xr.hand_pose[hand].aim.orientation, orientation );
+	along.x = bound( -0.5f, offset[0], 0.5f );
+	along.y = bound( -0.5f, offset[1], 0.5f );
+	along.z = bound( -0.5f, offset[2], 0.5f );
+	along = GL_OpenXRRotateVector( xr.hand_pose[hand].aim.orientation, along );
+	quad->pose.position.x = xr.hand_pose[hand].grip.position.x + along.x;
+	quad->pose.position.y = xr.hand_pose[hand].grip.position.y + along.y;
+	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
 	quad->size.width = metres * xr.hand_hud[index].hud_width;
 	quad->size.height = metres * xr.hand_hud[index].hud_height;
 	return true;
