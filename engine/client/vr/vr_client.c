@@ -25,6 +25,7 @@ static CVAR_DEFINE_AUTO( vr_walkdirection, "1", FCVAR_ARCHIVE, "movement directi
 static CVAR_DEFINE_AUTO( vr_swap_jumpduck, "1", FCVAR_ARCHIVE, "1: primary (Cross/A) jumps, secondary (Circle/B) ducks, like HL2VR; 0: Lambda1VR layout" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_threshold, "0.85", FCVAR_ARCHIVE, "stick deflection (0-1) that opens/steps the weapon menu; must also be mostly vertical" );
 static CVAR_DEFINE_AUTO( vr_ladder_aim, "0", FCVAR_ARCHIVE, "ladder climb direction: 0 look up/down (head), 1 point the off-hand controller" );
+static CVAR_DEFINE_AUTO( vr_weapon_stick_up_next, "0", FCVAR_ARCHIVE, "weapon menu stick direction: 0 up = previous weapon, down = next (Lambda1VR); 1 up = next" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_hold, "0.15", FCVAR_ARCHIVE, "seconds the stick must be held up/down to OPEN the weapon menu (steps inside it are immediate)" );
 static CVAR_DEFINE_AUTO( vr_laser_doubleclick, "0.35", FCVAR_ARCHIVE, "max seconds between the two off-hand stick clicks that cycle the laser sight (or scope smoothing); one click is use" );
 static CVAR_DEFINE_AUTO( vr_notify, "0", FCVAR_ARCHIVE, "show console notify lines (top left) over the VR HUD" );
@@ -188,6 +189,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_swap_jumpduck );
 	Cvar_RegisterVariable( &vr_ladder_aim );
 	Cvar_RegisterVariable( &vr_weapon_stick_hold );
+	Cvar_RegisterVariable( &vr_weapon_stick_up_next );
 	Cvar_RegisterVariable( &vr_laser_doubleclick );
 	Cvar_RegisterVariable( &vr_notify );
 	Cvar_RegisterVariable( &vr_weapon_stick_threshold );
@@ -831,8 +833,9 @@ void CL_VRFrameBegin( void )
 		{
 			if( !vr_weapon_latched )
 			{
-				/* stick up = next weapon, down = previous (user preference; Lambda1VR had it reversed) */
-				const char *select = fabs( yaxis ) > threshold ? ( yaxis > 0.0f ? "invnext\n" : "invprev\n" ) :
+				/* stick up = previous weapon, down = next, like Lambda1VR; vr_weapon_stick_up_next reverses it */
+				const qboolean next = ( yaxis > 0.0f ) == ( vr_weapon_stick_up_next.value != 0.0f );
+				const char *select = fabs( yaxis ) > threshold ? ( next ? "invnext\n" : "invprev\n" ) :
 					( xaxis > 0.0f ? "invprevslot\n" : "invnextslot\n" );
 				Cbuf_AddText( select );
 				vr_weapon_latched = true;
