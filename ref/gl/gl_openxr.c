@@ -87,8 +87,8 @@ extern XVisualInfo *glXGetVisualFromFBConfig( Display *display, GLXFBConfig conf
  * (vr_hud_health_rect / vr_hud_suit_rect / vr_hud_ammo_rect). We copy those boxes out of the UI texture
  * onto two small quads anchored to the controllers (health stacked above suit on the off hand, ammo on
  * the weapon hand) and erase them from the head-locked panel. */
-/* The third panel is the pointer weapon grid (client +vr_weaponpointer): it replaces the status panel on the off hand
- * while open, with a beam from the weapon hand; where the beam hits is sent back as vr_weapon_pointer_cursor. The
+/* The third panel is the pointer weapon grid (client +vr_weaponpointer): on the off hand, out past the status panel,
+ * shown while open, with a beam from the weapon hand; where the beam hits is sent back as vr_weapon_pointer_cursor. The
  * client draws the grid in up to three rows when it is wider than the HUD (vr_hud_weapons_rect, _weapons2_, _weapons3_);
  * here they are put side by side again, so the panel is always one row. */
 enum { GL_OPENXR_HAND_HUD_STATUS, GL_OPENXR_HAND_HUD_AMMO, GL_OPENXR_HAND_HUD_WEAPONS, GL_OPENXR_HAND_HUD_COUNT };
@@ -2111,8 +2111,6 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 
 	if( !xr.hud.ready || !xr.hand_hud[index].valid || !xr.hand_pose[hand].grip_valid || !xr.hand_pose[hand].aim_valid )
 		return false;
-	if( index == GL_OPENXR_HAND_HUD_STATUS && xr.hand_hud[GL_OPENXR_HAND_HUD_WEAPONS].valid )
-		return false; /* the weapon grid takes its place while open */
 	sscanf( vr_hud_offset[index]->string, "%f %f %f", &offset[0], &offset[1], &offset[2] );
 
 	quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
