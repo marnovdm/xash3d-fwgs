@@ -2229,6 +2229,13 @@ static void GL_OpenXRUpdateWeaponPointer( const XrCompositionLayerQuad *grid )
 		xr.weapon_pointer.end.x = o.x + d.x * reach;
 		xr.weapon_pointer.end.y = o.y + d.y * reach;
 		xr.weapon_pointer.end.z = o.z + d.z * reach;
+		{
+			/* the beam starts where the gun's laser sight does: 10 game units out along the barrel */
+			const float start = Q_min( 10.0f / Q_max( 1.0f, vr_worldscale->value ), reach * 0.9f );
+			xr.weapon_pointer.origin.x = o.x + d.x * start;
+			xr.weapon_pointer.origin.y = o.y + d.y * start;
+			xr.weapon_pointer.origin.z = o.z + d.z * start;
+		}
 	}
 	if( Q_strcmp( cursor, xr.weapon_pointer.cursor ))
 	{
