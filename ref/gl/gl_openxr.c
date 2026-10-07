@@ -271,7 +271,7 @@ void GL_OpenXRInit( void )
 		"hand HUD panels turned inwards in degrees, mirrored per hand (90 = facing your body, like a watch)" );
 	vr_hud_right_flip = gEngfuncs.Cvar_Get( "vr_hud_right_flip", "0", FCVAR_ARCHIVE,
 		"turn the right-hand HUD panel 180 degrees in its plane, so both panels read forwards along the arm when turned inwards" );
-	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0 0.035 0.02", FCVAR_ARCHIVE,
+	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0.025 0.035 0.02", FCVAR_ARCHIVE,
 		"health/suit panel position from the in-game off hand (flashlight), metres along the aim axes: right up back" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_offset", "0 0.025 0.08", FCVAR_ARCHIVE,
 		"ammo panel position from the weapon-hand palm, metres along the aim axes: right up back" );
