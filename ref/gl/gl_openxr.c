@@ -240,6 +240,7 @@ static cvar_t *vr_hud_right_flip;
 static cvar_t *vr_hud_rect[GL_OPENXR_HUD_BOX_COUNT];
 static cvar_t *vr_hud_offset[GL_OPENXR_HAND_HUD_COUNT];
 static cvar_t *vr_weapon_pointer_scale;
+static cvar_t *vr_weapon_pointer_yaw;
 
 void GL_OpenXRInit( void )
 {
@@ -286,10 +287,12 @@ void GL_OpenXRInit( void )
 		"set by the client: pointer weapon grid, second row (shown right of the first)" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_WEAPONS3] = gEngfuncs.Cvar_Get( "vr_hud_weapons3_rect", "", 0,
 		"set by the client: pointer weapon grid, third row (shown right of the second)" );
-	vr_hud_offset[GL_OPENXR_HAND_HUD_WEAPONS] = gEngfuncs.Cvar_Get( "vr_weapon_pointer_offset", "0 0.035 0.02", FCVAR_ARCHIVE,
-		"pointer weapon grid position from the off-hand palm, metres along the aim axes: right up back (oriented like the health panel)" );
-	vr_weapon_pointer_scale = gEngfuncs.Cvar_Get( "vr_weapon_pointer_scale", "0.00025", FCVAR_ARCHIVE,
-		"pointer weapon grid size: metres per HUD pixel (0.00025 = weapon icons about 4 cm wide)" );
+	vr_hud_offset[GL_OPENXR_HAND_HUD_WEAPONS] = gEngfuncs.Cvar_Get( "vr_weapon_pointer_offset", "0 0.035 -0.15", FCVAR_ARCHIVE,
+		"pointer weapon grid centre from the in-game off hand (flashlight), metres along the aim axes: right up back (-0.15 = out past the flashlight)" );
+	vr_weapon_pointer_scale = gEngfuncs.Cvar_Get( "vr_weapon_pointer_scale", "0.0005", FCVAR_ARCHIVE,
+		"pointer weapon grid size: metres per HUD pixel (0.0005 = weapon icons about 8 cm wide)" );
+	vr_weapon_pointer_yaw = gEngfuncs.Cvar_Get( "vr_weapon_pointer_yaw", "60", FCVAR_ARCHIVE,
+		"pointer weapon grid turn in degrees, like vr_hud_hand_yaw (90 = facing your body like the health panel; less turns its far end inwards and its face towards you)" );
 	gEngfuncs.Cvar_Get( "vr_weapon_pointer_cursor", "", 0,
 		"set by the renderer: \"x y\" HUD pixels the weapon hand points at on the weapon grid, empty when off it" );
 }
@@ -2064,6 +2067,14 @@ static void GL_OpenXRCaptureHandHUD( void )
 	xr.hud.ready = true;
 }
 
+/* The engine raises the eyes by vr_height_adjust, so in the game the guns and the flashlight are that much lower
+ * relative to you than the real controllers. The weapon grid and its pointer are shifted down by it to line up
+ * with the gun's laser sight and the flashlight model (LOCAL space: +Y up). */
+static float GL_OpenXRGameHandDrop( void )
+{
+	return bound( -1.0f, gEngfuncs.pfnGetCvarFloat( "vr_height_adjust" ), 1.0f );
+}
+
 /* Quad for one hand HUD panel, in that controller's grip space so the compositor keeps it on the hand. */
 static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *quad )
 {
@@ -2073,7 +2084,8 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	float metres = bound( 0.00005f, ( index == GL_OPENXR_HAND_HUD_WEAPONS ? vr_weapon_pointer_scale : vr_hud_hand_scale )->value, 0.005f );
 	float tilt = DEG2RAD( bound( -90.0f, vr_hud_hand_tilt->value, 90.0f ));
 	/* inwards = towards +X (right) on the left hand, -X on the right hand */
-	float yaw = DEG2RAD( bound( -180.0f, vr_hud_hand_yaw->value, 180.0f )) * ( hand == REF_VR_HAND_LEFT ? 1.0f : -1.0f );
+	float yaw = DEG2RAD( bound( -180.0f, ( index == GL_OPENXR_HAND_HUD_WEAPONS ? vr_weapon_pointer_yaw : vr_hud_hand_yaw )->value, 180.0f )) *
+		( hand == REF_VR_HAND_LEFT ? 1.0f : -1.0f );
 	XrQuaternionf turn = { 0.0f, 0.0f, 0.0f, 1.0f }, lean = { 0.0f, 0.0f, 0.0f, 1.0f };
 	float offset[3] = { 0.0f, 0.0f, 0.0f };
 
@@ -2126,6 +2138,8 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	quad->pose.position.x = xr.hand_pose[hand].grip.position.x + along.x;
 	quad->pose.position.y = xr.hand_pose[hand].grip.position.y + along.y;
 	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
+	if( index == GL_OPENXR_HAND_HUD_WEAPONS )
+		quad->pose.position.y -= GL_OpenXRGameHandDrop(); /* placed relative to the in-game flashlight */
 	return true;
 }
 
@@ -2147,7 +2161,8 @@ static void GL_OpenXRUpdateWeaponPointer( const XrCompositionLayerQuad *grid )
 		 * ammo panel and the gun's own laser sight do) */
 		const float adjust = DEG2RAD( bound( -90.0f, gEngfuncs.pfnGetCvarFloat( "vr_weapon_pitchadjust" ), 90.0f ));
 		const XrQuaternionf pitch = { sinf( adjust * 0.5f ), 0.0f, 0.0f, cosf( adjust * 0.5f ) };
-		const XrVector3f o = xr.hand_pose[hand].aim.position;
+		const XrVector3f o = { xr.hand_pose[hand].aim.position.x, xr.hand_pose[hand].aim.position.y - GL_OpenXRGameHandDrop(),
+			xr.hand_pose[hand].aim.position.z };
 		const XrVector3f d = GL_OpenXRRotateVector( GL_OpenXRQuatMultiply( xr.hand_pose[hand].aim.orientation, pitch ), forward );
 		const XrVector3f n = GL_OpenXRRotateVector( grid->pose.orientation, back );
 		const float facing = d.x * n.x + d.y * n.y + d.z * n.z;
