@@ -92,7 +92,7 @@ extern XVisualInfo *glXGetVisualFromFBConfig( Display *display, GLXFBConfig conf
  * client draws the grid in up to three rows when it is wider than the HUD (vr_hud_weapons_rect, _weapons2_, _weapons3_);
  * here they are put side by side again, so the panel is always one row. */
 enum { GL_OPENXR_HAND_HUD_STATUS, GL_OPENXR_HAND_HUD_AMMO, GL_OPENXR_HAND_HUD_WEAPONS, GL_OPENXR_HAND_HUD_COUNT };
-enum { GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_AMMO,
+enum { GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_AMMO, GL_OPENXR_HUD_BOX_DAMAGE,
 	GL_OPENXR_HUD_BOX_WEAPONS, GL_OPENXR_HUD_BOX_WEAPONS2, GL_OPENXR_HUD_BOX_WEAPONS3, GL_OPENXR_HUD_BOX_COUNT };
 #define GL_OPENXR_HAND_HUD_MAX_BOXES 3
 /* slots side by side in the hand HUD swapchain, in units of a GL_OPENXR_HAND_HUD_WIDTH-wide image */
@@ -178,6 +178,7 @@ typedef struct gl_openxr_state_s
 	{
 		qboolean valid;
 		int hud_width, hud_height; /* content size in HUD pixels (square on the desktop) */
+		int base_width;            /* status panel: width of health + suit; the damage icons extend it to the right */
 		uint32_t x, width, height; /* the panel's slot in the hand HUD swapchain */
 		int box_count;
 		struct
@@ -281,6 +282,8 @@ void GL_OpenXRInit( void )
 		"set by the client: suit HUD box \"x y w h screenwidth screenheight\"" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_rect", "", 0,
 		"set by the client: ammo HUD box \"x y w h screenwidth screenheight\"" );
+	vr_hud_rect[GL_OPENXR_HUD_BOX_DAMAGE] = gEngfuncs.Cvar_Get( "vr_hud_damage_rect", "", 0,
+		"set by the client: damage-type icons (drowning, freezing, ...) \"x y w h screenwidth screenheight\"" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_WEAPONS] = gEngfuncs.Cvar_Get( "vr_hud_weapons_rect", "", 0,
 		"set by the client: pointer weapon grid, first row \"x y w h screenwidth screenheight\"" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_WEAPONS2] = gEngfuncs.Cvar_Get( "vr_hud_weapons2_rect", "", 0,
@@ -1943,7 +1946,7 @@ static void GL_OpenXRCaptureHandHUD( void )
 	/* boxes per panel, top to bottom */
 	/* boxes per panel: stacked top to bottom, or (weapon grid rows) side by side left to right */
 	static const int panel_boxes[GL_OPENXR_HAND_HUD_COUNT][GL_OPENXR_HAND_HUD_MAX_BOXES] = {
-		{ GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, -1 },
+		{ GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_DAMAGE },
 		{ GL_OPENXR_HUD_BOX_AMMO, -1, -1 },
 		{ GL_OPENXR_HUD_BOX_WEAPONS, GL_OPENXR_HUD_BOX_WEAPONS2, GL_OPENXR_HUD_BOX_WEAPONS3 },
 	};
@@ -1986,6 +1989,8 @@ static void GL_OpenXRCaptureHandHUD( void )
 			xr.hand_hud[p].box[n].h = sizes[b][1];
 			if( side_by_side && n > 0 )
 				width += gap;
+			if( b == GL_OPENXR_HUD_BOX_DAMAGE )
+				xr.hand_hud[p].base_width = Q_max( 0, width - gap );
 			xr.hand_hud[p].box[n].px = side_by_side ? width : 0;
 			xr.hand_hud[p].box[n].py = side_by_side ? 0 : height;
 			xr.hand_hud[p].box_count++;
@@ -2002,6 +2007,14 @@ static void GL_OpenXRCaptureHandHUD( void )
 		}
 		if( width <= 0 || height <= 0 )
 			continue;
+		if( p == GL_OPENXR_HAND_HUD_STATUS )
+		{
+			/* vertically centred on each other (the damage icons are taller than the digits) */
+			for( int j = 0; j < xr.hand_hud[p].box_count; ++j )
+				xr.hand_hud[p].box[j].py = ( height - xr.hand_hud[p].box[j].h ) / 2;
+			if( !box_valid[GL_OPENXR_HUD_BOX_DAMAGE] )
+				xr.hand_hud[p].base_width = width;
+		}
 		/* stretched to fill the whole slot: SteamVR counts imageRect from the top, our content was at the
 		 * bottom (GL), so a short panel showed only empty texture. The quad's physical size (HUD pixels times
 		 * vr_hud_hand_scale) restores the aspect. */
@@ -2144,6 +2157,16 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
 	if( index != GL_OPENXR_HAND_HUD_AMMO )
 		quad->pose.position.y -= GL_OpenXRGameHandDrop(); /* off hand: placed relative to the in-game flashlight */
+	if( index == GL_OPENXR_HAND_HUD_STATUS && xr.hand_hud[index].hud_width > xr.hand_hud[index].base_width )
+	{
+		/* damage icons widen the panel to the right: keep health and suit where they were */
+		const XrVector3f right = { 1.0f, 0.0f, 0.0f };
+		const XrVector3f axis = GL_OpenXRRotateVector( quad->pose.orientation, right );
+		const float shift = 0.5f * metres * ( xr.hand_hud[index].hud_width - xr.hand_hud[index].base_width );
+		quad->pose.position.x += axis.x * shift;
+		quad->pose.position.y += axis.y * shift;
+		quad->pose.position.z += axis.z * shift;
+	}
 	return true;
 }
 
