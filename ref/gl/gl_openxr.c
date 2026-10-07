@@ -87,10 +87,14 @@ extern XVisualInfo *glXGetVisualFromFBConfig( Display *display, GLXFBConfig conf
  * (vr_hud_health_rect / vr_hud_suit_rect / vr_hud_ammo_rect). We copy those boxes out of the UI texture
  * onto two small quads anchored to the controllers (health stacked above suit on the off hand, ammo on
  * the weapon hand) and erase them from the head-locked panel. */
-enum { GL_OPENXR_HAND_HUD_STATUS, GL_OPENXR_HAND_HUD_AMMO, GL_OPENXR_HAND_HUD_COUNT };
-enum { GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_AMMO, GL_OPENXR_HUD_BOX_COUNT };
-#define GL_OPENXR_HAND_HUD_SLOT_WIDTH  512
-#define GL_OPENXR_HAND_HUD_SLOT_HEIGHT 192
+/* The third panel is the pointer weapon grid (client +vr_weaponpointer, vr_hud_weapons_rect): on the off hand,
+ * facing the head, with a beam from the weapon hand; where the beam hits is sent back as vr_weapon_pointer_cursor. */
+enum { GL_OPENXR_HAND_HUD_STATUS, GL_OPENXR_HAND_HUD_AMMO, GL_OPENXR_HAND_HUD_WEAPONS, GL_OPENXR_HAND_HUD_COUNT };
+enum { GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_AMMO, GL_OPENXR_HUD_BOX_WEAPONS, GL_OPENXR_HUD_BOX_COUNT };
+/* slots side by side in the hand HUD swapchain, in units of a GL_OPENXR_HAND_HUD_WIDTH-wide image */
+static const uint32_t gl_openxr_hand_hud_slot[GL_OPENXR_HAND_HUD_COUNT][2] = { { 0, 512 }, { 512, 512 }, { 1024, 1024 } };
+#define GL_OPENXR_HAND_HUD_WIDTH  2048
+#define GL_OPENXR_HAND_HUD_HEIGHT 512
 
 typedef struct gl_openxr_eye_s
 {
@@ -165,13 +169,23 @@ typedef struct gl_openxr_state_s
 	qboolean ui_world_active;
 	XrPosef ui_anchor; /* level head pose captured when a menu opened (local space) */
 	gl_openxr_eye_t beam; /* tiny solid-colour swapchain for the menu pointer beam */
-	gl_openxr_eye_t hud;  /* hand HUD: status (health/suit) in the left half, ammo in the right half */
+	gl_openxr_eye_t hud;  /* hand HUD: one slot per panel (gl_openxr_hand_hud_slot) */
 	struct
 	{
 		qboolean valid;
+		int hud_x, hud_y;          /* content origin in HUD pixels (top left, margin included) */
 		int hud_width, hud_height; /* content size in HUD pixels (square on the desktop) */
-		uint32_t width, height;  /* used part of the panel's slot in the hand HUD swapchain */
+		uint32_t x, width, height; /* the panel's slot in the hand HUD swapchain */
 	} hand_hud[GL_OPENXR_HAND_HUD_COUNT];
+	struct
+	{
+		qboolean valid;       /* the weapon grid is up and the weapon hand is tracked: draw the beam */
+		qboolean hit;         /* the beam ends on the grid */
+		float u, v;           /* where, 0..1 from the top left */
+		XrVector3f origin;    /* weapon-hand aim position (local space) */
+		XrVector3f end;       /* hit point, or a short way along the ray */
+		char cursor[32];      /* last value written to vr_weapon_pointer_cursor */
+	} weapon_pointer;
 	struct
 	{
 		qboolean valid;
@@ -215,6 +229,7 @@ static cvar_t *vr_hud_hand_yaw;
 static cvar_t *vr_hud_right_flip;
 static cvar_t *vr_hud_rect[GL_OPENXR_HUD_BOX_COUNT];
 static cvar_t *vr_hud_offset[GL_OPENXR_HAND_HUD_COUNT];
+static cvar_t *vr_weapon_pointer_scale;
 
 void GL_OpenXRInit( void )
 {
@@ -255,6 +270,14 @@ void GL_OpenXRInit( void )
 		"set by the client: suit HUD box \"x y w h screenwidth screenheight\"" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_rect", "", 0,
 		"set by the client: ammo HUD box \"x y w h screenwidth screenheight\"" );
+	vr_hud_rect[GL_OPENXR_HUD_BOX_WEAPONS] = gEngfuncs.Cvar_Get( "vr_hud_weapons_rect", "", 0,
+		"set by the client: pointer weapon grid box \"x y w h screenwidth screenheight\"" );
+	vr_hud_offset[GL_OPENXR_HAND_HUD_WEAPONS] = gEngfuncs.Cvar_Get( "vr_weapon_pointer_offset", "0 0.13 0", FCVAR_ARCHIVE,
+		"pointer weapon grid centre from the off-hand palm, metres: right up towards-you (the grid faces your head)" );
+	vr_weapon_pointer_scale = gEngfuncs.Cvar_Get( "vr_weapon_pointer_scale", "0.0004", FCVAR_ARCHIVE,
+		"pointer weapon grid size: metres per HUD pixel (0.0004 = weapon icons about 7 cm wide)" );
+	gEngfuncs.Cvar_Get( "vr_weapon_pointer_cursor", "", 0,
+		"set by the renderer: \"x y\" HUD pixels the weapon hand points at on the weapon grid, empty when off it" );
 }
 
 static void GL_OpenXRLogResult( const char *operation, XrResult result )
@@ -1114,8 +1137,8 @@ static qboolean GL_OpenXRInitialize( void )
 		/* optional: without it the HUD simply stays on the head-locked panel */
 		XrViewConfigurationView hud_config = { XR_TYPE_VIEW_CONFIGURATION_VIEW };
 		float scale = bound( 0.5f, vr_supersampling->value, 2.0f );
-		hud_config.recommendedImageRectWidth = (uint32_t)( GL_OPENXR_HAND_HUD_SLOT_WIDTH * GL_OPENXR_HAND_HUD_COUNT / scale );
-		hud_config.recommendedImageRectHeight = (uint32_t)( GL_OPENXR_HAND_HUD_SLOT_HEIGHT / scale );
+		hud_config.recommendedImageRectWidth = (uint32_t)( GL_OPENXR_HAND_HUD_WIDTH / scale );
+		hud_config.recommendedImageRectHeight = (uint32_t)( GL_OPENXR_HAND_HUD_HEIGHT / scale );
 		if( !GL_OpenXRCreateEye( &xr.hud, &hud_config, selected_format ))
 		{
 			GL_OpenXRDestroyEye( &xr.hud );
@@ -1745,19 +1768,74 @@ static qboolean GL_OpenXRPrepareBeam( void )
 	return GL_OpenXRCheck( xrReleaseSwapchainImage( xr.beam.swapchain, &release_info ), "xrReleaseSwapchainImage(beam)" );
 }
 
-/* Quad layer from the controller to the hit point, rotated about the ray to face the head. */
+/* Rotation with the given orthonormal axes as its columns. */
+static XrQuaternionf GL_OpenXRQuatFromBasis( XrVector3f xa, XrVector3f ya, XrVector3f za )
+{
+	const float m00 = xa.x, m01 = ya.x, m02 = za.x;
+	const float m10 = xa.y, m11 = ya.y, m12 = za.y;
+	const float m20 = xa.z, m21 = ya.z, m22 = za.z;
+	const float trace = m00 + m11 + m22;
+	XrQuaternionf q;
+	float sq;
+
+	if( trace > 0.0f )
+	{
+		sq = sqrtf( trace + 1.0f ) * 2.0f;
+		q.w = 0.25f * sq;
+		q.x = ( m21 - m12 ) / sq;
+		q.y = ( m02 - m20 ) / sq;
+		q.z = ( m10 - m01 ) / sq;
+	}
+	else if( m00 > m11 && m00 > m22 )
+	{
+		sq = sqrtf( 1.0f + m00 - m11 - m22 ) * 2.0f;
+		q.w = ( m21 - m12 ) / sq;
+		q.x = 0.25f * sq;
+		q.y = ( m01 + m10 ) / sq;
+		q.z = ( m02 + m20 ) / sq;
+	}
+	else if( m11 > m22 )
+	{
+		sq = sqrtf( 1.0f + m11 - m00 - m22 ) * 2.0f;
+		q.w = ( m02 - m20 ) / sq;
+		q.x = ( m01 + m10 ) / sq;
+		q.y = 0.25f * sq;
+		q.z = ( m12 + m21 ) / sq;
+	}
+	else
+	{
+		sq = sqrtf( 1.0f + m22 - m00 - m11 ) * 2.0f;
+		q.w = ( m10 - m01 ) / sq;
+		q.x = ( m02 + m20 ) / sq;
+		q.y = ( m12 + m21 ) / sq;
+		q.z = 0.25f * sq;
+	}
+	return q;
+}
+
+/* Quad layer from the controller to the hit point, rotated about the ray to face the head: the menu pointer, or
+ * the weapon grid pointer (never both: the grid is not shown while a menu is open). */
 static qboolean GL_OpenXRBuildBeamLayer( XrCompositionLayerQuad *beam )
 {
 	const int hand = GL_OpenXRPointerHand();
 	XrVector3f o, d, mid, to_head, xa, ya, za;
-	float length, dot, len, m00, m01, m02, m10, m11, m12, m20, m21, m22, trace, sq;
+	float length, dot, len;
 
-	if( !xr.ui_world_active || !xr.ui_pointer[hand].valid )
-		return false;
-	o = xr.ui_pointer[hand].origin;
-	d.x = xr.ui_pointer[hand].hit.x - o.x;
-	d.y = xr.ui_pointer[hand].hit.y - o.y;
-	d.z = xr.ui_pointer[hand].hit.z - o.z;
+	if( xr.ui_world_active && xr.ui_pointer[hand].valid )
+	{
+		o = xr.ui_pointer[hand].origin;
+		d.x = xr.ui_pointer[hand].hit.x - o.x;
+		d.y = xr.ui_pointer[hand].hit.y - o.y;
+		d.z = xr.ui_pointer[hand].hit.z - o.z;
+	}
+	else if( !xr.ui_world_active && xr.weapon_pointer.valid )
+	{
+		o = xr.weapon_pointer.origin;
+		d.x = xr.weapon_pointer.end.x - o.x;
+		d.y = xr.weapon_pointer.end.y - o.y;
+		d.z = xr.weapon_pointer.end.z - o.z;
+	}
+	else return false;
 	length = sqrtf( d.x * d.x + d.y * d.y + d.z * d.z );
 	if( length < 0.02f || !GL_OpenXRPrepareBeam() )
 		return false;
@@ -1777,43 +1855,7 @@ static qboolean GL_OpenXRBuildBeamLayer( XrCompositionLayerQuad *beam )
 	xa.y = ya.z * za.x - ya.x * za.z;
 	xa.z = ya.x * za.y - ya.y * za.x;
 
-	/* rotation matrix with columns x, y, z -> quaternion */
-	m00 = xa.x; m01 = ya.x; m02 = za.x;
-	m10 = xa.y; m11 = ya.y; m12 = za.y;
-	m20 = xa.z; m21 = ya.z; m22 = za.z;
-	trace = m00 + m11 + m22;
-	if( trace > 0.0f )
-	{
-		sq = sqrtf( trace + 1.0f ) * 2.0f;
-		beam->pose.orientation.w = 0.25f * sq;
-		beam->pose.orientation.x = ( m21 - m12 ) / sq;
-		beam->pose.orientation.y = ( m02 - m20 ) / sq;
-		beam->pose.orientation.z = ( m10 - m01 ) / sq;
-	}
-	else if( m00 > m11 && m00 > m22 )
-	{
-		sq = sqrtf( 1.0f + m00 - m11 - m22 ) * 2.0f;
-		beam->pose.orientation.w = ( m21 - m12 ) / sq;
-		beam->pose.orientation.x = 0.25f * sq;
-		beam->pose.orientation.y = ( m01 + m10 ) / sq;
-		beam->pose.orientation.z = ( m02 + m20 ) / sq;
-	}
-	else if( m11 > m22 )
-	{
-		sq = sqrtf( 1.0f + m11 - m00 - m22 ) * 2.0f;
-		beam->pose.orientation.w = ( m02 - m20 ) / sq;
-		beam->pose.orientation.x = ( m01 + m10 ) / sq;
-		beam->pose.orientation.y = 0.25f * sq;
-		beam->pose.orientation.z = ( m12 + m21 ) / sq;
-	}
-	else
-	{
-		sq = sqrtf( 1.0f + m22 - m00 - m11 ) * 2.0f;
-		beam->pose.orientation.w = ( m10 - m01 ) / sq;
-		beam->pose.orientation.x = ( m02 + m20 ) / sq;
-		beam->pose.orientation.y = ( m12 + m21 ) / sq;
-		beam->pose.orientation.z = 0.25f * sq;
-	}
+	beam->pose.orientation = GL_OpenXRQuatFromBasis( xa, ya, za );
 	beam->pose.position = mid;
 	beam->space = xr.local_space;
 	beam->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
@@ -1829,7 +1871,7 @@ static qboolean GL_OpenXRBuildBeamLayer( XrCompositionLayerQuad *beam )
 
 /* "x y w h screenwidth screenheight" (HUD pixels, y down) -> UI texture pixels (GL, y up), with a small margin
  * for the glow around the digits. */
-static qboolean GL_OpenXRParseHandHUDRect( const cvar_t *cv, int rect[4], int size[2] )
+static qboolean GL_OpenXRParseHandHUDRect( const cvar_t *cv, int rect[4], int origin[2], int size[2] )
 {
 	int x, y, w, h, sw, sh;
 
@@ -1837,6 +1879,8 @@ static qboolean GL_OpenXRParseHandHUDRect( const cvar_t *cv, int rect[4], int si
 		w <= 0 || h <= 0 || sw <= 0 || sh <= 0 )
 		return false;
 	x -= 2; y -= 2; w += 4; h += 4;
+	origin[0] = x;
+	origin[1] = y;
 	size[0] = w;
 	size[1] = h;
 	rect[0] = bound( 0, x * (int)xr.ui.width / sw, (int)xr.ui.width );
@@ -1846,8 +1890,34 @@ static qboolean GL_OpenXRParseHandHUDRect( const cvar_t *cv, int rect[4], int si
 	return rect[2] > rect[0] && rect[3] > rect[1];
 }
 
-/* Runs with the finished UI framebuffer bound (after the alpha fix-up): copies the status and ammo boxes into the
- * hand HUD swapchain and erases them from the head-locked UI. */
+/* Cursor dot on the weapon grid, at last frame's hit (the ray is cast against the panel pose in FrameEnd). Runs
+ * with the hand HUD framebuffer bound for drawing; the slot is stretched, so the dot is sized in HUD pixels. */
+static void GL_OpenXRDrawWeaponPointerDot( void )
+{
+	const int p = GL_OPENXR_HAND_HUD_WEAPONS;
+	float x, y, rx, ry;
+
+	if( !xr.hand_hud[p].valid || !xr.weapon_pointer.hit )
+		return;
+	rx = 4.0f * xr.hand_hud[p].width / xr.hand_hud[p].hud_width;
+	ry = 4.0f * xr.hand_hud[p].height / xr.hand_hud[p].hud_height;
+	x = xr.hand_hud[p].x + xr.weapon_pointer.u * xr.hand_hud[p].width;
+	y = ( 1.0f - xr.weapon_pointer.v ) * xr.hand_hud[p].height; /* GL: bottom-up */
+	pglEnable( GL_SCISSOR_TEST );
+	for( int ring = 0; ring < 2; ++ring )
+	{
+		const float k = ring ? 0.45f : 1.0f;
+		if( ring ) pglClearColor( 1.0f, 1.0f, 1.0f, 1.0f );
+		else pglClearColor( 0.9f, 0.15f, 0.12f, 1.0f );
+		pglScissor( (int)( x - rx * k ), (int)( y - ry * k ), Q_max( 1, (int)( 2.0f * rx * k )), Q_max( 1, (int)( 2.0f * ry * k )));
+		pglClear( GL_COLOR_BUFFER_BIT );
+	}
+	pglDisable( GL_SCISSOR_TEST );
+	pglClearColor( 0.0f, 0.0f, 0.0f, 0.0f );
+}
+
+/* Runs with the finished UI framebuffer bound (after the alpha fix-up): copies the status, ammo and weapon grid
+ * boxes into the hand HUD swapchain and erases them from the head-locked UI. */
 static void GL_OpenXRCaptureHandHUD( void )
 {
 	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -1857,19 +1927,22 @@ static void GL_OpenXRCaptureHandHUD( void )
 	static const int panel_boxes[GL_OPENXR_HAND_HUD_COUNT][2] = {
 		{ GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT },
 		{ GL_OPENXR_HUD_BOX_AMMO, -1 },
+		{ GL_OPENXR_HUD_BOX_WEAPONS, -1 },
 	};
-	int rects[GL_OPENXR_HUD_BOX_COUNT][4], sizes[GL_OPENXR_HUD_BOX_COUNT][2];
+	int rects[GL_OPENXR_HUD_BOX_COUNT][4], origins[GL_OPENXR_HUD_BOX_COUNT][2], sizes[GL_OPENXR_HUD_BOX_COUNT][2];
 	qboolean box_valid[GL_OPENXR_HUD_BOX_COUNT];
 	float scale[GL_OPENXR_HAND_HUD_COUNT];
 	qboolean any = false;
-	const uint32_t slot = xr.hud.width / GL_OPENXR_HAND_HUD_COUNT;
 
-	xr.hand_hud[0].valid = xr.hand_hud[1].valid = false;
-	if( vr_hud_hands->value == 0.0f || xr.ui_world_active || xr.hud.swapchain == XR_NULL_HANDLE )
+	for( int p = 0; p < GL_OPENXR_HAND_HUD_COUNT; ++p )
+		xr.hand_hud[p].valid = false;
+	if( xr.ui_world_active || xr.hud.swapchain == XR_NULL_HANDLE )
 		return;
 	for( int i = 0; i < GL_OPENXR_HUD_BOX_COUNT; ++i )
 	{
-		box_valid[i] = GL_OpenXRParseHandHUDRect( vr_hud_rect[i], rects[i], sizes[i] );
+		/* the weapon grid is only drawn for this panel, so it does not depend on vr_hud_hands */
+		box_valid[i] = ( i == GL_OPENXR_HUD_BOX_WEAPONS || vr_hud_hands->value != 0.0f ) &&
+			GL_OpenXRParseHandHUDRect( vr_hud_rect[i], rects[i], origins[i], sizes[i] );
 		any = any || box_valid[i];
 	}
 	if( !any )
@@ -1883,6 +1956,11 @@ static void GL_OpenXRCaptureHandHUD( void )
 			const int b = panel_boxes[p][j];
 			if( b < 0 || !box_valid[b] )
 				continue;
+			if( width == 0 )
+			{
+				xr.hand_hud[p].hud_x = origins[b][0];
+				xr.hand_hud[p].hud_y = origins[b][1];
+			}
 			width = Q_max( width, sizes[b][0] );
 			height += sizes[b][1];
 		}
@@ -1895,7 +1973,8 @@ static void GL_OpenXRCaptureHandHUD( void )
 		xr.hand_hud[p].valid = true;
 		xr.hand_hud[p].hud_width = width;
 		xr.hand_hud[p].hud_height = height;
-		xr.hand_hud[p].width = slot;
+		xr.hand_hud[p].x = gl_openxr_hand_hud_slot[p][0] * xr.hud.width / GL_OPENXR_HAND_HUD_WIDTH;
+		xr.hand_hud[p].width = gl_openxr_hand_hud_slot[p][1] * xr.hud.width / GL_OPENXR_HAND_HUD_WIDTH;
 		xr.hand_hud[p].height = xr.hud.height;
 	}
 
@@ -1927,15 +2006,18 @@ static void GL_OpenXRCaptureHandHUD( void )
 		for( int j = 0; j < 2; ++j )
 		{
 			const int b = panel_boxes[p][j];
-			int x0 = p * slot, y1 = (int)top, y0;
+			const int x0 = (int)xr.hand_hud[p].x, y1 = (int)top;
+			int y0;
 			if( b < 0 || !box_valid[b] )
 				continue;
 			y0 = (int)( top - sizes[b][1] * scale[p] );
 			pglBlitFramebuffer( rects[b][0], rects[b][1], rects[b][2], rects[b][3],
-				x0, y0, x0 + (int)( slot * (float)sizes[b][0] / xr.hand_hud[p].hud_width ), y1, GL_COLOR_BUFFER_BIT, GL_LINEAR );
+				x0, y0, x0 + (int)( xr.hand_hud[p].width * (float)sizes[b][0] / xr.hand_hud[p].hud_width ), y1,
+				GL_COLOR_BUFFER_BIT, GL_LINEAR );
 			top = y0;
 		}
 	}
+	GL_OpenXRDrawWeaponPointerDot();
 	pglBindFramebuffer( GL_FRAMEBUFFER, xr.ui.framebuffers[xr.ui.image_index] );
 	pglEnable( GL_SCISSOR_TEST );
 	for( int i = 0; i < GL_OPENXR_HUD_BOX_COUNT; ++i )
@@ -1949,7 +2031,8 @@ static void GL_OpenXRCaptureHandHUD( void )
 
 	if( !GL_OpenXRCheck( xrReleaseSwapchainImage( xr.hud.swapchain, &release_info ), "xrReleaseSwapchainImage(hand HUD)" ))
 	{
-		xr.hand_hud[0].valid = xr.hand_hud[1].valid = false;
+		for( int p = 0; p < GL_OPENXR_HAND_HUD_COUNT; ++p )
+			xr.hand_hud[p].valid = false;
 		return;
 	}
 	xr.hud.ready = true;
@@ -1961,8 +2044,7 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	const int weapon_hand = GL_OpenXRPointerHand();
 	const int off_hand = weapon_hand == REF_VR_HAND_LEFT ? REF_VR_HAND_RIGHT : REF_VR_HAND_LEFT;
 	const int hand = index == GL_OPENXR_HAND_HUD_AMMO ? weapon_hand : off_hand;
-	const uint32_t slot = xr.hud.width / GL_OPENXR_HAND_HUD_COUNT;
-	float metres = bound( 0.00005f, vr_hud_hand_scale->value, 0.005f );
+	float metres = bound( 0.00005f, ( index == GL_OPENXR_HAND_HUD_WEAPONS ? vr_weapon_pointer_scale : vr_hud_hand_scale )->value, 0.005f );
 	float tilt = DEG2RAD( bound( -90.0f, vr_hud_hand_tilt->value, 90.0f ));
 	/* inwards = towards +X (right) on the left hand, -X on the right hand */
 	float yaw = DEG2RAD( bound( -180.0f, vr_hud_hand_yaw->value, 180.0f )) * ( hand == REF_VR_HAND_LEFT ? 1.0f : -1.0f );
@@ -1980,9 +2062,52 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 	quad->space = xr.local_space;
 	quad->subImage.swapchain = xr.hud.swapchain;
-	quad->subImage.imageRect.offset.x = index * slot;
+	quad->subImage.imageRect.offset.x = xr.hand_hud[index].x;
 	quad->subImage.imageRect.extent.width = xr.hand_hud[index].width;
 	quad->subImage.imageRect.extent.height = xr.hand_hud[index].height;
+	quad->size.width = metres * xr.hand_hud[index].hud_width;
+	quad->size.height = metres * xr.hand_hud[index].hud_height;
+	if( index == GL_OPENXR_HAND_HUD_WEAPONS )
+	{
+		/* held like a tablet: at the palm, upright and facing the head (no roll), so wrist jitter does not
+		 * move the targets the other hand is pointing at */
+		const XrVector3f up = { 0.0f, 1.0f, 0.0f };
+		XrVector3f xa, ya, za, centre = xr.hand_pose[hand].grip.position;
+
+		for( int pass = 0; pass < 2; ++pass ) /* the second pass faces the head from the offset position */
+		{
+			float len;
+			za.x = xr.head_pose.position.x - centre.x;
+			za.y = xr.head_pose.position.y - centre.y;
+			za.z = xr.head_pose.position.z - centre.z;
+			len = sqrtf( za.x * za.x + za.y * za.y + za.z * za.z );
+			if( len < 0.01f )
+				return false;
+			za.x /= len; za.y /= len; za.z /= len;
+			xa.x = up.y * za.z - up.z * za.y; /* x = up cross z */
+			xa.y = up.z * za.x - up.x * za.z;
+			xa.z = up.x * za.y - up.y * za.x;
+			len = sqrtf( xa.x * xa.x + xa.y * xa.y + xa.z * xa.z );
+			if( len < 0.01f )
+				return false; /* hand straight above or below the head */
+			xa.x /= len; xa.y /= len; xa.z /= len;
+			ya.x = za.y * xa.z - za.z * xa.y; /* y = z cross x */
+			ya.y = za.z * xa.x - za.x * xa.z;
+			ya.z = za.x * xa.y - za.y * xa.x;
+			centre = xr.hand_pose[hand].grip.position;
+			for( int k = 0; k < 3; ++k )
+			{
+				const XrVector3f *axis = k == 0 ? &xa : k == 1 ? &ya : &za;
+				const float o = bound( -0.5f, offset[k], 0.5f );
+				centre.x += axis->x * o;
+				centre.y += axis->y * o;
+				centre.z += axis->z * o;
+			}
+		}
+		quad->pose.orientation = GL_OpenXRQuatFromBasis( xa, ya, za );
+		quad->pose.position = centre;
+		return true;
+	}
 	/* Axes of the aim pose (+X right, +Y up, -Z where the gun points; SteamVR's grip pose points along the
 	 * handle, steeply down), positioned at the grip (palm). The quad faces +Z (back towards you); it is tilted
 	 * about X to face upwards, then turned about Y towards your body (yaw after tilt keeps "up"). */
@@ -2014,9 +2139,62 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	quad->pose.position.x = xr.hand_pose[hand].grip.position.x + along.x;
 	quad->pose.position.y = xr.hand_pose[hand].grip.position.y + along.y;
 	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
-	quad->size.width = metres * xr.hand_hud[index].hud_width;
-	quad->size.height = metres * xr.hand_hud[index].hud_height;
 	return true;
+}
+
+/* Cast the weapon hand's aim ray at the weapon grid quad (NULL: grid not shown) and tell the client which HUD pixel
+ * it hits (vr_weapon_pointer_cursor "x y", empty when off the grid). */
+static void GL_OpenXRUpdateWeaponPointer( const XrCompositionLayerQuad *grid )
+{
+	const int hand = GL_OpenXRPointerHand();
+	const int p = GL_OPENXR_HAND_HUD_WEAPONS;
+	const XrVector3f forward = { 0.0f, 0.0f, -1.0f }, right = { 1.0f, 0.0f, 0.0f }, up = { 0.0f, 1.0f, 0.0f };
+	const XrVector3f back = { 0.0f, 0.0f, 1.0f };
+	char cursor[32] = "";
+	float reach = 0.6f; /* beam length when it misses the grid */
+
+	xr.weapon_pointer.valid = xr.weapon_pointer.hit = false;
+	if( grid && xr.hand_pose[hand].aim_valid )
+	{
+		const XrVector3f o = xr.hand_pose[hand].aim.position;
+		const XrVector3f d = GL_OpenXRRotateVector( xr.hand_pose[hand].aim.orientation, forward );
+		const XrVector3f n = GL_OpenXRRotateVector( grid->pose.orientation, back );
+		const float facing = d.x * n.x + d.y * n.y + d.z * n.z;
+
+		xr.weapon_pointer.valid = true;
+		xr.weapon_pointer.origin = o;
+		if( facing < -0.0001f )
+		{
+			const XrVector3f c = grid->pose.position;
+			const float t = (( c.x - o.x ) * n.x + ( c.y - o.y ) * n.y + ( c.z - o.z ) * n.z ) / facing;
+			if( t > 0.0f )
+			{
+				const XrVector3f xa = GL_OpenXRRotateVector( grid->pose.orientation, right );
+				const XrVector3f ya = GL_OpenXRRotateVector( grid->pose.orientation, up );
+				const XrVector3f h = { o.x + d.x * t - c.x, o.y + d.y * t - c.y, o.z + d.z * t - c.z };
+				const float u = ( h.x * xa.x + h.y * xa.y + h.z * xa.z ) / grid->size.width + 0.5f;
+				const float v = 0.5f - ( h.x * ya.x + h.y * ya.y + h.z * ya.z ) / grid->size.height;
+				if( u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f )
+				{
+					xr.weapon_pointer.hit = true;
+					xr.weapon_pointer.u = u;
+					xr.weapon_pointer.v = v;
+					reach = t;
+					Q_snprintf( cursor, sizeof( cursor ), "%d %d",
+						xr.hand_hud[p].hud_x + (int)( u * xr.hand_hud[p].hud_width ),
+						xr.hand_hud[p].hud_y + (int)( v * xr.hand_hud[p].hud_height ));
+				}
+			}
+		}
+		xr.weapon_pointer.end.x = o.x + d.x * reach;
+		xr.weapon_pointer.end.y = o.y + d.y * reach;
+		xr.weapon_pointer.end.z = o.z + d.z * reach;
+	}
+	if( Q_strcmp( cursor, xr.weapon_pointer.cursor ))
+	{
+		gEngfuncs.Cvar_Set( "vr_weapon_pointer_cursor", cursor );
+		Q_strncpy( xr.weapon_pointer.cursor, cursor, sizeof( xr.weapon_pointer.cursor ));
+	}
 }
 
 qboolean GL_OpenXRBeginUI( int width, int height )
@@ -2173,15 +2351,22 @@ void GL_OpenXRFrameEnd( void )
 			layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&ui;
 		}
 	}
+	{
+		qboolean grid = false;
+		for( int i = 0; i < GL_OPENXR_HAND_HUD_COUNT; ++i )
+		{
+			memset( &hand_hud[i], 0, sizeof( hand_hud[i] ));
+			hand_hud[i].type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+			if( frame_ok && eyes_ok && GL_OpenXRBuildHandHUDLayer( i, &hand_hud[i] ))
+			{
+				layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&hand_hud[i];
+				grid = grid || i == GL_OPENXR_HAND_HUD_WEAPONS;
+			}
+		}
+		GL_OpenXRUpdateWeaponPointer( grid ? &hand_hud[GL_OPENXR_HAND_HUD_WEAPONS] : NULL );
+	}
 	if( frame_ok && layer_count > 0 && GL_OpenXRBuildBeamLayer( &beam ))
 		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&beam;
-	for( int i = 0; i < GL_OPENXR_HAND_HUD_COUNT; ++i )
-	{
-		memset( &hand_hud[i], 0, sizeof( hand_hud[i] ));
-		hand_hud[i].type = XR_TYPE_COMPOSITION_LAYER_QUAD;
-		if( frame_ok && eyes_ok && GL_OpenXRBuildHandHUDLayer( i, &hand_hud[i] ))
-			layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&hand_hud[i];
-	}
 	submit = layer_count > 0;
 
 	end_info.displayTime = xr.frame_state.predictedDisplayTime;
