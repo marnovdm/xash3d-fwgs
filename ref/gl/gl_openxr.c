@@ -272,7 +272,7 @@ void GL_OpenXRInit( void )
 	vr_hud_right_flip = gEngfuncs.Cvar_Get( "vr_hud_right_flip", "0", FCVAR_ARCHIVE,
 		"turn the right-hand HUD panel 180 degrees in its plane, so both panels read forwards along the arm when turned inwards" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0 0.035 0.02", FCVAR_ARCHIVE,
-		"health/suit panel position from the off-hand palm, metres along the aim axes: right up back" );
+		"health/suit panel position from the in-game off hand (flashlight), metres along the aim axes: right up back" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_offset", "0 0.025 0.08", FCVAR_ARCHIVE,
 		"ammo panel position from the weapon-hand palm, metres along the aim axes: right up back" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_HEALTH] = gEngfuncs.Cvar_Get( "vr_hud_health_rect", "", 0,
@@ -1968,7 +1968,9 @@ static void GL_OpenXRCaptureHandHUD( void )
 	/* panel content = its boxes stacked (or side by side), stretched to fill the slot */
 	for( int p = 0; p < GL_OPENXR_HAND_HUD_COUNT; ++p )
 	{
-		const qboolean side_by_side = p == GL_OPENXR_HAND_HUD_WEAPONS;
+		/* health and suit side by side like the desktop HUD (with a gap), weapon grid rows joined into one row */
+		const qboolean side_by_side = p == GL_OPENXR_HAND_HUD_WEAPONS || p == GL_OPENXR_HAND_HUD_STATUS;
+		const int gap = p == GL_OPENXR_HAND_HUD_STATUS ? 12 : 0;
 		int width = 0, height = 0;
 		xr.hand_hud[p].box_count = 0;
 		for( int j = 0; j < GL_OPENXR_HAND_HUD_MAX_BOXES; ++j )
@@ -1982,6 +1984,8 @@ static void GL_OpenXRCaptureHandHUD( void )
 			xr.hand_hud[p].box[n].hud_y = origins[b][1];
 			xr.hand_hud[p].box[n].w = sizes[b][0];
 			xr.hand_hud[p].box[n].h = sizes[b][1];
+			if( side_by_side && n > 0 )
+				width += gap;
 			xr.hand_hud[p].box[n].px = side_by_side ? width : 0;
 			xr.hand_hud[p].box[n].py = side_by_side ? 0 : height;
 			xr.hand_hud[p].box_count++;
@@ -2138,8 +2142,8 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	quad->pose.position.x = xr.hand_pose[hand].grip.position.x + along.x;
 	quad->pose.position.y = xr.hand_pose[hand].grip.position.y + along.y;
 	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
-	if( index == GL_OPENXR_HAND_HUD_WEAPONS )
-		quad->pose.position.y -= GL_OpenXRGameHandDrop(); /* placed relative to the in-game flashlight */
+	if( index != GL_OPENXR_HAND_HUD_AMMO )
+		quad->pose.position.y -= GL_OpenXRGameHandDrop(); /* off hand: placed relative to the in-game flashlight */
 	return true;
 }
 
