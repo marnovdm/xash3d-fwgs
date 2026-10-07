@@ -2143,8 +2143,12 @@ static void GL_OpenXRUpdateWeaponPointer( const XrCompositionLayerQuad *grid )
 	xr.weapon_pointer.valid = xr.weapon_pointer.hit = false;
 	if( grid && xr.hand_pose[hand].aim_valid )
 	{
+		/* along the gun model, which the client points vr_weapon_pitchadjust degrees off the controller (as the
+		 * ammo panel and the gun's own laser sight do) */
+		const float adjust = DEG2RAD( bound( -90.0f, gEngfuncs.pfnGetCvarFloat( "vr_weapon_pitchadjust" ), 90.0f ));
+		const XrQuaternionf pitch = { sinf( adjust * 0.5f ), 0.0f, 0.0f, cosf( adjust * 0.5f ) };
 		const XrVector3f o = xr.hand_pose[hand].aim.position;
-		const XrVector3f d = GL_OpenXRRotateVector( xr.hand_pose[hand].aim.orientation, forward );
+		const XrVector3f d = GL_OpenXRRotateVector( GL_OpenXRQuatMultiply( xr.hand_pose[hand].aim.orientation, pitch ), forward );
 		const XrVector3f n = GL_OpenXRRotateVector( grid->pose.orientation, back );
 		const float facing = d.x * n.x + d.y * n.y + d.z * n.z;
 

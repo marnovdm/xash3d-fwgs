@@ -27,8 +27,7 @@ static CVAR_DEFINE_AUTO( vr_weapon_stick_threshold, "0.85", FCVAR_ARCHIVE, "stic
 static CVAR_DEFINE_AUTO( vr_ladder_aim, "0", FCVAR_ARCHIVE, "ladder climb direction: 0 look up/down (head), 1 point the off-hand controller" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_up_next, "0", FCVAR_ARCHIVE, "weapon menu stick direction: 0 up = previous weapon, down = next (Lambda1VR); 1 up = next" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_hold, "0.15", FCVAR_ARCHIVE, "seconds the stick must be held up/down to OPEN the weapon menu (steps inside it are immediate)" );
-static CVAR_DEFINE_AUTO( vr_weapon_pointer, "1", FCVAR_ARCHIVE, "hold left Triangle (Y) for the weapon grid on the off hand, point at a weapon with the weapon hand and release to switch; a tap is still the previous weapon" );
-static CVAR_DEFINE_AUTO( vr_weapon_pointer_hold, "0.25", FCVAR_ARCHIVE, "seconds Triangle (Y) must be held to open the pointer weapon grid; shorter is a tap (previous weapon)" );
+static CVAR_DEFINE_AUTO( vr_weapon_pointer, "1", FCVAR_ARCHIVE, "left Triangle (Y) shows the weapon grid on the off hand while held: point at a weapon with the weapon hand and release to switch; 0 = Triangle is the previous weapon" );
 static CVAR_DEFINE_AUTO( vr_laser_doubleclick, "0.35", FCVAR_ARCHIVE, "max seconds between the two off-hand stick clicks that cycle the laser sight (or scope smoothing); one click is use" );
 static CVAR_DEFINE_AUTO( vr_notify, "0", FCVAR_ARCHIVE, "show console notify lines (top left) over the VR HUD" );
 static CVAR_DEFINE_AUTO( vr_reloadtimeoutms, "200", FCVAR_ARCHIVE, "maximum squeeze tap duration used for reload" );
@@ -82,7 +81,7 @@ static qboolean vr_offhand_stick_chord; /* both sticks down during this off-hand
 static double vr_offhand_stick_since; /* when the current off-hand click went down, 0 when up */
 static double vr_offhand_stick_last; /* press time of the previous plain off-hand click, 0 = none */
 static qboolean vr_offhand_stick_second; /* the current click came within vr_laser_doubleclick of the last */
-static double vr_screen_button_since; /* single player: when Triangle (Y) went down outside the backpack, 0 = not held */
+static double vr_screen_button_since; /* single player: when Triangle (Y) went down outside the backpack with the grid opened, 0 = not held */
 static qboolean vr_weapon_pointer_open; /* the hold opened the client's pointer weapon grid */
 static int vr_weapon_scroll_count;
 static qboolean vr_scope_zoom_latched;
@@ -196,7 +195,6 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_weapon_stick_up_next );
 	Cvar_RegisterVariable( &vr_laser_doubleclick );
 	Cvar_RegisterVariable( &vr_weapon_pointer );
-	Cvar_RegisterVariable( &vr_weapon_pointer_hold );
 	Cvar_RegisterVariable( &vr_notify );
 	Cvar_RegisterVariable( &vr_weapon_stick_threshold );
 	Cvar_RegisterVariable( &vr_headtorch );
@@ -753,38 +751,36 @@ void CL_VRFrameBegin( void )
 				( vr_frame.hands[screen_hand].buttons & REF_VR_BUTTON_SECONDARY ))
 			{
 				/* multiplayer: scoreboard (Lambda1VR); single player has none, so the button
-				 * (left Triangle / Y) is weapon selection instead: a tap switches to the previous
-				 * weapon, a hold opens the pointer weapon grid (handled below) */
+				 * (left Triangle / Y) opens the pointer weapon grid while held (release handled
+				 * below), or without the grid switches to the previous weapon */
 				if( cl.maxclients > 1 )
 				{
 					vr_scoreboard_active = !vr_scoreboard_active;
 					Cbuf_AddText( vr_scoreboard_active ? "+showscores\n" : "-showscores\n" );
 				}
-				else vr_screen_button_since = host.realtime;
+				else if( vr_weapon_pointer.value != 0.0f && Cmd_Exists( "+vr_weaponpointer" ))
+				{
+					Cbuf_AddText( "+vr_weaponpointer\n" );
+					vr_weapon_pointer_open = true;
+					vr_screen_button_since = host.realtime;
+				}
+				else Cbuf_AddText( "lastinv\n" );
 			}
 		}
 	}
 
-	/* Triangle tap / hold, tracked outside the branch above so moving the hand behind the shoulder
-	 * while holding still sees the release. Tap = previous weapon (on release now, so a hold can
-	 * become the grid); hold = the client's pointer grid, switching to the weapon pointed at on release. */
+	/* Triangle release closes the grid (switching to the weapon pointed at). Tracked outside the
+	 * branch above so moving the hand behind the shoulder while holding still sees the release. */
 	if( vr_screen_button_since != 0.0 )
 	{
 		int screen_hand = variant == 2 ? dominant : offhand;
 
 		if( !FBitSet( vr_frame.hands[screen_hand].buttons, REF_VR_BUTTON_SECONDARY ))
 		{
-			Cbuf_AddText( vr_weapon_pointer_open ? "-vr_weaponpointer\n" : "lastinv\n" );
+			if( vr_weapon_pointer_open )
+				Cbuf_AddText( "-vr_weaponpointer\n" );
 			vr_weapon_pointer_open = false;
 			vr_screen_button_since = 0.0;
-		}
-		else if( !vr_weapon_pointer_open && vr_weapon_pointer.value != 0.0f &&
-			host.realtime - vr_screen_button_since >= vr_weapon_pointer_hold.value &&
-			Cmd_Exists( "+vr_weaponpointer" ))
-		{
-			Cbuf_AddText( "+vr_weaponpointer\n" );
-			CL_VRHaptic( screen_hand, 0.03f, 0.0f, 0.4f );
-			vr_weapon_pointer_open = true;
 		}
 	}
 
