@@ -255,6 +255,9 @@ static cvar_t *vr_hud_hands;
 static cvar_t *vr_hud_hand_scale;
 static cvar_t *vr_hud_hand_tilt;
 static cvar_t *vr_hud_hand_yaw;
+static cvar_t *vr_hud_ammo_scale;
+static cvar_t *vr_hud_ammo_tilt;
+static cvar_t *vr_hud_ammo_yaw;
 static cvar_t *vr_hud_right_flip;
 static cvar_t *vr_hud_rect[GL_OPENXR_HUD_BOX_COUNT];
 static cvar_t *vr_hud_offset[GL_OPENXR_HAND_HUD_COUNT];
@@ -285,11 +288,17 @@ void GL_OpenXRInit( void )
 	vr_hud_hands = gEngfuncs.Cvar_Get( "vr_hud_hands", "1", FCVAR_ARCHIVE,
 		"show health/suit on the off hand and ammo on the weapon hand instead of on the head-locked HUD" );
 	vr_hud_hand_scale = gEngfuncs.Cvar_Get( "vr_hud_hand_scale", "0.0005", FCVAR_ARCHIVE,
-		"hand HUD size: metres per HUD pixel (0.0005 = HUD digits about 1.2 cm tall)" );
+		"health/suit panel size: metres per HUD pixel (0.0005 = HUD digits about 1.2 cm tall)" );
 	vr_hud_hand_tilt = gEngfuncs.Cvar_Get( "vr_hud_hand_tilt", "-20", FCVAR_ARCHIVE,
-		"hand HUD panel tilt in degrees about the controller's sideways axis (negative = face more upwards)" );
+		"health/suit panel and weapon grid tilt in degrees about the controller's sideways axis (negative = face more upwards)" );
 	vr_hud_hand_yaw = gEngfuncs.Cvar_Get( "vr_hud_hand_yaw", "90", FCVAR_ARCHIVE,
-		"hand HUD panels turned inwards in degrees, mirrored per hand (90 = facing your body, like a watch)" );
+		"health/suit panel turned inwards in degrees, mirrored per hand (90 = facing your body, like a watch)" );
+	vr_hud_ammo_scale = gEngfuncs.Cvar_Get( "vr_hud_ammo_scale", "0.0005", FCVAR_ARCHIVE,
+		"ammo panel size, like vr_hud_hand_scale" );
+	vr_hud_ammo_tilt = gEngfuncs.Cvar_Get( "vr_hud_ammo_tilt", "-20", FCVAR_ARCHIVE,
+		"ammo panel tilt, like vr_hud_hand_tilt" );
+	vr_hud_ammo_yaw = gEngfuncs.Cvar_Get( "vr_hud_ammo_yaw", "90", FCVAR_ARCHIVE,
+		"ammo panel turned inwards, like vr_hud_hand_yaw" );
 	vr_hud_right_flip = gEngfuncs.Cvar_Get( "vr_hud_right_flip", "0", FCVAR_ARCHIVE,
 		"turn the right-hand HUD panel 180 degrees in its plane, so both panels read forwards along the arm when turned inwards" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0.025 0.035 -0.02", FCVAR_ARCHIVE,
@@ -2213,10 +2222,11 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	const int weapon_hand = GL_OpenXRPointerHand();
 	const int off_hand = weapon_hand == REF_VR_HAND_LEFT ? REF_VR_HAND_RIGHT : REF_VR_HAND_LEFT;
 	const int hand = index == GL_OPENXR_HAND_HUD_AMMO ? weapon_hand : off_hand;
-	float metres = bound( 0.00005f, ( index == GL_OPENXR_HAND_HUD_WEAPONS ? vr_weapon_pointer_scale : vr_hud_hand_scale )->value, 0.005f );
-	float tilt = DEG2RAD( bound( -90.0f, vr_hud_hand_tilt->value, 90.0f ));
+	const qboolean ammo = index == GL_OPENXR_HAND_HUD_AMMO;
+	float metres = bound( 0.00005f, ( index == GL_OPENXR_HAND_HUD_WEAPONS ? vr_weapon_pointer_scale : ammo ? vr_hud_ammo_scale : vr_hud_hand_scale )->value, 0.005f );
+	float tilt = DEG2RAD( bound( -90.0f, ( ammo ? vr_hud_ammo_tilt : vr_hud_hand_tilt )->value, 90.0f ));
 	/* inwards = towards +X (right) on the left hand, -X on the right hand */
-	float yaw = DEG2RAD( bound( -180.0f, ( index == GL_OPENXR_HAND_HUD_WEAPONS ? vr_weapon_pointer_yaw : vr_hud_hand_yaw )->value, 180.0f )) *
+	float yaw = DEG2RAD( bound( -180.0f, ( index == GL_OPENXR_HAND_HUD_WEAPONS ? vr_weapon_pointer_yaw : ammo ? vr_hud_ammo_yaw : vr_hud_hand_yaw )->value, 180.0f )) *
 		( hand == REF_VR_HAND_LEFT ? 1.0f : -1.0f );
 	XrQuaternionf turn = { 0.0f, 0.0f, 0.0f, 1.0f }, lean = { 0.0f, 0.0f, 0.0f, 1.0f };
 	float offset[3] = { 0.0f, 0.0f, 0.0f };
