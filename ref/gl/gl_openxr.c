@@ -270,7 +270,7 @@ void GL_OpenXRInit( void )
 	vr_supersampling = gEngfuncs.Cvar_Get( "vr_supersampling", "1.0", FCVAR_ARCHIVE, "OpenXR eye resolution scale" );
 	vr_mirror_eye = gEngfuncs.Cvar_Get( "vr_mirror_eye", "0", 0, "eye shown in the desktop window (0 left, 1 right)" );
 	vr_worldscale = gEngfuncs.Cvar_Get( "vr_worldscale", "40", FCVAR_ARCHIVE, "game units per physical metre" );
-	vr_ui_distance = gEngfuncs.Cvar_Get( "vr_ui_distance", "1.5", FCVAR_ARCHIVE, "head-relative VR UI distance in metres" );
+	vr_ui_distance = gEngfuncs.Cvar_Get( "vr_ui_distance", "2.2", FCVAR_ARCHIVE, "head-relative VR UI distance in metres" );
 	vr_ui_offset_x = gEngfuncs.Cvar_Get( "vr_ui_offset_x", "-0.1", FCVAR_ARCHIVE, "VR HUD (head-locked) panel offset to the right in metres (negative = left), clamped to +-1; the menu is centred" );
 	vr_ui_height = gEngfuncs.Cvar_Get( "vr_ui_height", "0", FCVAR_ARCHIVE, "VR UI panel height in metres; 0 = from the width and the UI texture aspect (16:9)" );
 	vr_ui_offset_y = gEngfuncs.Cvar_Get( "vr_ui_offset_y", "0", FCVAR_ARCHIVE, "VR HUD (head-locked) panel offset upwards in metres (negative = down), clamped to +-1; the menu is centred" );
@@ -295,15 +295,15 @@ void GL_OpenXRInit( void )
 		"health/suit panel turned inwards in degrees, mirrored per hand (90 = facing your body, like a watch)" );
 	vr_hud_ammo_scale = gEngfuncs.Cvar_Get( "vr_hud_ammo_scale", "0.0005", FCVAR_ARCHIVE,
 		"ammo panel size, like vr_hud_hand_scale" );
-	vr_hud_ammo_tilt = gEngfuncs.Cvar_Get( "vr_hud_ammo_tilt", "-20", FCVAR_ARCHIVE,
+	vr_hud_ammo_tilt = gEngfuncs.Cvar_Get( "vr_hud_ammo_tilt", "0", FCVAR_ARCHIVE,
 		"ammo panel tilt, like vr_hud_hand_tilt" );
-	vr_hud_ammo_yaw = gEngfuncs.Cvar_Get( "vr_hud_ammo_yaw", "90", FCVAR_ARCHIVE,
+	vr_hud_ammo_yaw = gEngfuncs.Cvar_Get( "vr_hud_ammo_yaw", "20", FCVAR_ARCHIVE,
 		"ammo panel turned inwards, like vr_hud_hand_yaw" );
 	vr_hud_right_flip = gEngfuncs.Cvar_Get( "vr_hud_right_flip", "0", FCVAR_ARCHIVE,
 		"turn the right-hand HUD panel 180 degrees in its plane, so both panels read forwards along the arm when turned inwards" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_STATUS] = gEngfuncs.Cvar_Get( "vr_hud_status_offset", "0.025 0.035 -0.02", FCVAR_ARCHIVE,
 		"health/suit panel position from the in-game off hand (flashlight), metres along the aim axes: right up back" );
-	vr_hud_offset[GL_OPENXR_HAND_HUD_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_offset", "0 0.025 0.08", FCVAR_ARCHIVE,
+	vr_hud_offset[GL_OPENXR_HAND_HUD_AMMO] = gEngfuncs.Cvar_Get( "vr_hud_ammo_offset", "-0.01 0.02 -0.05", FCVAR_ARCHIVE,
 		"ammo panel position from the weapon-hand palm, metres along the aim axes: right up back" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_HEALTH] = gEngfuncs.Cvar_Get( "vr_hud_health_rect", "", 0,
 		"set by the client: health HUD box \"x y w h screenwidth screenheight\"" );
@@ -321,11 +321,11 @@ void GL_OpenXRInit( void )
 		"set by the client: pointer weapon grid, second row (shown right of the first)" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_WEAPONS3] = gEngfuncs.Cvar_Get( "vr_hud_weapons3_rect", "", 0,
 		"set by the client: pointer weapon grid, third row (shown right of the second)" );
-	vr_hud_offset[GL_OPENXR_HAND_HUD_WEAPONS] = gEngfuncs.Cvar_Get( "vr_weapon_pointer_offset", "0 0.035 -0.15", FCVAR_ARCHIVE,
-		"pointer weapon grid centre from the in-game off hand (flashlight), metres along the aim axes: right up back (-0.15 = out past the flashlight)" );
-	vr_weapon_pointer_scale = gEngfuncs.Cvar_Get( "vr_weapon_pointer_scale", "0.0005", FCVAR_ARCHIVE,
-		"pointer weapon grid size: metres per HUD pixel (0.0005 = weapon icons about 8 cm wide)" );
-	vr_weapon_pointer_yaw = gEngfuncs.Cvar_Get( "vr_weapon_pointer_yaw", "60", FCVAR_ARCHIVE,
+	vr_hud_offset[GL_OPENXR_HAND_HUD_WEAPONS] = gEngfuncs.Cvar_Get( "vr_weapon_pointer_offset", "0 0.035 -0.35", FCVAR_ARCHIVE,
+		"pointer weapon grid centre from the in-game off hand (flashlight), metres along the aim axes: right up back (-0.35 = out past the flashlight)" );
+	vr_weapon_pointer_scale = gEngfuncs.Cvar_Get( "vr_weapon_pointer_scale", "0.00065", FCVAR_ARCHIVE,
+		"pointer weapon grid size: metres per HUD pixel (0.00065 = weapon icons about 10 cm wide)" );
+	vr_weapon_pointer_yaw = gEngfuncs.Cvar_Get( "vr_weapon_pointer_yaw", "40", FCVAR_ARCHIVE,
 		"pointer weapon grid turn in degrees, like vr_hud_hand_yaw (90 = facing your body like the health panel; less turns its far end inwards and its face towards you)" );
 	gEngfuncs.Cvar_Get( "vr_weapon_pointer_cursor", "", 0,
 		"set by the renderer: \"x y\" HUD pixels the weapon hand points at on the weapon grid, empty when off it" );

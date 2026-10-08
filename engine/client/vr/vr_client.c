@@ -20,26 +20,26 @@ static CVAR_DEFINE_AUTO( vr_worldscale, "40", FCVAR_ARCHIVE, "game units per phy
 static CVAR_DEFINE_AUTO( vr_control_scheme, "0", FCVAR_ARCHIVE, "Lambda1VR control scheme; values >= 10 use the left weapon hand" );
 static CVAR_DEFINE_AUTO( vr_comfort_moving, "0", 0, "whether VR locomotion is active for comfort masking" );
 static CVAR_DEFINE_AUTO( vr_turn_angle, "45", FCVAR_ARCHIVE, "snap-turn angle, or smooth-turn speed basis" );
-static CVAR_DEFINE_AUTO( vr_smoothturn, "0", FCVAR_ARCHIVE, "use continuous turning instead of snap turning" );
+static CVAR_DEFINE_AUTO( vr_smoothturn, "1", FCVAR_ARCHIVE, "use continuous turning instead of snap turning" );
 static CVAR_DEFINE_AUTO( vr_walkdirection, "1", FCVAR_ARCHIVE, "movement direction: 0 off-hand, 1 head" );
 static CVAR_DEFINE_AUTO( vr_swap_jumpduck, "1", FCVAR_ARCHIVE, "1: primary (Cross/A) jumps, secondary (Circle/B) ducks, like HL2VR; 0: Lambda1VR layout" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_threshold, "0.85", FCVAR_ARCHIVE, "stick deflection (0-1) that opens/steps the weapon menu; must also be mostly vertical" );
 static CVAR_DEFINE_AUTO( vr_ladder_aim, "0", FCVAR_ARCHIVE, "ladder climb direction: 0 look up/down (head), 1 point the off-hand controller" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_up_next, "0", FCVAR_ARCHIVE, "weapon menu stick direction: 0 up = previous weapon, down = next (Lambda1VR); 1 up = next" );
-static CVAR_DEFINE_AUTO( vr_weapon_stick_menu, "1", FCVAR_ARCHIVE, "pushing the weapon-hand stick up/down opens the HUD weapon menu; 0 = off (use the Triangle weapon grid)" );
+static CVAR_DEFINE_AUTO( vr_weapon_stick_menu, "0", FCVAR_ARCHIVE, "pushing the weapon-hand stick up/down opens the HUD weapon menu; 0 = off (use the Triangle weapon grid)" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_hold, "0.15", FCVAR_ARCHIVE, "seconds the stick must be held up/down to OPEN the weapon menu (steps inside it are immediate)" );
 static CVAR_DEFINE_AUTO( vr_weapon_pointer, "1", FCVAR_ARCHIVE, "left Triangle (Y) shows the weapon grid on the off hand while held: point at a weapon with the weapon hand and release to switch; 0 = Triangle is the previous weapon" );
 static CVAR_DEFINE_AUTO( vr_laser_doubleclick, "0.35", FCVAR_ARCHIVE, "max seconds between the two off-hand stick clicks that cycle the laser sight (or scope smoothing); one click is use" );
 static CVAR_DEFINE_AUTO( vr_notify, "0", FCVAR_ARCHIVE, "show console notify lines (top left) over the VR HUD" );
 static CVAR_DEFINE_AUTO( vr_reloadtimeoutms, "200", FCVAR_ARCHIVE, "maximum squeeze tap duration used for reload" );
-static CVAR_DEFINE_AUTO( vr_enable_crouching, "0.85", FCVAR_ARCHIVE,
-	"physical crouch standing-height multiplier; active from 0 to 0.98" );
+static CVAR_DEFINE_AUTO( vr_enable_crouching, "0", FCVAR_ARCHIVE,
+	"physical crouch standing-height multiplier; active from 0 to 0.98 (0 = off; 0.85 = crouch below 85% of your height)" );
 static CVAR_DEFINE_AUTO( vr_crouch_threshold, "0.32", FCVAR_ARCHIVE,
 	"deprecated; physical crouch uses vr_enable_crouching standing-height multiplier" );
 static CVAR_DEFINE_AUTO( vr_positional_factor, "1", FCVAR_ARCHIVE, "room-scale movement multiplier" );
-static CVAR_DEFINE_AUTO( vr_quick_crouchjump, "1", FCVAR_ARCHIVE, "double-tap jump to perform a crouch jump" );
+static CVAR_DEFINE_AUTO( vr_quick_crouchjump, "0", FCVAR_ARCHIVE, "double-tap jump to perform a crouch jump" );
 static CVAR_DEFINE_AUTO( vr_gesture_triggered_use, "1", FCVAR_ARCHIVE, "reach away from the body to use with either hand" );
-static CVAR_DEFINE_AUTO( vr_use_gesture_boundary, "0.35", FCVAR_ARCHIVE, "horizontal use-gesture boundary in metres" );
+static CVAR_DEFINE_AUTO( vr_use_gesture_boundary, "0.25", FCVAR_ARCHIVE, "horizontal use-gesture boundary in metres" );
 static CVAR_DEFINE_AUTO( vr_controller_tracking_haptic, "1", FCVAR_ARCHIVE, "haptic feedback for tracked interaction boundaries" );
 static CVAR_DEFINE_AUTO( vr_backpack_weapon, "weapon_crowbar", FCVAR_ARCHIVE, "weapon selected by the dominant-hand backpack gesture" );
 static CVAR_DEFINE_AUTO( vr_lasersight, "1", FCVAR_ARCHIVE, "laser sight mode" );
@@ -49,7 +49,7 @@ static CVAR_DEFINE_AUTO( vr_height_adjust, "0.1", FCVAR_ARCHIVE, "additional VR 
 static CVAR_DEFINE_AUTO( vr_headtorch, "0", FCVAR_ARCHIVE, "attach the flashlight beam to the HMD" );
 static CVAR_DEFINE_AUTO( vr_reversetorch, "0", FCVAR_ARCHIVE, "reverse the tracked flashlight direction" );
 static CVAR_DEFINE_AUTO( vr_cinema, "1", FCVAR_ARCHIVE, "show scripted camera views (trigger_camera) on a flat screen in the room; 0 = all around you" );
-static CVAR_DEFINE_AUTO( vr_cinema_fade, "0.3", FCVAR_ARCHIVE, "seconds the cinema screen and the world take to fade in/out" );
+static CVAR_DEFINE_AUTO( vr_cinema_fade, "0.2", FCVAR_ARCHIVE, "seconds the cinema screen and the world take to fade in/out" );
 
 static ref_vr_frame_t vr_frame;
 static ref_vr_pose_t vr_center;
@@ -1550,7 +1550,7 @@ void Test_RunVRInputPolicy( void )
 
 		/* Physical crouch: relative to the recentre height, not LOCAL space's zero. */
 		float saved_crouching = vr_enable_crouching.value;
-		vr_enable_crouching.value = 0.85f; /* cvar default; not registered in the test host */
+		vr_enable_crouching.value = 0.85f; /* crouching on (the default is off); not registered in the test host */
 		vr_center_valid = true;
 		vr_physical_crouched = false;
 		vr_center.position[2] = 0.0f;
