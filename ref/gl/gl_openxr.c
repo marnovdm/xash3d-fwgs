@@ -100,6 +100,11 @@ static const uint32_t gl_openxr_hand_hud_slot[GL_OPENXR_HAND_HUD_COUNT][2] = { {
 #define GL_OPENXR_HAND_HUD_WIDTH  2048
 #define GL_OPENXR_HAND_HUD_HEIGHT 512
 
+/* Cinema screen for scripted cameras (trigger_camera): 16:9 like the menu panel. The engine computes the
+ * camera FOV for this aspect (desktop widescreen rules: 4:3 vertical FOV kept, wider horizontally). */
+#define GL_OPENXR_CINEMA_WIDTH  1600
+#define GL_OPENXR_CINEMA_HEIGHT 900
+
 typedef struct gl_openxr_eye_s
 {
 	XrSwapchain swapchain;
@@ -174,6 +179,18 @@ typedef struct gl_openxr_state_s
 	XrPosef ui_anchor; /* level head pose captured when a menu opened (local space) */
 	gl_openxr_eye_t beam; /* tiny solid-colour swapchain for the menu pointer beam */
 	gl_openxr_eye_t hud;  /* hand HUD: one slot per panel (gl_openxr_hand_hud_slot) */
+	struct
+	{
+		gl_openxr_eye_t image;  /* the camera view, rendered once per frame like the desktop view */
+		qboolean rendering;     /* between BeginCinema and EndCinema */
+		qboolean show;          /* engine: a camera scene is up (screen shown, no world) */
+		float brightness;       /* engine: 0..1, the screen fades to black below 1 */
+		vec3_t forward;         /* engine: room heading for the screen (LOCAL, Xash axes) */
+		qboolean anchored;
+		XrPosef anchor;         /* level pose the screen hangs off, captured when it appeared */
+		GLuint copy_fbo, copy_rb; /* last camera image, repeated while the screen fades out */
+		qboolean copy_valid;
+	} cinema;
 	struct
 	{
 		qboolean valid;
@@ -876,9 +893,9 @@ void GL_OpenXRShutdown( void )
 
 	/* OpenXR requires every waited swapchain image to be released before its
 	 * frame/session is ended. This also unwinds an interrupted eye/UI pass. */
-	for( int i = 0; i <= REF_VR_MAX_EYES; ++i )
+	for( int i = 0; i <= REF_VR_MAX_EYES + 1; ++i )
 	{
-		gl_openxr_eye_t *eye = i == REF_VR_MAX_EYES ? &xr.ui : &xr.eyes[i];
+		gl_openxr_eye_t *eye = i == REF_VR_MAX_EYES ? &xr.ui : i > REF_VR_MAX_EYES ? &xr.cinema.image : &xr.eyes[i];
 		if( eye->acquired && eye->waited && eye->swapchain != XR_NULL_HANDLE )
 		{
 			XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -905,6 +922,11 @@ void GL_OpenXRShutdown( void )
 	GL_OpenXRDestroyEye( &xr.ui );
 	GL_OpenXRDestroyEye( &xr.beam );
 	GL_OpenXRDestroyEye( &xr.hud );
+	GL_OpenXRDestroyEye( &xr.cinema.image );
+	if( xr.cinema.copy_fbo )
+		pglDeleteFramebuffers( 1, &xr.cinema.copy_fbo );
+	if( xr.cinema.copy_rb )
+		pglDeleteRenderbuffers( 1, &xr.cinema.copy_rb );
 
 	for( int i = 0; i < REF_VR_MAX_HANDS; ++i )
 	{
@@ -1166,6 +1188,37 @@ static qboolean GL_OpenXRInitialize( void )
 		}
 	}
 
+	{
+		/* optional: without it scripted cameras are shown all around you as before (vr_cinema 0) */
+		XrViewConfigurationView cinema_config = { XR_TYPE_VIEW_CONFIGURATION_VIEW };
+		float scale = bound( 0.5f, vr_supersampling->value, 2.0f );
+		cinema_config.recommendedImageRectWidth = (uint32_t)( GL_OPENXR_CINEMA_WIDTH / scale );
+		cinema_config.recommendedImageRectHeight = (uint32_t)( GL_OPENXR_CINEMA_HEIGHT / scale );
+		if( GL_OpenXRCreateEye( &xr.cinema.image, &cinema_config, selected_format ))
+		{
+			pglGenRenderbuffers( 1, &xr.cinema.copy_rb );
+			pglBindRenderbuffer( GL_RENDERBUFFER, xr.cinema.copy_rb );
+			pglRenderbufferStorage( GL_RENDERBUFFER, (GLenum)selected_format, xr.cinema.image.width, xr.cinema.image.height );
+			pglBindRenderbuffer( GL_RENDERBUFFER, 0 );
+			pglGenFramebuffers( 1, &xr.cinema.copy_fbo );
+			pglBindFramebuffer( GL_FRAMEBUFFER, xr.cinema.copy_fbo );
+			pglFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, xr.cinema.copy_rb );
+			if( pglCheckFramebufferStatus( GL_FRAMEBUFFER ) != GL_FRAMEBUFFER_COMPLETE )
+			{
+				/* the screen still works, it just goes black at once when the camera ends */
+				pglDeleteFramebuffers( 1, &xr.cinema.copy_fbo );
+				pglDeleteRenderbuffers( 1, &xr.cinema.copy_rb );
+				xr.cinema.copy_fbo = xr.cinema.copy_rb = 0;
+			}
+			pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
+		}
+		else
+		{
+			GL_OpenXRDestroyEye( &xr.cinema.image );
+			memset( &xr.cinema.image, 0, sizeof( xr.cinema.image ));
+		}
+	}
+
 	xr.initialized = true;
 #if defined( _WIN32 )
 	gEngfuncs.Con_Printf( "OpenXR: initialized Windows/WGL stereo session (%ux%u per eye)\n",
@@ -1341,6 +1394,8 @@ qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame )
 	xr.ui_active = false;
 	xr.ui.ready = false;
 	xr.hud.ready = false;
+	xr.cinema.image.ready = false;
+	xr.cinema.rendering = false;
 	for( int i = 0; i < REF_VR_MAX_EYES; ++i )
 		xr.eyes[i].ready = false;
 	actions_synced = GL_OpenXRSyncActions();
@@ -1446,6 +1501,12 @@ qboolean GL_OpenXRBeginEye( int eye )
 
 qboolean GL_OpenXRGetEyeSize( int *width, int *height )
 {
+	if( xr.cinema.rendering )
+	{
+		*width = xr.cinema.image.width;
+		*height = xr.cinema.image.height;
+		return true;
+	}
 	if( xr.current_eye < 0 || xr.current_eye >= REF_VR_MAX_EYES || !xr.eyes[xr.current_eye].acquired )
 		return false; /* only between BeginEye and EndEye (xr is zeroed, i.e. current_eye 0, before VR init) */
 	*width = xr.eyes[xr.current_eye].width;
@@ -1456,13 +1517,21 @@ qboolean GL_OpenXRGetEyeSize( int *width, int *height )
 /* Screen fades (env_fade, death, damage flashes, the expansions' black title screen) are 2D, so in VR they
  * landed on the floating HUD panel as a coloured box. The engine draws them here instead, over the whole
  * eye image, with the same blend as the desktop path (modulate = multiply). */
+static void GL_OpenXRDrawFade( const gl_openxr_eye_t *target, const byte *rgba, qboolean modulate );
+
 void GL_OpenXRDrawEyeFade( const byte *rgba, qboolean modulate )
 {
-	const gl_openxr_eye_t *target;
-
-	if( !rgba || xr.current_eye < 0 || xr.current_eye >= REF_VR_MAX_EYES || !xr.eyes[xr.current_eye].acquired )
+	if( !rgba )
 		return;
-	target = &xr.eyes[xr.current_eye];
+	if( xr.cinema.rendering )
+		GL_OpenXRDrawFade( &xr.cinema.image, rgba, modulate ); /* the camera view on the cinema screen */
+	else if( xr.current_eye >= 0 && xr.current_eye < REF_VR_MAX_EYES && xr.eyes[xr.current_eye].acquired )
+		GL_OpenXRDrawFade( &xr.eyes[xr.current_eye], rgba, modulate );
+}
+
+/* Full-image fade over whatever target framebuffer is bound. */
+static void GL_OpenXRDrawFade( const gl_openxr_eye_t *target, const byte *rgba, qboolean modulate )
+{
 
 	pglPushAttrib( GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_VIEWPORT_BIT | GL_CURRENT_BIT | GL_TEXTURE_BIT | GL_FOG_BIT );
 	pglViewport( 0, 0, target->width, target->height );
@@ -2304,12 +2373,224 @@ void GL_OpenXREndUI( void )
 	xr.ui.ready = true;
 }
 
+/* Cinema mode: the engine shows a scripted camera's view on a flat screen in the room (vr_cinema). The screen is
+ * level at head height, along the heading the engine picks (the game's forward, or the head's when turned far away
+ * from it), at the menu panel's distance and width, and stays put for the whole scene. */
+void GL_OpenXRSetCinema( qboolean show, float brightness, const vec3_t forward )
+{
+	xr.cinema.show = show && xr.cinema.image.swapchain != XR_NULL_HANDLE;
+	xr.cinema.brightness = bound( 0.0f, brightness, 1.0f );
+	if( forward )
+		VectorCopy( forward, xr.cinema.forward );
+	if( !xr.cinema.show )
+	{
+		xr.cinema.anchored = false;
+		xr.cinema.copy_valid = false; /* never repeat the last scene's image in the next one */
+		return;
+	}
+	if( !xr.cinema.anchored && xr.views_valid )
+	{
+		if( xr.cinema.forward[0] * xr.cinema.forward[0] + xr.cinema.forward[1] * xr.cinema.forward[1] > 0.01f )
+		{
+			/* Xash forward (x, y) = OpenXR (-z, -x): a turn of yaw about +Y */
+			const float yaw = atan2f( xr.cinema.forward[1], xr.cinema.forward[0] );
+			xr.cinema.anchor.position = xr.head_pose.position;
+			xr.cinema.anchor.orientation.x = 0.0f;
+			xr.cinema.anchor.orientation.y = sinf( yaw * 0.5f );
+			xr.cinema.anchor.orientation.z = 0.0f;
+			xr.cinema.anchor.orientation.w = cosf( yaw * 0.5f );
+		}
+		else xr.cinema.anchor = GL_OpenXRLevelPose( &xr.head_pose );
+		xr.cinema.anchored = true;
+	}
+}
+
+qboolean GL_OpenXRBeginCinema( int *width, int *height )
+{
+	gl_openxr_eye_t *target = &xr.cinema.image;
+	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+
+	if( !xr.frame_begun || !xr.frame_state.shouldRender || !xr.views_valid || !xr.cinema.show || !xr.cinema.anchored ||
+		target->swapchain == XR_NULL_HANDLE || target->acquired || xr.current_eye >= 0 || !width || !height )
+		return false;
+	if( !GL_OpenXRCheck( xrAcquireSwapchainImage( target->swapchain, &acquire_info, &target->image_index ),
+		"xrAcquireSwapchainImage(cinema)" ))
+		return false;
+	target->acquired = true;
+	target->waited = false;
+	wait_info.timeout = XR_INFINITE_DURATION;
+	if( !GL_OpenXRCheck( xrWaitSwapchainImage( target->swapchain, &wait_info ), "xrWaitSwapchainImage(cinema)" ))
+	{
+		GL_OpenXRShutdown();
+		xr.failed = true;
+		return false;
+	}
+	target->waited = true;
+	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	pglViewport( 0, 0, target->width, target->height );
+	/* no eye is current: GetEyeFov/ApplyEyePose decline and the 3D path renders like the desktop, once */
+	xr.cinema.rendering = true;
+	*width = target->width;
+	*height = target->height;
+	return true;
+}
+
+/* Darken the bound cinema image towards black (the screen fading in or out). */
+static void GL_OpenXRCinemaBrightness( void )
+{
+	byte rgba[4] = { 0, 0, 0, 0 };
+
+	if( xr.cinema.brightness >= 1.0f )
+		return;
+	rgba[3] = (byte)( 255.0f * ( 1.0f - xr.cinema.brightness ) + 0.5f );
+	GL_OpenXRDrawFade( &xr.cinema.image, rgba, false );
+}
+
+static qboolean GL_OpenXRReleaseCinema( void )
+{
+	XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	gl_openxr_eye_t *target = &xr.cinema.image;
+
+	if( !GL_OpenXRCheck( xrReleaseSwapchainImage( target->swapchain, &release_info ), "xrReleaseSwapchainImage(cinema)" ))
+	{
+		GL_OpenXRShutdown();
+		xr.failed = true;
+		return false;
+	}
+	target->acquired = false;
+	target->waited = false;
+	target->ready = true;
+	return true;
+}
+
+void GL_OpenXREndCinema( int source_width, int source_height )
+{
+	gl_openxr_eye_t *target = &xr.cinema.image;
+
+	if( !xr.cinema.rendering )
+		return;
+	xr.cinema.rendering = false;
+	if( !target->acquired || !target->waited )
+		return;
+
+	/* keep the image: when the camera ends the screen fades out on it (the view is already back on the player) */
+	if( xr.cinema.copy_fbo )
+	{
+		pglBindFramebuffer( GL_READ_FRAMEBUFFER, target->framebuffers[target->image_index] );
+		pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, xr.cinema.copy_fbo );
+		pglBlitFramebuffer( 0, 0, target->width, target->height, 0, 0, target->width, target->height,
+			GL_COLOR_BUFFER_BIT, GL_NEAREST );
+		xr.cinema.copy_valid = true;
+	}
+	if( source_width > 0 && source_height > 0 )
+	{
+		/* desktop mirror, letterboxed */
+		int w = source_width, h = source_width * (int)target->height / (int)target->width;
+		GLfloat old_clear[4];
+
+		if( h > source_height )
+		{
+			h = source_height;
+			w = source_height * (int)target->width / (int)target->height;
+		}
+		while( pglGetError() != GL_NO_ERROR ) {}
+		pglGetFloatv( GL_COLOR_CLEAR_VALUE, old_clear );
+		pglPushAttrib( GL_SCISSOR_BIT | GL_COLOR_BUFFER_BIT );
+		pglDisable( GL_SCISSOR_TEST );
+		pglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+		pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
+		pglClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
+		pglClear( GL_COLOR_BUFFER_BIT );
+		pglBindFramebuffer( GL_READ_FRAMEBUFFER, target->framebuffers[target->image_index] );
+		pglBlitFramebuffer( 0, 0, target->width, target->height, ( source_width - w ) / 2, ( source_height - h ) / 2,
+			( source_width + w ) / 2, ( source_height + h ) / 2, GL_COLOR_BUFFER_BIT, GL_LINEAR );
+		pglPopAttrib();
+		pglClearColor( old_clear[0], old_clear[1], old_clear[2], old_clear[3] );
+		if( pglGetError() != GL_NO_ERROR && !xr.mirror_warned )
+		{
+			gEngfuncs.Con_Reportf( S_NOTE "OpenXR: desktop mirror blit of the cinema image failed\n" );
+			xr.mirror_warned = true;
+		}
+	}
+	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	GL_OpenXRCinemaBrightness();
+	pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
+	pglViewport( 0, 0, source_width, source_height );
+	GL_OpenXRReleaseCinema();
+}
+
+/* A frame without a new camera image (the scene just ended and the screen fades out): show the kept copy. */
+static void GL_OpenXRRepeatCinema( void )
+{
+	gl_openxr_eye_t *target = &xr.cinema.image;
+	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	GLint old_viewport[4];
+
+	if( !xr.cinema.copy_valid || target->acquired )
+		return;
+	if( !GL_OpenXRCheck( xrAcquireSwapchainImage( target->swapchain, &acquire_info, &target->image_index ),
+		"xrAcquireSwapchainImage(cinema repeat)" ))
+		return;
+	target->acquired = true;
+	wait_info.timeout = XR_INFINITE_DURATION;
+	if( !GL_OpenXRCheck( xrWaitSwapchainImage( target->swapchain, &wait_info ), "xrWaitSwapchainImage(cinema repeat)" ))
+	{
+		GL_OpenXRShutdown();
+		xr.failed = true;
+		return;
+	}
+	target->waited = true;
+	pglGetIntegerv( GL_VIEWPORT, old_viewport );
+	pglBindFramebuffer( GL_READ_FRAMEBUFFER, xr.cinema.copy_fbo );
+	pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	pglBlitFramebuffer( 0, 0, target->width, target->height, 0, 0, target->width, target->height,
+		GL_COLOR_BUFFER_BIT, GL_NEAREST );
+	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	GL_OpenXRCinemaBrightness();
+	pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
+	pglViewport( old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3] );
+	GL_OpenXRReleaseCinema();
+}
+
+static qboolean GL_OpenXRBuildCinemaLayer( XrCompositionLayerQuad *quad )
+{
+	XrVector3f offset = { 0.0f, 0.0f, 0.0f }, rotated;
+	float width;
+
+	if( !xr.cinema.show || !xr.cinema.anchored )
+		return false;
+	if( !xr.cinema.image.ready )
+		GL_OpenXRRepeatCinema();
+	if( !xr.initialized || !xr.cinema.image.ready )
+		return false; /* nothing released in this scene yet (menu up, first frame): black */
+
+	width = bound( 0.25f, vr_ui_width->value, 8.0f );
+	offset.z = -bound( 0.2f, vr_ui_distance->value, 10.0f );
+	rotated = GL_OpenXRRotateVector( xr.cinema.anchor.orientation, offset );
+	quad->layerFlags = 0; /* opaque */
+	quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+	quad->space = xr.local_space;
+	quad->pose.orientation = xr.cinema.anchor.orientation;
+	quad->pose.position.x = xr.cinema.anchor.position.x + rotated.x;
+	quad->pose.position.y = xr.cinema.anchor.position.y + rotated.y;
+	quad->pose.position.z = xr.cinema.anchor.position.z + rotated.z;
+	quad->subImage.swapchain = xr.cinema.image.swapchain;
+	quad->subImage.imageRect.extent.width = xr.cinema.image.width;
+	quad->subImage.imageRect.extent.height = xr.cinema.image.height;
+	quad->size.width = width;
+	quad->size.height = width * (float)xr.cinema.image.height / (float)xr.cinema.image.width;
+	return true;
+}
+
 void GL_OpenXRFrameEnd( void )
 {
 	XrCompositionLayerProjectionView projection_views[REF_VR_MAX_EYES];
 	XrCompositionLayerProjection projection = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
 	XrCompositionLayerQuad ui = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-	const XrCompositionLayerBaseHeader *layers[3 + GL_OPENXR_HAND_HUD_COUNT];
+	XrCompositionLayerQuad cinema = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+	const XrCompositionLayerBaseHeader *layers[4 + GL_OPENXR_HAND_HUD_COUNT];
 	XrCompositionLayerQuad beam = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrCompositionLayerQuad hand_hud[GL_OPENXR_HAND_HUD_COUNT];
 	XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
@@ -2339,6 +2620,16 @@ void GL_OpenXRFrameEnd( void )
 			eyes_ok = false;
 		}
 	}
+	if( xr.cinema.image.acquired && xr.cinema.image.waited )
+	{
+		/* interrupted camera render */
+		XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		GL_OpenXRCheck( xrReleaseSwapchainImage( xr.cinema.image.swapchain, &release_info ),
+			"xrReleaseSwapchainImage(interrupted cinema)" );
+		xr.cinema.image.acquired = false;
+		xr.cinema.image.waited = false;
+		xr.cinema.rendering = false;
+	}
 
 	for( int i = 0; i < REF_VR_MAX_EYES; ++i )
 		eyes_ok = eyes_ok && xr.eyes[i].ready;
@@ -2360,6 +2651,11 @@ void GL_OpenXRFrameEnd( void )
 		}
 		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&projection;
 	}
+	/* under the UI quad, so game text (chapter titles, game_text) stays readable over the camera view */
+	if( frame_ok && GL_OpenXRBuildCinemaLayer( &cinema ))
+		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&cinema;
+	if( !xr.frame_begun )
+		return; /* the repeat may have shut the session down */
 	if( frame_ok && xr.ui.ready )
 	{
 		{

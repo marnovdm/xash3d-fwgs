@@ -738,6 +738,14 @@ typedef struct ref_interface_s
 	qboolean (*R_VRHaptic)( int hand, float duration, float frequency, float amplitude );
 	// Screen fade over the whole current eye image (between R_VRBeginEye and R_VREndEye).
 	void (*R_VRDrawEyeFade)( const byte *rgba, qboolean modulate );
+	// Cinema mode (scripted cameras): one flat view on a screen in the room instead of the eyes.
+	// Set once per frame after R_VRFrameBegin: show the screen, its brightness (0..1, fades to black)
+	// and the room heading to place it along (LOCAL space, Xash axes; latched when the screen appears).
+	void (*R_VRSetCinema)( qboolean show, float brightness, const vec3_t forward );
+	// Render the camera view between these (no eye is current, so the desktop render path is used).
+	// Without a new image in a frame the screen repeats the last one.
+	qboolean (*R_VRBeginCinema)( int *width, int *height );
+	void (*R_VREndCinema)( int source_width, int source_height );
 } ref_interface_t;
 
 typedef int (*REFAPI)( int version, ref_interface_t *pFunctionTable, ref_api_t* engfuncs, ref_globals_t *pGlobals );

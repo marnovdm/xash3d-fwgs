@@ -24,5 +24,10 @@ qboolean CL_VRIsActive( void );
 qboolean CL_VRGetRecenter( ref_vr_pose_t *center );
 float CL_VRGetWorldScale( void );
 qboolean CL_VRGetFlashlightPose( vec3_t origin, vec3_t forward );
+qboolean CL_VRCinemaShowing( void );
+qboolean CL_VRCinemaCamera( void );
+qboolean CL_VRBeginCinema( int *width, int *height );
+void CL_VREndCinema( void );
+void CL_VRDrawCinemaWorldFade( void );
 
 #endif /* VR_CLIENT_H */

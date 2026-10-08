@@ -47,6 +47,10 @@ static CVAR_DEFINE_AUTO( vr_weapon_backface_culling, "0", FCVAR_ARCHIVE, "enable
 static CVAR_DEFINE_AUTO( vr_height_adjust, "0.1", FCVAR_ARCHIVE, "additional VR eye height in metres" );
 static CVAR_DEFINE_AUTO( vr_headtorch, "0", FCVAR_ARCHIVE, "attach the flashlight beam to the HMD" );
 static CVAR_DEFINE_AUTO( vr_reversetorch, "0", FCVAR_ARCHIVE, "reverse the tracked flashlight direction" );
+static CVAR_DEFINE_AUTO( vr_cinema, "1", FCVAR_ARCHIVE, "show scripted camera views (trigger_camera) on a flat screen in the room; 0 = all around you" );
+static CVAR_DEFINE_AUTO( vr_cinema_fade, "0.3", FCVAR_ARCHIVE, "seconds the cinema screen and the world take to fade in/out" );
+static CVAR_DEFINE_AUTO( vr_cinema_head_angle, "70", FCVAR_ARCHIVE,
+	"the cinema screen appears in the game's forward direction unless your head is turned further than this from it (degrees); then where you look" );
 
 static ref_vr_frame_t vr_frame;
 static ref_vr_pose_t vr_center;
@@ -96,6 +100,15 @@ static float vr_one_controller_stick[4][2];
 static vec3_t vr_body_view_origin;
 static float vr_body_view_yaw;
 static qboolean vr_body_view_valid;
+static struct
+{
+	qboolean camera;    /* a scripted camera has the view this frame */
+	qboolean showing;   /* the screen is up: camera scene, or fading out after one */
+	float brightness;   /* screen, 0..1 */
+	float world_black;  /* black over the world after a scene, 1..0 */
+	vec3_t forward;     /* room heading of the screen, latched when it appears */
+	double last_time;
+} vr_cinema_state;
 
 static void CL_VRTransformVector( const vec3_t in, const ref_vr_pose_t *origin, vec3_t out );
 
@@ -199,6 +212,9 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_weapon_stick_threshold );
 	Cvar_RegisterVariable( &vr_headtorch );
 	Cvar_RegisterVariable( &vr_reversetorch );
+	Cvar_RegisterVariable( &vr_cinema );
+	Cvar_RegisterVariable( &vr_cinema_fade );
+	Cvar_RegisterVariable( &vr_cinema_head_angle );
 	Cmd_AddCommand( "vr_poseinfo", CL_VRPoseInfo_f, "print VR head/centre/body angles (tilt debugging)" );
 	Cmd_AddCommand( "vr_testhaptic", CL_VRTestHaptic_f, "pulse both controllers for 0.5 s: vr_testhaptic [amplitude 0-1] [frequency Hz]" );
 	Cmd_AddCommand( "vr_recenter", CL_VRRecenter_f, "make the current head position and heading the VR reference" );
@@ -454,6 +470,103 @@ static void CL_VRRelativePose( const ref_vr_pose_t *pose, const ref_vr_pose_t *o
 	CL_VRTransformVector( pose->up, origin, out->up );
 }
 
+static void CL_VRCinemaReset( void )
+{
+	memset( &vr_cinema_state, 0, sizeof( vr_cinema_state ));
+}
+
+/* Cinema mode: while a scripted camera (trigger_camera, svc_setview) has the view, the engine renders it once onto
+ * a flat screen in the room and leaves the world black around it. The engine only learns of the camera when the
+ * view switches, so the world cuts to black at once and the screen fades in; when the camera ends the screen fades
+ * out on its last image, then the world fades in from black. */
+static void CL_VRCinemaUpdate( void )
+{
+	const double now = host.realtime;
+	const float fade = vr_cinema_fade.value;
+	float step;
+
+	step = (float)bound( 0.0, now - vr_cinema_state.last_time, 0.1 );
+	step = fade > 0.01f ? step / fade : 1.0f;
+	vr_cinema_state.last_time = now;
+
+	/* level changes (c5a1, of7a0 end on a camera) must not leave the screen up */
+	if( !vr_cinema.value || cls.state != ca_active || !vr_center_valid || !ref.dllFuncs.R_VRSetCinema )
+	{
+		CL_VRCinemaReset();
+		vr_cinema_state.last_time = now;
+		if( ref.dllFuncs.R_VRSetCinema )
+			ref.dllFuncs.R_VRSetCinema( false, 0.0f, vr_cinema_state.forward );
+		return;
+	}
+
+	/* same test as the client's V_CalcRefdef: a view entity that is not a player is a camera */
+	vr_cinema_state.camera = !cls.spectator && cl.viewentity > cl.maxclients;
+	if( vr_cinema_state.camera )
+	{
+		if( !vr_cinema_state.showing )
+		{
+			/* the game's forward (the way you faced at recentre), unless the head is turned far away from it */
+			VectorCopy( vr_center.forward, vr_cinema_state.forward );
+			if( FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ))
+			{
+				ref_vr_pose_t head = vr_frame.head;
+				CL_VRFlattenPose( &head );
+				if( DotProduct( head.forward, vr_center.forward ) < cos( DEG2RAD( bound( 0.0f, vr_cinema_head_angle.value, 180.0f ))))
+					VectorCopy( head.forward, vr_cinema_state.forward );
+			}
+			vr_cinema_state.showing = true;
+			vr_cinema_state.brightness = 0.0f;
+		}
+		vr_cinema_state.brightness = Q_min( 1.0f, vr_cinema_state.brightness + step );
+		vr_cinema_state.world_black = 1.0f;
+	}
+	else if( vr_cinema_state.showing )
+	{
+		vr_cinema_state.brightness -= step;
+		if( vr_cinema_state.brightness <= 0.0f )
+		{
+			vr_cinema_state.brightness = 0.0f;
+			vr_cinema_state.showing = false;
+		}
+		vr_cinema_state.world_black = 1.0f;
+	}
+	else vr_cinema_state.world_black = Q_max( 0.0f, vr_cinema_state.world_black - step );
+
+	ref.dllFuncs.R_VRSetCinema( vr_cinema_state.showing, vr_cinema_state.brightness, vr_cinema_state.forward );
+}
+
+qboolean CL_VRCinemaShowing( void )
+{
+	return vr_cinema_state.showing;
+}
+
+qboolean CL_VRCinemaCamera( void )
+{
+	return vr_cinema_state.showing && vr_cinema_state.camera;
+}
+
+qboolean CL_VRBeginCinema( int *width, int *height )
+{
+	return CL_VRShouldRender() && ref.dllFuncs.R_VRBeginCinema && ref.dllFuncs.R_VRBeginCinema( width, height );
+}
+
+void CL_VREndCinema( void )
+{
+	if( ref.dllFuncs.R_VREndCinema )
+		ref.dllFuncs.R_VREndCinema( refState.width, refState.height );
+}
+
+/* After a camera scene: the world fades in from black (between CL_VRBeginEye and CL_VREndEye). */
+void CL_VRDrawCinemaWorldFade( void )
+{
+	byte rgba[4] = { 0, 0, 0, 0 };
+
+	if( vr_cinema_state.world_black <= 0.0f || !ref.dllFuncs.R_VRDrawEyeFade )
+		return;
+	rgba[3] = (byte)( 255.0f * Q_min( 1.0f, vr_cinema_state.world_black ) + 0.5f );
+	ref.dllFuncs.R_VRDrawEyeFade( rgba, false );
+}
+
 void CL_VRFrameBegin( void )
 {
 	qboolean old_menu, menu;
@@ -471,6 +584,7 @@ void CL_VRFrameBegin( void )
 	if( !ref.initialized || !ref.dllFuncs.R_VRFrameBegin )
 	{
 		CL_VRResetInputState( true );
+		CL_VRCinemaReset();
 		return;
 	}
 
@@ -490,6 +604,7 @@ void CL_VRFrameBegin( void )
 		vr_previous_head_valid = false;
 		VectorClear( vr_head_delta );
 		CL_VRResetInputState( true );
+		CL_VRCinemaReset();
 		return;
 	}
 
@@ -538,6 +653,7 @@ void CL_VRFrameBegin( void )
 		vr_previous_head = vr_frame.head;
 		vr_previous_head_valid = true;
 	}
+	CL_VRCinemaUpdate();
 
 	dominant = vr_control_scheme.value >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT;
 	offhand = dominant == REF_VR_HAND_LEFT ? REF_VR_HAND_RIGHT : REF_VR_HAND_LEFT;

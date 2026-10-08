@@ -396,6 +396,7 @@ void V_RenderView( void )
 	ref_viewpass_t	rvp;
 	ref_viewpass_t	base_rvp;
 	int		viewnum = 0;
+	qboolean	cinema;
 
 	if( !cl.video_prepped || ( !ui_renderworld.value && UI_IsVisible() && !cl.background ))
 		return; // still loading
@@ -406,6 +407,9 @@ void V_RenderView( void )
 	ref.dllFuncs.R_Set2DMode( false );
 	SCR_DirtyScreen();
 	ref.dllFuncs.GL_BackendStartFrame ();
+
+	/* VR cinema mode: a scripted camera's view goes on a flat screen, the world around it stays black */
+	cinema = CL_VRShouldRender() && CL_VRCinemaShowing();
 
 	do
 	{
@@ -419,7 +423,8 @@ void V_RenderView( void )
 		V_GetRefParams( &rp, &rvp );
 		V_RefApplyOverview( &rvp );
 		V_ApplyRefUnderwater( &rvp );
-		CL_VRApplyHeadPose( &rvp );
+		if( !cinema )
+			CL_VRApplyHeadPose( &rvp ); /* the camera keeps its own angles (VR drops the body pitch) */
 		base_rvp = rvp;
 
 		if( viewnum == 0 && FBitSet( rvp.flags, RF_ONLY_CLIENTDRAW ))
@@ -427,7 +432,24 @@ void V_RenderView( void )
 			ref.dllFuncs.R_ClearScreen();
 		}
 
-		if( CL_VRShouldRender() )
+		if( cinema )
+		{
+			int width, height;
+
+			/* rendered once, like the desktop view; once the camera has ended the screen fades out on
+			 * its last image, so nothing is rendered */
+			if( CL_VRCinemaCamera() && CL_VRBeginCinema( &width, &height ))
+			{
+				rvp.fov_x = bound( 10.0f, cl.local.scr_fov, 150.0f );
+				rvp.fov_y = V_CalcFov( &rvp.fov_x, width, height );
+				if( r_adjust_fov.value )
+					V_AdjustFov( &rvp.fov_x, &rvp.fov_y, width, height, false );
+				GL_RenderFrame( &rvp );
+				CL_VRDrawEyeScreenFade();
+				CL_VREndCinema();
+			}
+		}
+		else if( CL_VRShouldRender() )
 		{
 			int render_seed = (int)CL_VRFrameId();
 
@@ -439,6 +461,7 @@ void V_RenderView( void )
 				rvp = base_rvp;
 				GL_RenderFrame( &rvp );
 				CL_VRDrawEyeScreenFade();
+				CL_VRDrawCinemaWorldFade();
 				CL_VREndEye( eye );
 			}
 		}
