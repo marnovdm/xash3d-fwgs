@@ -2221,8 +2221,11 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 {
 	const int weapon_hand = GL_OpenXRPointerHand();
 	const int off_hand = weapon_hand == REF_VR_HAND_LEFT ? REF_VR_HAND_RIGHT : REF_VR_HAND_LEFT;
-	const int hand = index == GL_OPENXR_HAND_HUD_AMMO ? weapon_hand : off_hand;
-	const qboolean ammo = index == GL_OPENXR_HAND_HUD_AMMO;
+	/* Holding the gun with both hands (vr_weapon_stabilised, set by the client) the off hand is on the gun: the
+	 * health panel then docks under the ammo panel, with the ammo panel's size, tilt, turn and position. */
+	const qboolean docked = index == GL_OPENXR_HAND_HUD_STATUS && gEngfuncs.pfnGetCvarFloat( "vr_weapon_stabilised" ) != 0.0f;
+	const qboolean ammo = index == GL_OPENXR_HAND_HUD_AMMO || docked;
+	const int hand = ammo ? weapon_hand : off_hand;
 	float metres = bound( 0.00005f, ( index == GL_OPENXR_HAND_HUD_WEAPONS ? vr_weapon_pointer_scale : ammo ? vr_hud_ammo_scale : vr_hud_hand_scale )->value, 0.005f );
 	float tilt = DEG2RAD( bound( -90.0f, ( ammo ? vr_hud_ammo_tilt : vr_hud_hand_tilt )->value, 90.0f ));
 	/* inwards = towards +X (right) on the left hand, -X on the right hand */
@@ -2236,7 +2239,7 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 
 	if( !xr.hud.ready || !xr.hand_hud[index].valid || !xr.hand_pose[hand].grip_valid || !xr.hand_pose[hand].aim_valid )
 		return false;
-	sscanf( vr_hud_offset[index]->string, "%f %f %f", &offset[0], &offset[1], &offset[2] );
+	sscanf( vr_hud_offset[ammo ? GL_OPENXR_HAND_HUD_AMMO : index]->string, "%f %f %f", &offset[0], &offset[1], &offset[2] );
 
 	quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
 	quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -2264,7 +2267,7 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	/* the weapon hand follows the gun model, which the client points vr_weapon_pitchadjust degrees off the
 	 * controller (-20 = 20 degrees down; skipped there only for two-handed aim) */
 	frame = xr.hand_pose[hand].aim.orientation;
-	if( index == GL_OPENXR_HAND_HUD_AMMO )
+	if( ammo )
 	{
 		const float adjust = DEG2RAD( bound( -90.0f, gEngfuncs.pfnGetCvarFloat( "vr_weapon_pitchadjust" ), 90.0f ));
 		const XrQuaternionf pitch = { sinf( adjust * 0.5f ), 0.0f, 0.0f, cosf( adjust * 0.5f ) };
@@ -2278,8 +2281,19 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	quad->pose.position.x = xr.hand_pose[hand].grip.position.x + along.x;
 	quad->pose.position.y = xr.hand_pose[hand].grip.position.y + along.y;
 	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
-	if( index != GL_OPENXR_HAND_HUD_AMMO )
+	if( !ammo )
 		quad->pose.position.y -= GL_OpenXRGameHandDrop(); /* off hand: placed relative to the in-game flashlight */
+	if( docked )
+	{
+		/* below the ammo panel, in its plane, with a small gap */
+		const XrVector3f up = { 0.0f, 1.0f, 0.0f };
+		const XrVector3f axis = GL_OpenXRRotateVector( quad->pose.orientation, up );
+		const float above = xr.hand_hud[GL_OPENXR_HAND_HUD_AMMO].valid ? metres * xr.hand_hud[GL_OPENXR_HAND_HUD_AMMO].hud_height : 0.0f;
+		const float shift = 0.5f * ( above + quad->size.height ) + ( above > 0.0f ? 0.005f : 0.0f );
+		quad->pose.position.x -= axis.x * shift;
+		quad->pose.position.y -= axis.y * shift;
+		quad->pose.position.z -= axis.z * shift;
+	}
 	if( index == GL_OPENXR_HAND_HUD_STATUS && xr.hand_hud[index].hud_width > xr.hand_hud[index].base_width )
 	{
 		/* the flashlight and damage icons widen the panel to the right only: health and suit stay where they were */
