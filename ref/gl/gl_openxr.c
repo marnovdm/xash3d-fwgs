@@ -195,7 +195,7 @@ typedef struct gl_openxr_state_s
 	{
 		qboolean valid;
 		int hud_width, hud_height; /* content size in HUD pixels (square on the desktop) */
-		int base_width;            /* status panel: width of health + suit + flashlight; the damage icons extend it to the right */
+		int base_width;            /* status panel: width of health + suit; the flashlight and damage icons extend it to the right */
 		uint32_t x, width, height; /* the panel's slot in the hand HUD swapchain */
 		int box_count;
 		struct
@@ -2055,7 +2055,8 @@ static void GL_OpenXRCaptureHandHUD( void )
 	/* boxes per panel, top to bottom */
 	/* boxes per panel: stacked top to bottom, or (weapon grid rows) side by side left to right */
 	static const int panel_boxes[GL_OPENXR_HAND_HUD_COUNT][GL_OPENXR_HAND_HUD_MAX_BOXES] = {
-		/* the flashlight is always there with the suit, so it sits before the damage icons, which come and go */
+		/* the flashlight is always there with the suit, so it sits before the damage icons, which come and go;
+		 * both extend the panel to the right, the health end stays put */
 		{ GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_FLASHLIGHT, GL_OPENXR_HUD_BOX_DAMAGE },
 		{ GL_OPENXR_HUD_BOX_AMMO, -1, -1, -1 },
 		{ GL_OPENXR_HUD_BOX_WEAPONS, GL_OPENXR_HUD_BOX_WEAPONS2, GL_OPENXR_HUD_BOX_WEAPONS3, -1 },
@@ -2085,6 +2086,7 @@ static void GL_OpenXRCaptureHandHUD( void )
 		const qboolean side_by_side = p == GL_OPENXR_HAND_HUD_WEAPONS || p == GL_OPENXR_HAND_HUD_STATUS;
 		const int gap = p == GL_OPENXR_HAND_HUD_STATUS ? 12 : 0;
 		int width = 0, height = 0;
+		qboolean base_set = false;
 		xr.hand_hud[p].box_count = 0;
 		for( int j = 0; j < GL_OPENXR_HAND_HUD_MAX_BOXES; ++j )
 		{
@@ -2099,8 +2101,11 @@ static void GL_OpenXRCaptureHandHUD( void )
 			xr.hand_hud[p].box[n].h = sizes[b][1];
 			if( side_by_side && n > 0 )
 				width += gap;
-			if( b == GL_OPENXR_HUD_BOX_DAMAGE )
+			if( !base_set && ( b == GL_OPENXR_HUD_BOX_FLASHLIGHT || b == GL_OPENXR_HUD_BOX_DAMAGE ))
+			{
 				xr.hand_hud[p].base_width = Q_max( 0, width - gap );
+				base_set = true;
+			}
 			xr.hand_hud[p].box[n].px = side_by_side ? width : 0;
 			xr.hand_hud[p].box[n].py = side_by_side ? 0 : height;
 			xr.hand_hud[p].box_count++;
@@ -2122,7 +2127,7 @@ static void GL_OpenXRCaptureHandHUD( void )
 			/* vertically centred on each other (the damage icons are taller than the digits) */
 			for( int j = 0; j < xr.hand_hud[p].box_count; ++j )
 				xr.hand_hud[p].box[j].py = ( height - xr.hand_hud[p].box[j].h ) / 2;
-			if( !box_valid[GL_OPENXR_HUD_BOX_DAMAGE] )
+			if( !base_set )
 				xr.hand_hud[p].base_width = width;
 		}
 		/* stretched to fill the whole slot: SteamVR counts imageRect from the top, our content was at the
@@ -2267,7 +2272,7 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 		quad->pose.position.y -= GL_OpenXRGameHandDrop(); /* off hand: placed relative to the in-game flashlight */
 	if( index == GL_OPENXR_HAND_HUD_STATUS && xr.hand_hud[index].hud_width > xr.hand_hud[index].base_width )
 	{
-		/* damage icons widen the panel to the right: keep health, suit and flashlight where they were */
+		/* the flashlight and damage icons widen the panel to the right only: health and suit stay where they were */
 		const XrVector3f right = { 1.0f, 0.0f, 0.0f };
 		const XrVector3f axis = GL_OpenXRRotateVector( quad->pose.orientation, right );
 		const float shift = 0.5f * metres * ( xr.hand_hud[index].hud_width - xr.hand_hud[index].base_width );
