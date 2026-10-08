@@ -26,6 +26,7 @@ static CVAR_DEFINE_AUTO( vr_swap_jumpduck, "1", FCVAR_ARCHIVE, "1: primary (Cros
 static CVAR_DEFINE_AUTO( vr_weapon_stick_threshold, "0.85", FCVAR_ARCHIVE, "stick deflection (0-1) that opens/steps the weapon menu; must also be mostly vertical" );
 static CVAR_DEFINE_AUTO( vr_ladder_aim, "0", FCVAR_ARCHIVE, "ladder climb direction: 0 look up/down (head), 1 point the off-hand controller" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_up_next, "0", FCVAR_ARCHIVE, "weapon menu stick direction: 0 up = previous weapon, down = next (Lambda1VR); 1 up = next" );
+static CVAR_DEFINE_AUTO( vr_weapon_stick_menu, "1", FCVAR_ARCHIVE, "pushing the weapon-hand stick up/down opens the HUD weapon menu; 0 = off (use the Triangle weapon grid)" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_hold, "0.15", FCVAR_ARCHIVE, "seconds the stick must be held up/down to OPEN the weapon menu (steps inside it are immediate)" );
 static CVAR_DEFINE_AUTO( vr_weapon_pointer, "1", FCVAR_ARCHIVE, "left Triangle (Y) shows the weapon grid on the off hand while held: point at a weapon with the weapon hand and release to switch; 0 = Triangle is the previous weapon" );
 static CVAR_DEFINE_AUTO( vr_laser_doubleclick, "0.35", FCVAR_ARCHIVE, "max seconds between the two off-hand stick clicks that cycle the laser sight (or scope smoothing); one click is use" );
@@ -202,6 +203,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_swap_jumpduck );
 	Cvar_RegisterVariable( &vr_ladder_aim );
 	Cvar_RegisterVariable( &vr_weapon_stick_hold );
+	Cvar_RegisterVariable( &vr_weapon_stick_menu );
 	Cvar_RegisterVariable( &vr_weapon_stick_up_next );
 	Cvar_RegisterVariable( &vr_laser_doubleclick );
 	Cvar_RegisterVariable( &vr_weapon_pointer );
@@ -950,6 +952,8 @@ void CL_VRFrameBegin( void )
 		}
 		else vr_scope_zoom_latched = false;
 	}
+	else if( vr_weapon_stick_menu.value == 0.0f )
+		vr_stick_selecting = false; /* stick menu off: up/down does nothing */
 	else
 	{
 		int selector = variant == 2 ? offhand : dominant;
