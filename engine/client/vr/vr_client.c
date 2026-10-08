@@ -49,8 +49,6 @@ static CVAR_DEFINE_AUTO( vr_headtorch, "0", FCVAR_ARCHIVE, "attach the flashligh
 static CVAR_DEFINE_AUTO( vr_reversetorch, "0", FCVAR_ARCHIVE, "reverse the tracked flashlight direction" );
 static CVAR_DEFINE_AUTO( vr_cinema, "1", FCVAR_ARCHIVE, "show scripted camera views (trigger_camera) on a flat screen in the room; 0 = all around you" );
 static CVAR_DEFINE_AUTO( vr_cinema_fade, "0.3", FCVAR_ARCHIVE, "seconds the cinema screen and the world take to fade in/out" );
-static CVAR_DEFINE_AUTO( vr_cinema_head_angle, "70", FCVAR_ARCHIVE,
-	"the cinema screen appears in the game's forward direction unless your head is turned further than this from it (degrees); then where you look" );
 
 static ref_vr_frame_t vr_frame;
 static ref_vr_pose_t vr_center;
@@ -106,7 +104,6 @@ static struct
 	qboolean showing;   /* the screen is up: camera scene, or fading out after one */
 	float brightness;   /* screen, 0..1 */
 	float world_black;  /* black over the world after a scene, 1..0 */
-	vec3_t forward;     /* room heading of the screen, latched when it appears */
 	double last_time;
 } vr_cinema_state;
 
@@ -214,7 +211,6 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_reversetorch );
 	Cvar_RegisterVariable( &vr_cinema );
 	Cvar_RegisterVariable( &vr_cinema_fade );
-	Cvar_RegisterVariable( &vr_cinema_head_angle );
 	Cmd_AddCommand( "vr_poseinfo", CL_VRPoseInfo_f, "print VR head/centre/body angles (tilt debugging)" );
 	Cmd_AddCommand( "vr_testhaptic", CL_VRTestHaptic_f, "pulse both controllers for 0.5 s: vr_testhaptic [amplitude 0-1] [frequency Hz]" );
 	Cmd_AddCommand( "vr_recenter", CL_VRRecenter_f, "make the current head position and heading the VR reference" );
@@ -483,7 +479,12 @@ static void CL_VRCinemaUpdate( void )
 {
 	const double now = host.realtime;
 	const float fade = vr_cinema_fade.value;
+	/* the game's forward places the screen and the menu panel in the renderer (GL_OpenXRPanelAnchor) */
+	vec3_t room_forward = { 0.0f, 0.0f, 0.0f };
 	float step;
+
+	if( vr_center_valid )
+		VectorCopy( vr_center.forward, room_forward );
 
 	step = (float)bound( 0.0, now - vr_cinema_state.last_time, 0.1 );
 	step = fade > 0.01f ? step / fade : 1.0f;
@@ -495,7 +496,7 @@ static void CL_VRCinemaUpdate( void )
 		CL_VRCinemaReset();
 		vr_cinema_state.last_time = now;
 		if( ref.dllFuncs.R_VRSetCinema )
-			ref.dllFuncs.R_VRSetCinema( false, 0.0f, vr_cinema_state.forward );
+			ref.dllFuncs.R_VRSetCinema( false, 0.0f, room_forward );
 		return;
 	}
 
@@ -505,15 +506,6 @@ static void CL_VRCinemaUpdate( void )
 	{
 		if( !vr_cinema_state.showing )
 		{
-			/* the game's forward (the way you faced at recentre), unless the head is turned far away from it */
-			VectorCopy( vr_center.forward, vr_cinema_state.forward );
-			if( FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ))
-			{
-				ref_vr_pose_t head = vr_frame.head;
-				CL_VRFlattenPose( &head );
-				if( DotProduct( head.forward, vr_center.forward ) < cos( DEG2RAD( bound( 0.0f, vr_cinema_head_angle.value, 180.0f ))))
-					VectorCopy( head.forward, vr_cinema_state.forward );
-			}
 			vr_cinema_state.showing = true;
 			vr_cinema_state.brightness = 0.0f;
 		}
@@ -532,7 +524,7 @@ static void CL_VRCinemaUpdate( void )
 	}
 	else vr_cinema_state.world_black = Q_max( 0.0f, vr_cinema_state.world_black - step );
 
-	ref.dllFuncs.R_VRSetCinema( vr_cinema_state.showing, vr_cinema_state.brightness, vr_cinema_state.forward );
+	ref.dllFuncs.R_VRSetCinema( vr_cinema_state.showing, vr_cinema_state.brightness, room_forward );
 }
 
 qboolean CL_VRCinemaShowing( void )

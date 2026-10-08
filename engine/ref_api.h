@@ -740,8 +740,9 @@ typedef struct ref_interface_s
 	void (*R_VRDrawEyeFade)( const byte *rgba, qboolean modulate );
 	// Cinema mode (scripted cameras): one flat view on a screen in the room instead of the eyes.
 	// Set once per frame after R_VRFrameBegin: show the screen, its brightness (0..1, fades to black)
-	// and the room heading to place it along (LOCAL space, Xash axes; latched when the screen appears).
-	void (*R_VRSetCinema)( qboolean show, float brightness, const vec3_t forward );
+	// and the game's forward in the room (LOCAL space, Xash axes, zero when unknown), which places
+	// both the cinema screen and the menu panel when they appear.
+	void (*R_VRSetCinema)( qboolean show, float brightness, const vec3_t room_forward );
 	// Render the camera view between these (no eye is current, so the desktop render path is used).
 	// Without a new image in a frame the screen repeats the last one.
 	qboolean (*R_VRBeginCinema)( int *width, int *height );

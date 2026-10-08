@@ -176,7 +176,8 @@ typedef struct gl_openxr_state_s
 	gl_openxr_actions_t actions;
 	qboolean ui_active;
 	qboolean ui_world_active;
-	XrPosef ui_anchor; /* level head pose captured when a menu opened (local space) */
+	XrPosef ui_anchor; /* level pose captured when a menu opened (local space, GL_OpenXRPanelAnchor) */
+	vec3_t room_forward; /* engine: the game's forward in the room (LOCAL, Xash axes), zero when unknown */
 	gl_openxr_eye_t beam; /* tiny solid-colour swapchain for the menu pointer beam */
 	gl_openxr_eye_t hud;  /* hand HUD: one slot per panel (gl_openxr_hand_hud_slot) */
 	struct
@@ -185,7 +186,6 @@ typedef struct gl_openxr_state_s
 		qboolean rendering;     /* between BeginCinema and EndCinema */
 		qboolean show;          /* engine: a camera scene is up (screen shown, no world) */
 		float brightness;       /* engine: 0..1, the screen fades to black below 1 */
-		vec3_t forward;         /* engine: room heading for the screen (LOCAL, Xash axes) */
 		qboolean anchored;
 		XrPosef anchor;         /* level pose the screen hangs off, captured when it appeared */
 		GLuint copy_fbo, copy_rb; /* last camera image, repeated while the screen fades out */
@@ -243,6 +243,7 @@ static cvar_t *vr_ui_distance;
 static cvar_t *vr_ui_offset_x;
 static cvar_t *vr_ui_height;
 static cvar_t *vr_ui_offset_y;
+static cvar_t *vr_panel_head_angle;
 static cvar_t *vr_ui_world;
 static cvar_t *vr_ui_width;
 static cvar_t *vr_ui_glow_curve;
@@ -267,9 +268,11 @@ void GL_OpenXRInit( void )
 	vr_mirror_eye = gEngfuncs.Cvar_Get( "vr_mirror_eye", "0", 0, "eye shown in the desktop window (0 left, 1 right)" );
 	vr_worldscale = gEngfuncs.Cvar_Get( "vr_worldscale", "40", FCVAR_ARCHIVE, "game units per physical metre" );
 	vr_ui_distance = gEngfuncs.Cvar_Get( "vr_ui_distance", "1.5", FCVAR_ARCHIVE, "head-relative VR UI distance in metres" );
-	vr_ui_offset_x = gEngfuncs.Cvar_Get( "vr_ui_offset_x", "-0.1", FCVAR_ARCHIVE, "VR UI panel offset to the right in metres (negative = left), clamped to +-1" );
+	vr_ui_offset_x = gEngfuncs.Cvar_Get( "vr_ui_offset_x", "-0.1", FCVAR_ARCHIVE, "VR HUD (head-locked) panel offset to the right in metres (negative = left), clamped to +-1; the menu is centred" );
 	vr_ui_height = gEngfuncs.Cvar_Get( "vr_ui_height", "0", FCVAR_ARCHIVE, "VR UI panel height in metres; 0 = from the width and the UI texture aspect (16:9)" );
-	vr_ui_offset_y = gEngfuncs.Cvar_Get( "vr_ui_offset_y", "0", FCVAR_ARCHIVE, "VR UI panel offset upwards in metres (negative = down), clamped to +-1" );
+	vr_ui_offset_y = gEngfuncs.Cvar_Get( "vr_ui_offset_y", "0", FCVAR_ARCHIVE, "VR HUD (head-locked) panel offset upwards in metres (negative = down), clamped to +-1; the menu is centred" );
+	vr_panel_head_angle = gEngfuncs.Cvar_Get( "vr_panel_head_angle", "70", FCVAR_ARCHIVE,
+		"the menu and the cinema screen appear in the game's forward direction unless your head is turned further than this from it (degrees); then where you look" );
 	vr_ui_world = gEngfuncs.Cvar_Get( "vr_ui_world", "0", 0, "set by the engine while a menu/console is open: the UI panel stays put in the room" );
 	vr_ui_width = gEngfuncs.Cvar_Get( "vr_ui_width", "2.6", FCVAR_ARCHIVE, "head-relative VR UI width in metres" );
 	vr_ui_glow_curve = gEngfuncs.Cvar_Get( "vr_ui_glow_curve", "1.6", FCVAR_ARCHIVE, "VR HUD: opacity of additive (glowing) HUD pixels = brightness^curve; 1 = old look, higher hides faint fringes" );
@@ -696,20 +699,49 @@ static XrPosef GL_OpenXRUIReference( void )
 	return xr.ui_world_active ? xr.ui_anchor : xr.head_pose;
 }
 
-/* Level (yaw-only) copy of a pose, so a world-locked menu does not tilt with the head. */
-static XrPosef GL_OpenXRLevelPose( const XrPosef *pose )
+/* Heading of a pose about +Y (0 = facing -Z); looking straight up or down it comes from the right vector. */
+static float GL_OpenXRPoseYaw( const XrPosef *pose )
 {
-	const XrVector3f forward = { 0.0f, 0.0f, -1.0f };
+	const XrVector3f forward = { 0.0f, 0.0f, -1.0f }, right = { 1.0f, 0.0f, 0.0f };
 	XrVector3f f = GL_OpenXRRotateVector( pose->orientation, forward );
-	float yaw = atan2f( -f.x, -f.z );
+	XrVector3f r;
+
+	if( f.x * f.x + f.z * f.z > 0.01f )
+		return atan2f( -f.x, -f.z );
+	r = GL_OpenXRRotateVector( pose->orientation, right );
+	return atan2f( -r.z, r.x );
+}
+
+/* Level (yaw-only) pose, so the menu and the cinema screen do not tilt with the head. */
+static XrPosef GL_OpenXRYawPose( const XrVector3f *position, float yaw )
+{
 	XrPosef out;
 
-	out.position = pose->position;
+	out.position = *position;
 	out.orientation.x = 0.0f;
 	out.orientation.y = sinf( yaw * 0.5f );
 	out.orientation.z = 0.0f;
 	out.orientation.w = cosf( yaw * 0.5f );
 	return out;
+}
+
+/* Where the menu and the cinema screen hang when they appear: level at the head, facing the game's forward (the way
+ * you faced at recentre, passed by the engine), unless the head is turned more than vr_panel_head_angle away from
+ * it, then where you look. They often appear unasked (camera scenes, loading, the main menu), when you may be
+ * looking anywhere. */
+static XrPosef GL_OpenXRPanelAnchor( void )
+{
+	const float head_yaw = GL_OpenXRPoseYaw( &xr.head_pose );
+	float room_yaw, diff;
+
+	if( xr.room_forward[0] * xr.room_forward[0] + xr.room_forward[1] * xr.room_forward[1] < 0.01f )
+		return GL_OpenXRYawPose( &xr.head_pose.position, head_yaw );
+	/* Xash forward (x, y) = OpenXR (-z, -x): a turn of yaw about +Y */
+	room_yaw = atan2f( xr.room_forward[1], xr.room_forward[0] );
+	diff = fabsf( remainderf( head_yaw - room_yaw, 2.0f * (float)M_PI ));
+	if( RAD2DEG( diff ) > bound( 0.0f, vr_panel_head_angle->value, 180.0f ))
+		return GL_OpenXRYawPose( &xr.head_pose.position, head_yaw );
+	return GL_OpenXRYawPose( &xr.head_pose.position, room_yaw );
 }
 
 static void GL_OpenXRFillUICursor( int hand, const XrPosef *aim, ref_vr_hand_t *out )
@@ -737,8 +769,14 @@ static void GL_OpenXRFillUICursor( int hand, const XrPosef *aim, ref_vr_hand_t *
 	t = ( -distance - local_origin.z ) / local_direction.z;
 	if( t <= 0.0f )
 		return;
-	x = local_origin.x + local_direction.x * t - bound( -1.0f, vr_ui_offset_x->value, 1.0f );
-	y = local_origin.y + local_direction.y * t - bound( -1.0f, vr_ui_offset_y->value, 1.0f );
+	x = local_origin.x + local_direction.x * t;
+	y = local_origin.y + local_direction.y * t;
+	if( !xr.ui_world_active )
+	{
+		/* the offsets move only the head-locked HUD (tuned for it); the menu is centred */
+		x -= bound( -1.0f, vr_ui_offset_x->value, 1.0f );
+		y -= bound( -1.0f, vr_ui_offset_y->value, 1.0f );
+	}
 	out->ui_cursor[0] = x / width + 0.5f;
 	out->ui_cursor[1] = 0.5f - y / height;
 	if( out->ui_cursor[0] >= 0.0f && out->ui_cursor[0] <= 1.0f &&
@@ -1423,7 +1461,7 @@ qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame )
 	if( vr_ui_world->value != 0.0f && xr.views_valid )
 	{
 		if( !xr.ui_world_active )
-			xr.ui_anchor = GL_OpenXRLevelPose( &xr.head_pose );
+			xr.ui_anchor = GL_OpenXRPanelAnchor();
 		xr.ui_world_active = true;
 	}
 	else if( vr_ui_world->value == 0.0f )
@@ -2373,15 +2411,15 @@ void GL_OpenXREndUI( void )
 	xr.ui.ready = true;
 }
 
-/* Cinema mode: the engine shows a scripted camera's view on a flat screen in the room (vr_cinema). The screen is
- * level at head height, along the heading the engine picks (the game's forward, or the head's when turned far away
- * from it), at the menu panel's distance and width, and stays put for the whole scene. */
-void GL_OpenXRSetCinema( qboolean show, float brightness, const vec3_t forward )
+/* Cinema mode: the engine shows a scripted camera's view on a flat screen in the room (vr_cinema), placed like the
+ * menu (GL_OpenXRPanelAnchor) at the menu panel's distance and width, and kept there for the whole scene. */
+void GL_OpenXRSetCinema( qboolean show, float brightness, const vec3_t room_forward )
 {
 	xr.cinema.show = show && xr.cinema.image.swapchain != XR_NULL_HANDLE;
 	xr.cinema.brightness = bound( 0.0f, brightness, 1.0f );
-	if( forward )
-		VectorCopy( forward, xr.cinema.forward );
+	if( room_forward )
+		VectorCopy( room_forward, xr.room_forward );
+	else VectorClear( xr.room_forward );
 	if( !xr.cinema.show )
 	{
 		xr.cinema.anchored = false;
@@ -2390,17 +2428,7 @@ void GL_OpenXRSetCinema( qboolean show, float brightness, const vec3_t forward )
 	}
 	if( !xr.cinema.anchored && xr.views_valid )
 	{
-		if( xr.cinema.forward[0] * xr.cinema.forward[0] + xr.cinema.forward[1] * xr.cinema.forward[1] > 0.01f )
-		{
-			/* Xash forward (x, y) = OpenXR (-z, -x): a turn of yaw about +Y */
-			const float yaw = atan2f( xr.cinema.forward[1], xr.cinema.forward[0] );
-			xr.cinema.anchor.position = xr.head_pose.position;
-			xr.cinema.anchor.orientation.x = 0.0f;
-			xr.cinema.anchor.orientation.y = sinf( yaw * 0.5f );
-			xr.cinema.anchor.orientation.z = 0.0f;
-			xr.cinema.anchor.orientation.w = cosf( yaw * 0.5f );
-		}
-		else xr.cinema.anchor = GL_OpenXRLevelPose( &xr.head_pose );
+		xr.cinema.anchor = GL_OpenXRPanelAnchor();
 		xr.cinema.anchored = true;
 	}
 }
@@ -2669,8 +2697,8 @@ void GL_OpenXRFrameEnd( void )
 			ui.subImage.imageRect.extent.height = xr.ui.height;
 			{
 				XrVector3f offset;
-				offset.x = bound( -1.0f, vr_ui_offset_x->value, 1.0f );
-				offset.y = bound( -1.0f, vr_ui_offset_y->value, 1.0f );
+				offset.x = xr.ui_world_active ? 0.0f : bound( -1.0f, vr_ui_offset_x->value, 1.0f );
+				offset.y = xr.ui_world_active ? 0.0f : bound( -1.0f, vr_ui_offset_y->value, 1.0f );
 				offset.z = -bound( 0.2f, vr_ui_distance->value, 10.0f );
 				if( xr.ui_world_active )
 				{
