@@ -28,7 +28,14 @@ char *Posix_Input( void )
 	static int len;
 	struct timeval tv = { 0 };
 
-	if( !Host_IsDedicated( ))
+	static int stdincmd = -1;
+
+	// -stdincmd: a client reads console commands from stdin too (the Linux/SteamVR launcher connects a FIFO,
+	// so scripts can save, quit or load while you are in the headset)
+	if( stdincmd < 0 )
+		stdincmd = Sys_CheckParm( "-stdincmd" ) ? 1 : 0;
+
+	if( !Host_IsDedicated( ) && !stdincmd )
 		return NULL;
 
 	FD_ZERO( &rfds );
