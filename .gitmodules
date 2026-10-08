@@ -1,6 +1,6 @@
 [submodule "mainui"]
 	path = 3rdparty/mainui
-	url = https://git.marno.org/marnom/mainui_cpp.git
+	url = ../mainui_cpp.git
 	branch = steamvr-linux
 [submodule "ref_gl/nanogl"]
 	path = 3rdparty/nanogl
