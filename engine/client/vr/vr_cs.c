@@ -599,6 +599,12 @@ void CL_VRCSFrame( qboolean ui_active )
 		return;
 	}
 	Cvar_DirectSet( &vr_gamemode, "1" );
+	{
+		/* the classic crosshair ignores vr_xhair; CSVR's engine forces the client's own one too */
+		convar_t *xhair = Cvar_FindVar( "xhair_enable" );
+		if( xhair && xhair->value == 0.0f )
+			Cvar_DirectSet( xhair, "1" );
+	}
 
 	/* Zoomed (AWP, Scout, autosnipers, AUG/SG552): the engine renders the zoomed view onto a lens in
 	 * front of the weapon hand; the client's 2D scope overlay stays off (vr_zoomfix), the head keeps
