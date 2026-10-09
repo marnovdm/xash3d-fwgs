@@ -451,6 +451,10 @@ void V_RenderView( void )
 				CL_VREndCinema();
 			}
 		}
+		else if( CL_VRShouldRender() && viewnum > 0 )
+		{
+			/* extra views (the CS spectator's picture-in-picture overview) would fill a whole eye in VR */
+		}
 		else if( CL_VRShouldRender() )
 		{
 			int render_seed = (int)CL_VRFrameId();

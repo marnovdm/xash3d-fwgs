@@ -412,6 +412,11 @@ static void CL_VRCSButtonMapping( uint32_t weapon, uint32_t offhand )
 	vr_cs_last_buttons[1] = offhand;
 }
 
+qboolean CL_VRCSFreeView( void )
+{
+	return vr_cs_mode && ( cls.spectator || vr_spectator.value > 0.5f || cl.local.health <= 0 );
+}
+
 qboolean CL_VRCSScopeActive( void )
 {
 	return vr_cs_mode && vr_cs_scope;
@@ -702,6 +707,13 @@ void CL_VRCSAppendMove( float frametime, usercmd_t *cmd, const vec3_t head_delta
 
 	if( vr_gamemode.value < 0.5f || !CL_VRCSHands( weapon_pos, weapon_ang, hand_pos, hand_ang ))
 		return;
+	if( CL_VRCSFreeView( ))
+	{
+		/* the spectator/death camera has the view; take the spawn direction again afterwards */
+		vr_cs_body_valid = false;
+		vr_cs_gun_valid = false;
+		return;
+	}
 	if( !FBitSet( frame->flags, REF_VR_FRAME_HEAD_VALID ) || !CL_VRCSRelative( &frame->head, head_pos, head_ang ))
 		VectorCopy( weapon_ang, head_ang );
 

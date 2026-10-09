@@ -1574,6 +1574,20 @@ qboolean GL_OpenXRBeginEye( int eye )
 
 	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
 	pglViewport( 0, 0, target->width, target->height );
+	{
+		/* Swapchain images are reused: a view that does not cover every pixel (no sky, the CS spectator
+		 * overview map) otherwise shows older frames through it, smearing like dragged windows. */
+		GLfloat old_clear[4];
+		pglGetFloatv( GL_COLOR_CLEAR_VALUE, old_clear );
+		pglPushAttrib( GL_SCISSOR_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
+		pglDisable( GL_SCISSOR_TEST );
+		pglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+		pglDepthMask( GL_TRUE );
+		pglClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
+		pglClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT );
+		pglPopAttrib();
+		pglClearColor( old_clear[0], old_clear[1], old_clear[2], old_clear[3] );
+	}
 	xr.current_eye = eye;
 	return true;
 }

@@ -18,6 +18,8 @@ void CL_VRCSReleaseInput( void );
 void CL_VRCSAppendMove( float frametime, usercmd_t *cmd, const vec3_t head_delta );
 /* the body's yaw: the view yaw carries the weapon hand's yaw on top of it */
 float CL_VRCSBodyYaw( void );
+/* dead or spectating: the spectator camera owns the view angles, the head pose goes on top of them */
+qboolean CL_VRCSFreeView( void );
 /* zoomed with a scoped weapon: the engine renders the scope lens */
 qboolean CL_VRCSScopeActive( void );
 /* the server set the view angles (spawn, teleport): turn the body so the gun points that way */
