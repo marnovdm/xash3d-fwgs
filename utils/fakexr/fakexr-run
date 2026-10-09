@@ -70,7 +70,9 @@ exec 3<>"$xr_fifo" 4<>"$con_fifo"
 game=${FAKEXR_GAME:-valve}
 (
 	cd "$root"
-	exec env DISPLAY="$display" LD_LIBRARY_PATH="$root${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+	# SDL otherwise tickles org.freedesktop.ScreenSaver on the desktop's session bus (SimulateUserActivity),
+	# which wakes the real, blanked monitors although the game draws into Xvfb
+	exec env DISPLAY="$display" SDL_VIDEO_ALLOW_SCREENSAVER=1 LD_LIBRARY_PATH="$root${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 		XR_RUNTIME_JSON="$json" FAKEXR_CONTROL="$xr_fifo" \
 		./xash3d -game "$game" +set vr_enable 1 +set gl_vsync 0 +set fps_max 0 -console -log -stdincmd \
 		-width 1280 -height 720 -windowed "$@" <"$con_fifo" >>"$log" 2>&1
