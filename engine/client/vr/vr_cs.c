@@ -87,6 +87,7 @@ static CVAR_DEFINE_AUTO( vr_weapon_pivot_scale, "0", 0, "CS VR: weapon model sca
 static CVAR_DEFINE_AUTO( vr_6dof, "1", FCVAR_ARCHIVE, "CS VR: room-scale head movement" );
 static CVAR_DEFINE_AUTO( vr_xhair, "0", FCVAR_ARCHIVE, "CS VR: draw the 2D crosshair (it sits on the HUD panel, not where the gun points)" );
 static CVAR_DEFINE_AUTO( vr_haptics_enable, "1", FCVAR_ARCHIVE, "CS VR: controller haptics" );
+static CVAR_DEFINE_AUTO( vr_cs_grip_origin, "1", FCVAR_ARCHIVE, "CS VR: hold the weapon at the grip (middle of the hand) instead of the aim point at the front of the controller" );
 static CVAR_DEFINE_AUTO( vr_aimdot, "1", FCVAR_ARCHIVE, "CS VR: red dot where the shot lands (traced from the eye along the gun, like the server)" );
 static CVAR_DEFINE_AUTO( vr_aimdot_scale, "0.1", FCVAR_ARCHIVE, "CS VR: aim dot size (sprite scale per 100 units of distance)" );
 static CVAR_DEFINE_AUTO( vr_weapon_calibration_on, "0", FCVAR_ARCHIVE, "CS VR: right stick adjusts the weapon grip (x/y/z/pitch/yaw/scale)" );
@@ -131,7 +132,7 @@ static convar_t *const vr_cs_cvars[] = {
 	&vr_hand_swap, &vr_haptics_weapon, &vr_haptics_yaw, &vr_ladder, &vr_shielded, &vr_spectator,
 	&vr_weapon_calibration_update, &vr_weapon_pivot_name, &vr_weapon_pivot_x, &vr_weapon_pivot_y,
 	&vr_weapon_pivot_z, &vr_weapon_pivot_pitch, &vr_weapon_pivot_yaw, &vr_weapon_pivot_scale,
-	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_aimdot, &vr_aimdot_scale, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
+	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_aimdot, &vr_aimdot_scale, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
 	&vr_button_alt, &vr_button_a, &vr_button_b, &vr_button_x, &vr_button_y, &vr_button_grip_left,
 	&vr_button_thumbstick_press_left, &vr_button_trigger_left, &vr_button_grip_right,
 	&vr_button_thumbstick_dup_right, &vr_button_thumbstick_ddown_right, &vr_button_thumbstick_dleft_right,
@@ -235,18 +236,32 @@ static const ref_vr_pose_t *CL_VRCSHandPose( const ref_vr_hand_t *hand )
 	return NULL;
 }
 
+/* A hand's pose for the models: the aim orientation (the view angles follow the aim ray, so the gun has to point
+ * along it) at the grip position (the middle of the hand). The OpenXR aim point sits at the front of the
+ * controller (PS VR2 Sense: ~9 cm ahead of and ~4 cm below the grip), so a gun held there swings around the hand
+ * when the wrist turns. vr_cs_grip_origin 0 = the aim position, as CSVR had it. */
+static qboolean CL_VRCSHandRelative( const ref_vr_hand_t *hand, vec3_t position, vec3_t angles )
+{
+	const ref_vr_pose_t *pose = CL_VRCSHandPose( hand );
+	vec3_t ang;
+
+	if( !pose || !CL_VRCSRelative( pose, position, angles ))
+		return false;
+	if( vr_cs_grip_origin.value != 0.0f && pose != &hand->grip && FBitSet( hand->flags, REF_VR_HAND_GRIP_VALID ))
+		CL_VRCSRelative( &hand->grip, position, ang );
+	return true;
+}
+
 /* Weapon and off-hand poses after CSVR's swaps: with the shield up the off hand aims, with dual
  * elites the active gun alternates between the hands. */
 static qboolean CL_VRCSHands( vec3_t weapon_pos, vec3_t weapon_ang, vec3_t hand_pos, vec3_t hand_ang )
 {
 	const ref_vr_frame_t *frame = CL_VRGetFrame();
 	int weapon_hand = CL_VRCSWeaponHand();
-	const ref_vr_pose_t *weapon = CL_VRCSHandPose( &frame->hands[weapon_hand] );
-	const ref_vr_pose_t *hand = CL_VRCSHandPose( &frame->hands[!weapon_hand] );
 
-	if( !weapon || !CL_VRCSRelative( weapon, weapon_pos, weapon_ang ))
+	if( !CL_VRCSHandRelative( &frame->hands[weapon_hand], weapon_pos, weapon_ang ))
 		return false;
-	if( !hand || !CL_VRCSRelative( hand, hand_pos, hand_ang ))
+	if( !CL_VRCSHandRelative( &frame->hands[!weapon_hand], hand_pos, hand_ang ))
 	{
 		VectorCopy( weapon_pos, hand_pos );
 		VectorCopy( weapon_ang, hand_ang );
