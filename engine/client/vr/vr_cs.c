@@ -90,6 +90,10 @@ static CVAR_DEFINE_AUTO( vr_haptics_enable, "1", FCVAR_ARCHIVE, "CS VR: controll
 static CVAR_DEFINE_AUTO( vr_cs_skip_dead_round, "3", FCVAR_ARCHIVE, "CS VR: seconds after your death in an offline bots game until the bots are killed so the next round starts (0 = watch the round out)" );
 static CVAR_DEFINE_AUTO( vr_cs_grip_origin, "1", FCVAR_ARCHIVE, "CS VR: hold the weapon at the grip (middle of the hand) instead of the aim point at the front of the controller" );
 static CVAR_DEFINE_AUTO( vr_aimdot, "1", FCVAR_ARCHIVE, "CS VR: red dot where the shot lands (traced from the eye along the gun, like the server)" );
+static CVAR_DEFINE_AUTO( vr_weapon_origin_x, "0", 0, "CS VR: drawn weapon's origin (set by the client)" );
+static CVAR_DEFINE_AUTO( vr_weapon_origin_y, "0", 0, "CS VR: drawn weapon's origin (set by the client)" );
+static CVAR_DEFINE_AUTO( vr_weapon_origin_z, "0", 0, "CS VR: drawn weapon's origin (set by the client)" );
+static CVAR_DEFINE_AUTO( vr_cs_converge, "1", FCVAR_ARCHIVE, "CS VR: aim the shot at what the barrel points at (the server fires from the eye; 0 = parallel to the barrel)" );
 static CVAR_DEFINE_AUTO( vr_aimdot_scale, "0.1", FCVAR_ARCHIVE, "CS VR: aim dot size (sprite scale per 100 units of distance)" );
 static CVAR_DEFINE_AUTO( vr_weapon_calibration_on, "0", FCVAR_ARCHIVE, "CS VR: right stick adjusts the weapon grip (x/y/z/pitch/yaw/scale)" );
 static CVAR_DEFINE_AUTO( vr_thumbstick_deadzone_right, "0.8", FCVAR_ARCHIVE, "CS VR: right stick deflection for turning and weapon changes" );
@@ -133,7 +137,7 @@ static convar_t *const vr_cs_cvars[] = {
 	&vr_hand_swap, &vr_haptics_weapon, &vr_haptics_yaw, &vr_ladder, &vr_shielded, &vr_spectator,
 	&vr_weapon_calibration_update, &vr_weapon_pivot_name, &vr_weapon_pivot_x, &vr_weapon_pivot_y,
 	&vr_weapon_pivot_z, &vr_weapon_pivot_pitch, &vr_weapon_pivot_yaw, &vr_weapon_pivot_scale,
-	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_cs_skip_dead_round, &vr_aimdot, &vr_aimdot_scale, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
+	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_cs_skip_dead_round, &vr_aimdot, &vr_cs_converge, &vr_weapon_origin_x, &vr_weapon_origin_y, &vr_weapon_origin_z, &vr_aimdot_scale, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
 	&vr_button_alt, &vr_button_a, &vr_button_b, &vr_button_x, &vr_button_y, &vr_button_grip_left,
 	&vr_button_thumbstick_press_left, &vr_button_trigger_left, &vr_button_grip_right,
 	&vr_button_thumbstick_dup_right, &vr_button_thumbstick_ddown_right, &vr_button_thumbstick_dleft_right,
@@ -542,6 +546,33 @@ static void CL_VRCSExpireDot( model_t *dot )
 	vr_cs_dot_ent = NULL;
 }
 
+/* The server fires from the eye along the view angles, but the gun is held 30-40 cm from the eye, so shots
+ * flew parallel to the barrel and missed what it pointed at. Converge: trace the gun's line from where the
+ * client last drew it (vr_weapon_origin_*, the model origin, on the sight line) and aim the eye ray at what
+ * it hits. */
+static qboolean CL_VRCSConverge( const vec3_t gun_angles, vec3_t view_angles )
+{
+	vec3_t eye, gun, forward, end, dir;
+	pmtrace_t trace;
+
+	if( vr_cs_converge.value == 0.0f || vr_zoomed.value > 0.5f || CL_VRCSAimlessWeapon( ))
+		return false;
+	VectorAdd( cl.simorg, cl.viewheight, eye );
+	VectorSet( gun, vr_weapon_origin_x.value, vr_weapon_origin_y.value, vr_weapon_origin_z.value );
+	if( VectorDistance( gun, eye ) > 80.0f )
+		return false; /* not drawn yet (old client, other weapon model) */
+	AngleVectors( gun_angles, forward, NULL, NULL );
+	VectorMA( gun, 8192.0f, forward, end );
+	trace = CL_TraceLine( gun, end, PM_STUDIO_BOX );
+	VectorSubtract( trace.endpos, eye, dir );
+	if( DotProduct( dir, forward ) < 16.0f )
+		return false; /* something right at the muzzle: keep the gun's direction */
+	view_angles[YAW] = anglemod( RAD2DEG( atan2( dir[1], dir[0] )));
+	view_angles[PITCH] = -RAD2DEG( atan2( dir[2], sqrt( dir[0] * dir[0] + dir[1] * dir[1] )));
+	view_angles[ROLL] = 0.0f;
+	return true;
+}
+
 static void CL_VRCSAimDot( const vec3_t weapon_ang )
 {
 	vec3_t start, end, angles, forward;
@@ -559,6 +590,7 @@ static void CL_VRCSAimDot( const vec3_t weapon_ang )
 
 	VectorAdd( cl.simorg, cl.viewheight, start );
 	VectorSet( angles, weapon_ang[PITCH], CL_VRCSBodyYaw() + weapon_ang[YAW], 0.0f );
+	CL_VRCSConverge( angles, angles );
 	AngleVectors( angles, forward, NULL, NULL );
 	VectorMA( start, 8192.0f, forward, end );
 	trace = CL_TraceLine( start, end, PM_STUDIO_BOX );
@@ -751,6 +783,24 @@ static float CL_VRCSFilterAxis( float value )
 	return copysign( magnitude * magnitude, value );
 }
 
+/* movement stick: round dead zone and a linear response, full speed from 90 % deflection on, in every
+ * direction (per-axis squaring gave 77 % speed at 90 % stick and about half on a diagonal) */
+static void CL_VRCSFilterStick( const float *stick, float *x, float *y )
+{
+	const float deadzone = 0.15f, full = 0.9f;
+	float magnitude = sqrt( stick[0] * stick[0] + stick[1] * stick[1] );
+	float scale;
+
+	if( magnitude <= deadzone )
+	{
+		*x = *y = 0.0f;
+		return;
+	}
+	scale = bound( 0.0f, ( magnitude - deadzone ) / ( full - deadzone ), 1.0f ) / magnitude;
+	*x = stick[0] * scale;
+	*y = stick[1] * scale;
+}
+
 void CL_VRCSAppendMove( float frametime, usercmd_t *cmd, const vec3_t head_delta )
 {
 	const ref_vr_frame_t *frame = CL_VRGetFrame();
@@ -814,8 +864,7 @@ void CL_VRCSAppendMove( float frametime, usercmd_t *cmd, const vec3_t head_delta
 	/* left stick, analog over its whole range: scaled to the real top speed (cl_forwardspeed is 400,
 	 * CS caps at 250, so most of the stick used to be full speed) */
 	speed = cl.local.maxspeed > 0.0f ? cl.local.maxspeed : 250.0f;
-	x = CL_VRCSFilterAxis( move->stick[0] );
-	y = CL_VRCSFilterAxis( move->stick[1] );
+	CL_VRCSFilterStick( move->stick, &x, &y );
 	SinCos( DEG2RAD( heading ), &sine, &cosine );
 	cmd->sidemove += ( x * cosine - y * sine ) * speed;
 	cmd->forwardmove += ( y * cosine + x * sine ) * speed;
@@ -845,7 +894,10 @@ void CL_VRCSAppendMove( float frametime, usercmd_t *cmd, const vec3_t head_delta
 			cmd->sidemove *= speed / total;
 		}
 	}
+	/* the view (and the gun drawn with it) keeps the barrel's direction; the server gets the converged one */
 	VectorCopy( cmd->viewangles, cl.viewangles );
 	Cvar_DirectSetValue( &vr_player_pitch, cmd->viewangles[PITCH] );
 	Cvar_DirectSetValue( &vr_player_yaw, cmd->viewangles[YAW] );
+	if( !free_view )
+		CL_VRCSConverge( cl.viewangles, cmd->viewangles );
 }
