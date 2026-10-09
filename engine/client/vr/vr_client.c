@@ -1106,7 +1106,7 @@ void CL_VRApplyHeadPose( ref_viewpass_t *rvp )
 	CL_VRRelativePose( &vr_frame.head, &vr_center, &relative );
 	VectorCopy( rvp->vieworigin, vr_body_view_origin );
 	/* Counter-Strike: the view angles are the weapon hand's, the body is under them */
-	vr_body_view_yaw = CL_VRCSMode() && !CL_VRCSFreeView() ? CL_VRCSBodyYaw() : rvp->viewangles[YAW];
+	vr_body_view_yaw = CL_VRCSMode() ? CL_VRCSBodyYaw() : rvp->viewangles[YAW];
 	vr_body_view_valid = true;
 	{
 		/* the body carries the head pitch for gameplay (swimming, ladders); the view gets

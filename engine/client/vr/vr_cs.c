@@ -167,6 +167,8 @@ static qboolean vr_cs_gun_valid;
  * turning and the server's setangle change it. */
 static float vr_cs_body_yaw;
 static qboolean vr_cs_body_valid;
+static float vr_cs_spec_yaw;    /* dead/spectating: the head turns the camera on top of this */
+static qboolean vr_cs_spec_valid;
 static float vr_cs_stick_input[2]; /* +vr_left/right, +vr_weapon_prev/next */
 static qboolean vr_cs_weapon_change_down;
 static qboolean vr_cs_turn_latched;
@@ -674,6 +676,8 @@ void CL_VRCSFrame( qboolean ui_active )
 
 float CL_VRCSBodyYaw( void )
 {
+	if( CL_VRCSFreeView( ) && vr_cs_spec_valid )
+		return vr_cs_spec_yaw;
 	if( !vr_cs_body_valid )
 		return anglemod( cl.viewangles[YAW] - ( vr_cs_gun_valid ? vr_cs_gun_yaw : 0.0f ));
 	return vr_cs_body_yaw;
@@ -703,72 +707,92 @@ void CL_VRCSAppendMove( float frametime, usercmd_t *cmd, const vec3_t head_delta
 	int weapon_hand = CL_VRCSWeaponHand();
 	const ref_vr_hand_t *move = &frame->hands[!weapon_hand];
 	vec3_t weapon_pos, weapon_ang, hand_pos, hand_ang, head_pos, head_ang;
-	float body_yaw, x, y, heading, sine, cosine, forward_speed, side_speed;
+	float body_yaw, x, y, heading, sine, cosine, speed, turn;
+	qboolean free_view;
 
 	if( vr_gamemode.value < 0.5f || !CL_VRCSHands( weapon_pos, weapon_ang, hand_pos, hand_ang ))
 		return;
-	if( CL_VRCSFreeView( ))
-	{
-		/* the spectator/death camera has the view; take the spawn direction again afterwards */
-		vr_cs_body_valid = false;
-		vr_cs_gun_valid = false;
-		return;
-	}
 	if( !FBitSet( frame->flags, REF_VR_FRAME_HEAD_VALID ) || !CL_VRCSRelative( &frame->head, head_pos, head_ang ))
 		VectorCopy( weapon_ang, head_ang );
+	free_view = CL_VRCSFreeView();
 
-	/* the gun moves the view on top of the body; turning and the server's setangle move the body */
-	body_yaw = CL_VRCSBodyYaw();
-	if( vr_cs_stick_input[0] != 0.0f )
+	/* turning: smooth turn follows how far the right stick is pushed; snap turn steps once per push */
+	body_yaw = free_view ? vr_cs_spec_yaw : CL_VRCSBodyYaw();
+	if( free_view && !vr_cs_spec_valid )
+		body_yaw = anglemod( cl.viewangles[YAW] - head_ang[YAW] );
+	turn = Cvar_VariableValue( "vr_turn_angle" );
+	if( vr_weapon_calibration_on.value > 0.0f )
+		vr_cs_turn_latched = false;
+	else if( Cvar_VariableValue( "vr_smoothturn" ) != 0.0f )
+		body_yaw -= CL_VRCSFilterAxis( frame->hands[weapon_hand].stick[0] ) * turn * 8.0f * frametime;
+	else if( vr_cs_stick_input[0] != 0.0f )
 	{
-		float turn = Cvar_VariableValue( "vr_turn_angle" );
-		if( Cvar_VariableValue( "vr_smoothturn" ) != 0.0f )
-			body_yaw -= vr_cs_stick_input[0] * turn * 8.0f * frametime * fabs( frame->hands[weapon_hand].stick[0] );
-		else if( !vr_cs_turn_latched )
+		if( !vr_cs_turn_latched )
 			body_yaw -= vr_cs_stick_input[0] * turn;
 		vr_cs_turn_latched = true;
 	}
 	else vr_cs_turn_latched = false;
+	body_yaw = anglemod( body_yaw );
 
-	vr_cs_body_yaw = anglemod( body_yaw );
-	vr_cs_body_valid = true;
-	cmd->viewangles[YAW] = anglemod( body_yaw + weapon_ang[YAW] );
-	cmd->viewangles[PITCH] = bound( -89.0f, weapon_ang[PITCH], 89.0f );
+	if( free_view )
+	{
+		/* dead or spectating: the head looks around (the chase camera orbits with it); the gun is not
+		 * in play, and the next spawn's setangle gives the body its direction again */
+		vr_cs_spec_yaw = body_yaw;
+		vr_cs_spec_valid = true;
+		vr_cs_body_valid = false;
+		vr_cs_gun_valid = false;
+		cmd->viewangles[YAW] = anglemod( body_yaw + head_ang[YAW] );
+		cmd->viewangles[PITCH] = bound( -89.0f, head_ang[PITCH], 89.0f );
+		heading = 0.0f;
+	}
+	else
+	{
+		/* the gun moves the view on top of the body; turning and the server's setangle move the body */
+		vr_cs_spec_valid = false;
+		vr_cs_body_yaw = body_yaw;
+		vr_cs_body_valid = true;
+		cmd->viewangles[YAW] = anglemod( body_yaw + weapon_ang[YAW] );
+		cmd->viewangles[PITCH] = bound( -89.0f, weapon_ang[PITCH], 89.0f );
+		vr_cs_gun_yaw = weapon_ang[YAW];
+		vr_cs_gun_valid = true;
+		/* walk where the head looks (vr_walkdirection 1) or the off hand points, in the gun's frame */
+		heading = Cvar_VariableValue( "vr_walkdirection" ) >= 0.5f ? head_ang[YAW] - weapon_ang[YAW] : hand_ang[YAW] - weapon_ang[YAW];
+	}
 	cmd->viewangles[ROLL] = 0.0f;
-	vr_cs_gun_yaw = weapon_ang[YAW];
-	vr_cs_gun_valid = true;
 
-	/* left stick: walk where the head looks (vr_walkdirection 1) or the off hand points, in the
-	 * gun's frame because the view angles are the gun's */
+	/* left stick, analog over its whole range: scaled to the real top speed (cl_forwardspeed is 400,
+	 * CS caps at 250, so most of the stick used to be full speed) */
+	speed = cl.local.maxspeed > 0.0f ? cl.local.maxspeed : 250.0f;
 	x = CL_VRCSFilterAxis( move->stick[0] );
 	y = CL_VRCSFilterAxis( move->stick[1] );
-	if( Cvar_VariableValue( "vr_walkdirection" ) >= 0.5f )
-		heading = head_ang[YAW] - weapon_ang[YAW];
-	else heading = hand_ang[YAW] - weapon_ang[YAW];
 	SinCos( DEG2RAD( heading ), &sine, &cosine );
-	forward_speed = Cvar_VariableValue( "cl_forwardspeed" );
-	side_speed = Cvar_VariableValue( "cl_sidespeed" );
-	if( forward_speed <= 0.0f ) forward_speed = 400.0f;
-	if( side_speed <= 0.0f ) side_speed = 400.0f;
-	cmd->sidemove += ( x * cosine - y * sine ) * side_speed;
-	cmd->forwardmove += ( y * cosine + x * sine ) * forward_speed;
+	cmd->sidemove += ( x * cosine - y * sine ) * speed;
+	cmd->forwardmove += ( y * cosine + x * sine ) * speed;
+
+	/* Ladders move on the movement buttons, not on forwardmove: set them from the plain stick, like
+	 * Lambda1VR-PC does (pointing the gun up or down picks the climbing direction) */
+	ClearBits( cmd->buttons, IN_FORWARD | IN_BACK | IN_MOVERIGHT | IN_MOVELEFT );
+	if( move->stick[1] > 0.3f ) SetBits( cmd->buttons, IN_FORWARD );
+	else if( move->stick[1] < -0.3f ) SetBits( cmd->buttons, IN_BACK );
+	if( move->stick[0] > 0.3f ) SetBits( cmd->buttons, IN_MOVERIGHT );
+	else if( move->stick[0] < -0.3f ) SetBits( cmd->buttons, IN_MOVELEFT );
 
 	/* room-scale: the body follows the head (the recentre point moved with it, vr_client.c) */
-	if( vr_6dof.value != 0.0f && frametime > 0.0f && head_delta )
+	if( !free_view && vr_6dof.value != 0.0f && frametime > 0.0f && head_delta )
 	{
 		float scale = CL_VRGetWorldScale() / frametime;
 		SinCos( DEG2RAD( -weapon_ang[YAW] ), &sine, &cosine );
-		cmd->forwardmove += bound( -forward_speed, ( head_delta[0] * cosine - head_delta[1] * sine ) * scale, forward_speed );
-		cmd->sidemove -= bound( -side_speed, ( head_delta[0] * sine + head_delta[1] * cosine ) * scale, side_speed );
+		cmd->forwardmove += bound( -speed, ( head_delta[0] * cosine - head_delta[1] * sine ) * scale, speed );
+		cmd->sidemove -= bound( -speed, ( head_delta[0] * sine + head_delta[1] * cosine ) * scale, speed );
 	}
 
-	if( cl.local.maxspeed > 0.0f )
 	{
-		float speed = sqrt( cmd->forwardmove * cmd->forwardmove + cmd->sidemove * cmd->sidemove );
-		if( speed > cl.local.maxspeed )
+		float total = sqrt( cmd->forwardmove * cmd->forwardmove + cmd->sidemove * cmd->sidemove );
+		if( total > speed )
 		{
-			cmd->forwardmove *= cl.local.maxspeed / speed;
-			cmd->sidemove *= cl.local.maxspeed / speed;
+			cmd->forwardmove *= speed / total;
+			cmd->sidemove *= speed / total;
 		}
 	}
 	VectorCopy( cmd->viewangles, cl.viewangles );
