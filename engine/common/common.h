@@ -621,6 +621,7 @@ void SV_Shutdown( const char *finalmsg );
 void SV_ShutdownFilter( void );
 void Host_ServerFrame( void );
 qboolean SV_Active( void );
+int SV_HumanClients( void );
 
 /*
 ==============================================================

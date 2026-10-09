@@ -1086,6 +1086,19 @@ qboolean SV_Active( void )
 	return (sv.state != ss_dead);
 }
 
+/* connected players that are not bots (CS VR: end a bots-only round once the local player is dead) */
+int SV_HumanClients( void )
+{
+	int count = 0;
+
+	for( int i = 0; svs.clients && i < svs.maxclients; i++ )
+	{
+		if( svs.clients[i].state >= cs_connected && !FBitSet( svs.clients[i].flags, FCL_FAKECLIENT ))
+			count++;
+	}
+	return count;
+}
+
 qboolean SV_Initialized( void )
 {
 	return svs.initialized;

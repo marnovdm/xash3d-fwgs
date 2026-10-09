@@ -87,6 +87,7 @@ static CVAR_DEFINE_AUTO( vr_weapon_pivot_scale, "0", 0, "CS VR: weapon model sca
 static CVAR_DEFINE_AUTO( vr_6dof, "1", FCVAR_ARCHIVE, "CS VR: room-scale head movement" );
 static CVAR_DEFINE_AUTO( vr_xhair, "0", FCVAR_ARCHIVE, "CS VR: draw the 2D crosshair (it sits on the HUD panel, not where the gun points)" );
 static CVAR_DEFINE_AUTO( vr_haptics_enable, "1", FCVAR_ARCHIVE, "CS VR: controller haptics" );
+static CVAR_DEFINE_AUTO( vr_cs_skip_dead_round, "3", FCVAR_ARCHIVE, "CS VR: seconds after your death in an offline bots game until the bots are killed so the next round starts (0 = watch the round out)" );
 static CVAR_DEFINE_AUTO( vr_cs_grip_origin, "1", FCVAR_ARCHIVE, "CS VR: hold the weapon at the grip (middle of the hand) instead of the aim point at the front of the controller" );
 static CVAR_DEFINE_AUTO( vr_aimdot, "1", FCVAR_ARCHIVE, "CS VR: red dot where the shot lands (traced from the eye along the gun, like the server)" );
 static CVAR_DEFINE_AUTO( vr_aimdot_scale, "0.1", FCVAR_ARCHIVE, "CS VR: aim dot size (sprite scale per 100 units of distance)" );
@@ -132,7 +133,7 @@ static convar_t *const vr_cs_cvars[] = {
 	&vr_hand_swap, &vr_haptics_weapon, &vr_haptics_yaw, &vr_ladder, &vr_shielded, &vr_spectator,
 	&vr_weapon_calibration_update, &vr_weapon_pivot_name, &vr_weapon_pivot_x, &vr_weapon_pivot_y,
 	&vr_weapon_pivot_z, &vr_weapon_pivot_pitch, &vr_weapon_pivot_yaw, &vr_weapon_pivot_scale,
-	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_aimdot, &vr_aimdot_scale, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
+	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_cs_skip_dead_round, &vr_aimdot, &vr_aimdot_scale, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
 	&vr_button_alt, &vr_button_a, &vr_button_b, &vr_button_x, &vr_button_y, &vr_button_grip_left,
 	&vr_button_thumbstick_press_left, &vr_button_trigger_left, &vr_button_grip_right,
 	&vr_button_thumbstick_dup_right, &vr_button_thumbstick_ddown_right, &vr_button_thumbstick_dleft_right,
@@ -598,6 +599,39 @@ static void CL_VRCSSetOffset( convar_t *x, convar_t *y, convar_t *z, const vec3_
 	Cvar_DirectSetValue( z, scale * ( position[2] + height ));
 }
 
+/* Offline with bots there is nothing to do once you are dead but watch them finish the round: a few seconds after
+ * the death (so you see who got you) kill the bots, the round ends and the next one starts. Only on our own
+ * server with no other human player; a death before the first spawn of the map (team menu) does not count. */
+static void CL_VRCSSkipDeadRound( void )
+{
+	static qboolean alive_seen;
+	static double dead_since;
+
+	if( !SV_Active() || cls.state != ca_active || vr_cs_skip_dead_round.value <= 0.0f )
+	{
+		alive_seen = false;
+		dead_since = 0.0;
+		return;
+	}
+	if( cl.local.health > 0 && !cls.spectator )
+	{
+		alive_seen = true;
+		dead_since = 0.0;
+		return;
+	}
+	if( !alive_seen )
+		return;
+	if( dead_since == 0.0 )
+		dead_since = host.realtime;
+	if( host.realtime - dead_since < vr_cs_skip_dead_round.value )
+		return;
+	alive_seen = false;
+	if( SV_HumanClients( ) > 1 )
+		return;
+	Con_Printf( "CS VR: you are dead, killing the bots to end the round (vr_cs_skip_dead_round)\n" );
+	Cbuf_AddText( "bot_kill\n" );
+}
+
 void CL_VRCSFrame( qboolean ui_active )
 {
 	const ref_vr_frame_t *frame = CL_VRGetFrame();
@@ -610,6 +644,7 @@ void CL_VRCSFrame( qboolean ui_active )
 	if(( Cvar_VariableValue( "cl_righthand" ) != 0.0f ) != ( weapon_hand == REF_VR_HAND_RIGHT ))
 		Cvar_SetValue( "cl_righthand", weapon_hand == REF_VR_HAND_RIGHT ? 1.0f : 0.0f );
 
+	CL_VRCSSkipDeadRound( );
 	if( !game )
 	{
 		if( cls.state != ca_active )
