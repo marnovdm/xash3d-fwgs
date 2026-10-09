@@ -280,6 +280,7 @@ static struct
 
 	char shot_path[1024];
 	int shot_eyes; /* bit 0 left, bit 1 right */
+	int shot_layers; /* also write every quad layer's image */
 	GLuint compose_fbo, compose_texture;
 	uint32_t compose_width, compose_height;
 	uint64_t haptic_count;
@@ -446,10 +447,12 @@ static void ControlCommand( char *line )
 	}
 	else if( !strcmp( word, "shot" ) && sscanf( line, "%*s %1023s %15s", rt.shot_path, side ) >= 1 )
 	{
+		char extra[16] = "";
 		if( sscanf( line, "%*s %*s %15s", side ) != 1 || !strcmp( side, "both" ))
 			rt.shot_eyes = 3;
 		else
 			rt.shot_eyes = !strcmp( side, "right" ) ? 2 : 1;
+		rt.shot_layers = sscanf( line, "%*s %*s %*s %15s", extra ) == 1 && !strcmp( extra, "layers" );
 	}
 	else if( !strcmp( word, "exit" ))
 	{
@@ -883,6 +886,29 @@ static void Compose( const XrFrameEndInfo *info )
 		else
 			Log( "could not write %s", rt.shot_path );
 		free( pixels );
+	}
+
+	/* every quad layer's image on its own: <shot>.layerN.png (raw texels, sRGB values as stored) */
+	for( uint32_t i = 0; rt.shot_layers && i < info->layerCount; ++i )
+	{
+		const XrCompositionLayerQuad *quad = (const XrCompositionLayerQuad *)info->layers[i];
+		const swapchain_t *chain;
+		char path[1100];
+		uint8_t *texels;
+
+		if( quad->type != XR_TYPE_COMPOSITION_LAYER_QUAD )
+			continue;
+		chain = FROM_HANDLE( const swapchain_t, quad->subImage.swapchain );
+		texels = malloc( (size_t)chain->width * chain->height * 4 );
+		if( !texels )
+			continue;
+		glBindTexture( GL_TEXTURE_2D, chain->textures[chain->acquired] );
+		glPixelStorei( GL_PACK_ALIGNMENT, 1 );
+		glGetTexImage( GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels );
+		snprintf( path, sizeof( path ), "%.*s.layer%u.png", (int)strlen( rt.shot_path ) - 4, rt.shot_path, i );
+		if( WritePNG( path, texels, chain->width, chain->height ))
+			Log( "layer %u (%ux%u, %.3fx%.3f m) -> %s", i, chain->width, chain->height, quad->size.width, quad->size.height, path );
+		free( texels );
 	}
 
 	glMatrixMode( GL_MODELVIEW ); glPopMatrix();

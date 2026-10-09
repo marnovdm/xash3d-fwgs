@@ -29,5 +29,8 @@ qboolean CL_VRCinemaCamera( void );
 qboolean CL_VRBeginCinema( int *width, int *height );
 void CL_VREndCinema( void );
 void CL_VRDrawCinemaWorldFade( void );
+void CL_VRSetScope( qboolean show, int hand );
+qboolean CL_VRBeginScope( int *width, int *height );
+void CL_VREndScope( void );
 
 #endif /* VR_CLIENT_H */

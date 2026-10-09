@@ -25,6 +25,8 @@ there). This file is that engine half on top of our OpenXR layer (vr_client.c):
 #include "client.h"
 #include "input.h"
 #include "keydefs.h"
+#include "cl_tent.h"
+#include "mod_local.h"
 #include "vr_client.h"
 #include "vr_cs.h"
 
@@ -85,6 +87,8 @@ static CVAR_DEFINE_AUTO( vr_weapon_pivot_scale, "0", 0, "CS VR: weapon model sca
 static CVAR_DEFINE_AUTO( vr_6dof, "1", FCVAR_ARCHIVE, "CS VR: room-scale head movement" );
 static CVAR_DEFINE_AUTO( vr_xhair, "0", FCVAR_ARCHIVE, "CS VR: draw the 2D crosshair (it sits on the HUD panel, not where the gun points)" );
 static CVAR_DEFINE_AUTO( vr_haptics_enable, "1", FCVAR_ARCHIVE, "CS VR: controller haptics" );
+static CVAR_DEFINE_AUTO( vr_aimdot, "1", FCVAR_ARCHIVE, "CS VR: red dot where the shot lands (traced from the eye along the gun, like the server)" );
+static CVAR_DEFINE_AUTO( vr_aimdot_scale, "0.1", FCVAR_ARCHIVE, "CS VR: aim dot size (sprite scale per 100 units of distance)" );
 static CVAR_DEFINE_AUTO( vr_weapon_calibration_on, "0", FCVAR_ARCHIVE, "CS VR: right stick adjusts the weapon grip (x/y/z/pitch/yaw/scale)" );
 static CVAR_DEFINE_AUTO( vr_thumbstick_deadzone_right, "0.8", FCVAR_ARCHIVE, "CS VR: right stick deflection for turning and weapon changes" );
 static CVAR_DEFINE_AUTO( vr_button_alt, "vr_button_x", FCVAR_ARCHIVE, "CS VR: button that switches the other buttons to their _alt commands while held" );
@@ -127,7 +131,7 @@ static convar_t *const vr_cs_cvars[] = {
 	&vr_hand_swap, &vr_haptics_weapon, &vr_haptics_yaw, &vr_ladder, &vr_shielded, &vr_spectator,
 	&vr_weapon_calibration_update, &vr_weapon_pivot_name, &vr_weapon_pivot_x, &vr_weapon_pivot_y,
 	&vr_weapon_pivot_z, &vr_weapon_pivot_pitch, &vr_weapon_pivot_yaw, &vr_weapon_pivot_scale,
-	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
+	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_aimdot, &vr_aimdot_scale, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
 	&vr_button_alt, &vr_button_a, &vr_button_b, &vr_button_x, &vr_button_y, &vr_button_grip_left,
 	&vr_button_thumbstick_press_left, &vr_button_trigger_left, &vr_button_grip_right,
 	&vr_button_thumbstick_dup_right, &vr_button_thumbstick_ddown_right, &vr_button_thumbstick_dleft_right,
@@ -154,6 +158,7 @@ enum
 };
 
 static qboolean vr_cs_mode;
+static qboolean vr_cs_scope;
 static uint32_t vr_cs_last_buttons[REF_VR_MAX_HANDS]; /* [weapon hand, off hand] */
 static float vr_cs_gun_yaw;     /* weapon-hand yaw relative to the recentre heading, applied last frame */
 static qboolean vr_cs_gun_valid;
@@ -407,10 +412,17 @@ static void CL_VRCSButtonMapping( uint32_t weapon, uint32_t offhand )
 	vr_cs_last_buttons[1] = offhand;
 }
 
+qboolean CL_VRCSScopeActive( void )
+{
+	return vr_cs_mode && vr_cs_scope;
+}
+
 void CL_VRCSReleaseInput( void )
 {
 	if( !vr_cs_mode )
 		return;
+	vr_cs_scope = false;
+	CL_VRSetScope( false, 0 );
 	if( vr_cs_last_buttons[0] || vr_cs_last_buttons[1] )
 		CL_VRCSButtonMapping( 0, 0 );
 	vr_cs_stick_input[0] = vr_cs_stick_input[1] = 0.0f;
@@ -476,6 +488,80 @@ static void CL_VRCSHaptics( int weapon_hand )
 	vr_cs_last_health = cl.local.health;
 }
 
+/* Weapons without a useful aim point (CSVR hides its crosshair for these too). */
+static qboolean CL_VRCSAimlessWeapon( void )
+{
+	static const char *names[] = { "v_knife.mdl", "v_flashbang.mdl", "v_hegrenade.mdl", "v_smokegrenade.mdl",
+		"v_c4.mdl", "v_shield_knife.mdl", "v_shield_flashbang.mdl", "v_shield_hegrenade.mdl", "v_shield_smokegrenade.mdl" };
+	const char *weapon = COM_FileWithoutPath( vr_weapon_pivot_name.string );
+
+	if( !weapon[0] )
+		return true;
+	for( size_t i = 0; i < ARRAYSIZE( names ); ++i )
+	{
+		if( !Q_stricmp( weapon, names[i] ))
+			return true;
+	}
+	return false;
+}
+
+/* A glowing laser dot where the shot lands. The server fires from the eye along the view angles
+ * (= the gun's direction), not from the barrel, so trace exactly that. A new temp entity every
+ * frame; the previous one is expired when it is still ours (same model and position), so a
+ * reused slot after a map change is never touched. */
+static TEMPENTITY *vr_cs_dot_ent;
+static vec3_t vr_cs_dot_origin;
+
+static void CL_VRCSExpireDot( model_t *dot )
+{
+	if( vr_cs_dot_ent && vr_cs_dot_ent->entity.model == dot && VectorCompare( vr_cs_dot_ent->entity.origin, vr_cs_dot_origin ))
+		vr_cs_dot_ent->die = 0.0f;
+	vr_cs_dot_ent = NULL;
+}
+
+static void CL_VRCSAimDot( const vec3_t weapon_ang )
+{
+	vec3_t start, end, angles, forward;
+	model_t *dot;
+	TEMPENTITY *ent;
+	pmtrace_t trace;
+
+	dot = Mod_ForName( "sprites/laserdot.spr", false, false );
+	if( !dot )
+		return;
+	CL_VRCSExpireDot( dot );
+	if( vr_aimdot.value == 0.0f || vr_spectator.value > 0.5f || cl.local.health <= 0 ||
+		vr_zoomed.value > 0.5f || CL_VRCSAimlessWeapon( ))
+		return;
+
+	VectorAdd( cl.simorg, cl.viewheight, start );
+	VectorSet( angles, weapon_ang[PITCH], CL_VRCSBodyYaw() + weapon_ang[YAW], 0.0f );
+	AngleVectors( angles, forward, NULL, NULL );
+	VectorMA( start, 8192.0f, forward, end );
+	trace = CL_TraceLine( start, end, PM_STUDIO_BOX );
+	if( trace.fraction >= 1.0f )
+		return;
+	/* pull it off the surface so it is not half inside the wall */
+	VectorMA( trace.endpos, -2.0f, forward, end );
+
+	ent = CL_TempEntAlloc( end, dot );
+	if( !ent )
+		return;
+	ent->die = cl.time + 0.1f;
+	ent->flags = FTENT_NONE;
+	/* additive and depth-tested: glow sprites go through an occlusion test that hid the dot;
+	 * scaled with distance instead so it keeps the same angular size */
+	ent->entity.curstate.rendermode = kRenderTransAdd;
+	ent->entity.curstate.renderfx = kRenderFxNone;
+	ent->entity.curstate.renderamt = 255;
+	ent->entity.curstate.rendercolor.r = 255;
+	ent->entity.curstate.rendercolor.g = 255;
+	ent->entity.curstate.rendercolor.b = 255;
+	ent->entity.curstate.scale = vr_aimdot_scale.value * trace.fraction * 8192.0f / 100.0f;
+	vr_cs_dot_ent = ent;
+	VectorCopy( end, vr_cs_dot_origin );
+}
+
 /* the offsets the client adds to the eye origin, in the head's flattened frame (see the header) */
 static void CL_VRCSSetOffset( convar_t *x, convar_t *y, convar_t *z, const vec3_t position, float head_yaw )
 {
@@ -505,11 +591,24 @@ void CL_VRCSFrame( qboolean ui_active )
 	if( !game )
 	{
 		if( cls.state != ca_active )
+		{
 			vr_cs_body_valid = false; /* new map: take the spawn direction again */
+			vr_cs_dot_ent = NULL;
+		}
 		CL_VRCSReleaseInput();
 		return;
 	}
 	Cvar_DirectSet( &vr_gamemode, "1" );
+
+	/* Zoomed (AWP, Scout, autosnipers, AUG/SG552): the engine renders the zoomed view onto a lens in
+	 * front of the weapon hand; the client's 2D scope overlay stays off (vr_zoomfix), the head keeps
+	 * its normal view. */
+	vr_cs_scope = cl.local.scr_fov > 1.0f && cl.local.scr_fov < 80.0f && vr_spectator.value < 0.5f && cl.local.health > 0;
+	if(( vr_zoomed.value != 0.0f ) != vr_cs_scope )
+		Cvar_DirectSet( &vr_zoomed, vr_cs_scope ? "1" : "0" );
+	if( vr_zoomfix.value == 0.0f )
+		Cvar_DirectSet( &vr_zoomfix, "1" );
+	CL_VRSetScope( vr_cs_scope, vr_shielded.value > 0.0f ? !weapon_hand : weapon_hand );
 	if( vr_xhair_x.value != 0.0f || vr_xhair_y.value != 0.0f )
 	{
 		Cvar_DirectSet( &vr_xhair_x, "0" );
@@ -559,6 +658,7 @@ void CL_VRCSFrame( qboolean ui_active )
 	CL_VRCSSetOffset( &vr_weapon_x, &vr_weapon_y, &vr_weapon_z, weapon_pos, head_ang[YAW] );
 	CL_VRCSSetOffset( &vr_hand_x, &vr_hand_y, &vr_hand_z, hand_pos, head_ang[YAW] );
 	CL_VRCSHaptics( weapon_hand );
+	CL_VRCSAimDot( weapon_ang );
 }
 
 float CL_VRCSBodyYaw( void )

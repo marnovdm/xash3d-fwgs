@@ -30,6 +30,10 @@ void GL_OpenXRApplyEyePose( struct ref_viewpass_s *rvp );
 void GL_OpenXRSetCinema( qboolean show, float brightness, const vec3_t room_forward );
 qboolean GL_OpenXRBeginCinema( int *width, int *height );
 void GL_OpenXREndCinema( int source_width, int source_height );
+void GL_OpenXRSetScope( qboolean show, int hand );
+qboolean GL_OpenXRBeginScope( int *width, int *height );
+void GL_OpenXREndScope( int source_width, int source_height );
+qboolean GL_OpenXRIsRenderingScope( void );
 #else
 static inline void GL_OpenXRInit( void ) {}
 static inline qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame ) { (void)frame; return false; }
@@ -58,4 +62,8 @@ static inline void GL_OpenXRSetCinema( qboolean show, float brightness, const ve
 }
 static inline qboolean GL_OpenXRBeginCinema( int *width, int *height ) { (void)width; (void)height; return false; }
 static inline void GL_OpenXREndCinema( int source_width, int source_height ) { (void)source_width; (void)source_height; }
+static inline void GL_OpenXRSetScope( qboolean show, int hand ) { (void)show; (void)hand; }
+static inline qboolean GL_OpenXRBeginScope( int *width, int *height ) { (void)width; (void)height; return false; }
+static inline void GL_OpenXREndScope( int source_width, int source_height ) { (void)source_width; (void)source_height; }
+static inline qboolean GL_OpenXRIsRenderingScope( void ) { return false; }
 #endif

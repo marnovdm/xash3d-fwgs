@@ -547,6 +547,23 @@ qboolean CL_VRBeginCinema( int *width, int *height )
 	return CL_VRShouldRender() && ref.dllFuncs.R_VRBeginCinema && ref.dllFuncs.R_VRBeginCinema( width, height );
 }
 
+void CL_VRSetScope( qboolean show, int hand )
+{
+	if( vr_frame_begun && ref.dllFuncs.R_VRSetScope )
+		ref.dllFuncs.R_VRSetScope( show, hand );
+}
+
+qboolean CL_VRBeginScope( int *width, int *height )
+{
+	return CL_VRShouldRender() && ref.dllFuncs.R_VRBeginScope && ref.dllFuncs.R_VRBeginScope( width, height );
+}
+
+void CL_VREndScope( void )
+{
+	if( ref.dllFuncs.R_VREndScope )
+		ref.dllFuncs.R_VREndScope( refState.width, refState.height );
+}
+
 void CL_VREndCinema( void )
 {
 	if( ref.dllFuncs.R_VREndCinema )

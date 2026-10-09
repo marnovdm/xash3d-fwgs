@@ -8,7 +8,8 @@
 #                xr <command>          fakexr control command (head/aim/grip/track/input/exit, see fakexr.c)
 #                con <command>         engine console command (via -stdincmd)
 #                sleep <seconds>
-#                shot <name> [both|left|right]   composited view -> $FAKEXR_OUT/<name>.png (waits for it)
+#                shot <name> [both|left|right] [layers]   composited view -> $FAKEXR_OUT/<name>.png (waits for it);
+#                                      "layers" also writes each overlay layer's image to <name>.layerN.png
 #                wait-log <regex> [seconds]       wait until the game log matches (default 60 s)
 #                # comment
 #   Lines may use $OUT (the output directory).
@@ -91,10 +92,10 @@ while IFS= read -r line || [[ -n $line ]]; do
 	con) printf '%s\n' "$rest" >&4 ;;
 	sleep) sleep "$rest" ;;
 	shot)
-		read -r name eyes <<<"$rest"
+		read -r name eyes layers <<<"$rest"
 		file=$out/$name.png
 		rm -f "$file"
-		printf 'shot %s %s\n' "$file" "${eyes:-both}" >&3
+		printf 'shot %s %s %s\n' "$file" "${eyes:-both}" "${layers:-}" >&3
 		for _ in $(seq 1 300); do [[ -f $file ]] && break; alive || break; sleep 0.1; done
 		if [[ -f $file ]]; then echo "fakexr-run: $file"; else echo "fakexr-run: shot $name timed out" >&2; fi
 		;;

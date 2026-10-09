@@ -747,6 +747,11 @@ typedef struct ref_interface_s
 	// Without a new image in a frame the screen repeats the last one.
 	qboolean (*R_VRBeginCinema)( int *width, int *height );
 	void (*R_VREndCinema)( int source_width, int source_height );
+	// Scope lens (Counter-Strike): show the zoomed view on a lens in front of the weapon hand. Set once per
+	// frame after R_VRFrameBegin; render the zoomed view between Begin/End (no eye current, desktop path).
+	void (*R_VRSetScope)( qboolean show, int hand );
+	qboolean (*R_VRBeginScope)( int *width, int *height );
+	void (*R_VREndScope)( int source_width, int source_height );
 } ref_interface_t;
 
 typedef int (*REFAPI)( int version, ref_interface_t *pFunctionTable, ref_api_t* engfuncs, ref_globals_t *pGlobals );

@@ -587,4 +587,7 @@ const ref_interface_t gReffuncs =
 	GL_OpenXRSetCinema,
 	GL_OpenXRBeginCinema,
 	GL_OpenXREndCinema,
+	GL_OpenXRSetScope,
+	GL_OpenXRBeginScope,
+	GL_OpenXREndScope,
 };

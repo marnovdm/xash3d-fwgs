@@ -3352,6 +3352,10 @@ void R_DrawViewModel( void )
 	if( GL_OpenXRIsRenderingEye() && gEngfuncs.pfnGetCvarFloat( "vr_scope_engaged" ) != 0.0f )
 		return;
 
+	/* the scope lens shows the world in front of the gun, not the gun */
+	if( GL_OpenXRIsRenderingScope( ))
+		return;
+
 	if( ENGINE_GET_PARM( PARM_THIRDPERSON ))
 		return;
 

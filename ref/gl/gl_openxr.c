@@ -193,6 +193,13 @@ typedef struct gl_openxr_state_s
 	} cinema;
 	struct
 	{
+		gl_openxr_eye_t image;  /* zoomed view along the weapon, rendered once per frame */
+		qboolean show;          /* engine: zoomed with a scoped weapon */
+		qboolean rendering;     /* between BeginScope and EndScope */
+		int hand;               /* the weapon hand the lens sits on */
+	} scope;
+	struct
+	{
 		qboolean valid;
 		int hud_width, hud_height; /* content size in HUD pixels (square on the desktop) */
 		int base_width;            /* status panel: width of health + suit; the flashlight and damage icons extend it to the right */
@@ -262,6 +269,8 @@ static cvar_t *vr_hud_right_flip;
 static cvar_t *vr_hud_rect[GL_OPENXR_HUD_BOX_COUNT];
 static cvar_t *vr_hud_offset[GL_OPENXR_HAND_HUD_COUNT];
 static cvar_t *vr_weapon_pointer_scale;
+static cvar_t *vr_scope_size;
+static cvar_t *vr_scope_offset;
 static cvar_t *vr_weapon_pointer_yaw;
 
 void GL_OpenXRInit( void )
@@ -327,6 +336,10 @@ void GL_OpenXRInit( void )
 		"pointer weapon grid size: metres per HUD pixel (0.00065 = weapon icons about 10 cm wide)" );
 	vr_weapon_pointer_yaw = gEngfuncs.Cvar_Get( "vr_weapon_pointer_yaw", "40", FCVAR_ARCHIVE,
 		"pointer weapon grid turn in degrees, like vr_hud_hand_yaw (90 = facing your body like the health panel; less turns its far end inwards and its face towards you)" );
+	vr_scope_size = gEngfuncs.Cvar_Get( "vr_scope_size", "0.05", FCVAR_ARCHIVE,
+		"scope lens diameter in metres (Counter-Strike: the zoomed view on a lens in front of the weapon hand)" );
+	vr_scope_offset = gEngfuncs.Cvar_Get( "vr_scope_offset", "0 0.06 -0.08", FCVAR_ARCHIVE,
+		"scope lens centre from the weapon-hand aim pose, metres along its axes: right up back (negative back = in front)" );
 	gEngfuncs.Cvar_Get( "vr_weapon_pointer_cursor", "", 0,
 		"set by the renderer: \"x y\" HUD pixels the weapon hand points at on the weapon grid, empty when off it" );
 }
@@ -942,9 +955,10 @@ void GL_OpenXRShutdown( void )
 
 	/* OpenXR requires every waited swapchain image to be released before its
 	 * frame/session is ended. This also unwinds an interrupted eye/UI pass. */
-	for( int i = 0; i <= REF_VR_MAX_EYES + 1; ++i )
+	for( int i = 0; i <= REF_VR_MAX_EYES + 2; ++i )
 	{
-		gl_openxr_eye_t *eye = i == REF_VR_MAX_EYES ? &xr.ui : i > REF_VR_MAX_EYES ? &xr.cinema.image : &xr.eyes[i];
+		gl_openxr_eye_t *eye = i == REF_VR_MAX_EYES ? &xr.ui : i == REF_VR_MAX_EYES + 1 ? &xr.cinema.image :
+			i > REF_VR_MAX_EYES ? &xr.scope.image : &xr.eyes[i];
 		if( eye->acquired && eye->waited && eye->swapchain != XR_NULL_HANDLE )
 		{
 			XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
@@ -972,6 +986,7 @@ void GL_OpenXRShutdown( void )
 	GL_OpenXRDestroyEye( &xr.beam );
 	GL_OpenXRDestroyEye( &xr.hud );
 	GL_OpenXRDestroyEye( &xr.cinema.image );
+	GL_OpenXRDestroyEye( &xr.scope.image );
 	if( xr.cinema.copy_fbo )
 		pglDeleteFramebuffers( 1, &xr.cinema.copy_fbo );
 	if( xr.cinema.copy_rb )
@@ -1268,6 +1283,19 @@ static qboolean GL_OpenXRInitialize( void )
 		}
 	}
 
+	{
+		/* optional: without it zoomed weapons just show the unzoomed view */
+		XrViewConfigurationView scope_config = { XR_TYPE_VIEW_CONFIGURATION_VIEW };
+		float scale = bound( 0.5f, vr_supersampling->value, 2.0f );
+		scope_config.recommendedImageRectWidth = (uint32_t)( 512 / scale );
+		scope_config.recommendedImageRectHeight = (uint32_t)( 512 / scale );
+		if( !GL_OpenXRCreateEye( &xr.scope.image, &scope_config, selected_format ))
+		{
+			GL_OpenXRDestroyEye( &xr.scope.image );
+			memset( &xr.scope.image, 0, sizeof( xr.scope.image ));
+		}
+	}
+
 	xr.initialized = true;
 #if defined( _WIN32 )
 	gEngfuncs.Con_Printf( "OpenXR: initialized Windows/WGL stereo session (%ux%u per eye)\n",
@@ -1445,6 +1473,8 @@ qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame )
 	xr.hud.ready = false;
 	xr.cinema.image.ready = false;
 	xr.cinema.rendering = false;
+	xr.scope.image.ready = false;
+	xr.scope.rendering = false;
 	for( int i = 0; i < REF_VR_MAX_EYES; ++i )
 		xr.eyes[i].ready = false;
 	actions_synced = GL_OpenXRSyncActions();
@@ -2644,14 +2674,173 @@ static qboolean GL_OpenXRBuildCinemaLayer( XrCompositionLayerQuad *quad )
 	return true;
 }
 
+/* Scope lens (Counter-Strike): the engine renders the zoomed view along the weapon into a small
+ * image once per frame; it is shown as a round lens in front of the weapon hand. */
+void GL_OpenXRSetScope( qboolean show, int hand )
+{
+	xr.scope.show = show && xr.scope.image.swapchain != XR_NULL_HANDLE && hand >= 0 && hand < REF_VR_MAX_HANDS;
+	xr.scope.hand = hand;
+}
+
+qboolean GL_OpenXRBeginScope( int *width, int *height )
+{
+	gl_openxr_eye_t *target = &xr.scope.image;
+	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	XrSwapchainImageWaitInfo wait_info = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+
+	if( !xr.frame_begun || !xr.frame_state.shouldRender || !xr.views_valid || !xr.scope.show ||
+		target->swapchain == XR_NULL_HANDLE || target->acquired || xr.current_eye >= 0 || !width || !height )
+		return false;
+	if( !GL_OpenXRCheck( xrAcquireSwapchainImage( target->swapchain, &acquire_info, &target->image_index ),
+		"xrAcquireSwapchainImage(scope)" ))
+		return false;
+	target->acquired = true;
+	target->waited = false;
+	wait_info.timeout = XR_INFINITE_DURATION;
+	if( !GL_OpenXRCheck( xrWaitSwapchainImage( target->swapchain, &wait_info ), "xrWaitSwapchainImage(scope)" ))
+	{
+		GL_OpenXRShutdown();
+		xr.failed = true;
+		return false;
+	}
+	target->waited = true;
+	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	pglViewport( 0, 0, target->width, target->height );
+	xr.scope.rendering = true;
+	*width = target->width;
+	*height = target->height;
+	return true;
+}
+
+qboolean GL_OpenXRIsRenderingScope( void )
+{
+	return xr.scope.rendering;
+}
+
+/* Round lens with a thin cross: alpha 1 inside the circle, 0 outside (the layer blends with alpha). */
+static void GL_OpenXRDrawScopeMask( int width, int height )
+{
+	const int segments = 64;
+	const float radius = 0.5f, line = 1.5f / (float)width;
+
+	pglPushAttrib( GL_ALL_ATTRIB_BITS );
+	pglDisable( GL_DEPTH_TEST );
+	pglDisable( GL_CULL_FACE );
+	pglDisable( GL_TEXTURE_2D );
+	pglDisable( GL_BLEND );
+	pglDisable( GL_ALPHA_TEST );
+	pglDisable( GL_SCISSOR_TEST );
+	pglDisable( GL_FOG );
+	pglMatrixMode( GL_PROJECTION );
+	pglPushMatrix();
+	pglLoadIdentity();
+	pglOrtho( -0.5f, 0.5f, -0.5f, 0.5f, -1.0f, 1.0f );
+	pglMatrixMode( GL_MODELVIEW );
+	pglPushMatrix();
+	pglLoadIdentity();
+	pglViewport( 0, 0, width, height );
+
+	/* the world pass leaves arbitrary alpha: make the inside opaque */
+	pglColorMask( GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE );
+	pglClearColor( 0.0f, 0.0f, 0.0f, 1.0f );
+	pglClear( GL_COLOR_BUFFER_BIT );
+	pglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+
+	/* outside the circle: transparent */
+	pglColor4f( 0.0f, 0.0f, 0.0f, 0.0f );
+	pglBegin( GL_TRIANGLE_STRIP );
+	for( int i = 0; i <= segments; ++i )
+	{
+		float a = (float)i / segments * 2.0f * M_PI_F;
+		pglVertex2f( cosf( a ) * radius, sinf( a ) * radius );
+		pglVertex2f( cosf( a ) * 1.0f, sinf( a ) * 1.0f );
+	}
+	pglEnd();
+
+	/* black ring and cross */
+	pglColor4f( 0.0f, 0.0f, 0.0f, 1.0f );
+	pglBegin( GL_TRIANGLE_STRIP );
+	for( int i = 0; i <= segments; ++i )
+	{
+		float a = (float)i / segments * 2.0f * M_PI_F;
+		pglVertex2f( cosf( a ) * radius * 0.94f, sinf( a ) * radius * 0.94f );
+		pglVertex2f( cosf( a ) * radius, sinf( a ) * radius );
+	}
+	pglEnd();
+	pglBegin( GL_QUADS );
+	pglVertex2f( -radius, -line ); pglVertex2f( radius, -line ); pglVertex2f( radius, line ); pglVertex2f( -radius, line );
+	pglVertex2f( -line, -radius ); pglVertex2f( line, -radius ); pglVertex2f( line, radius ); pglVertex2f( -line, radius );
+	pglEnd();
+
+	pglColor4f( 1.0f, 1.0f, 1.0f, 1.0f );
+	pglMatrixMode( GL_PROJECTION );
+	pglPopMatrix();
+	pglMatrixMode( GL_MODELVIEW );
+	pglPopMatrix();
+	pglPopAttrib();
+}
+
+void GL_OpenXREndScope( int source_width, int source_height )
+{
+	gl_openxr_eye_t *target = &xr.scope.image;
+	XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+
+	if( !xr.scope.rendering )
+		return;
+	xr.scope.rendering = false;
+	if( !target->acquired || !target->waited )
+		return;
+	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	GL_OpenXRDrawScopeMask( target->width, target->height );
+	pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
+	pglViewport( 0, 0, source_width, source_height );
+	if( !GL_OpenXRCheck( xrReleaseSwapchainImage( target->swapchain, &release_info ), "xrReleaseSwapchainImage(scope)" ))
+	{
+		GL_OpenXRShutdown();
+		xr.failed = true;
+		return;
+	}
+	target->acquired = false;
+	target->waited = false;
+	target->ready = true;
+}
+
+static qboolean GL_OpenXRBuildScopeLayer( XrCompositionLayerQuad *quad )
+{
+	XrVector3f offset, rotated;
+	float size;
+
+	if( !xr.scope.show || !xr.scope.image.ready || !xr.hand_pose[xr.scope.hand].aim_valid )
+		return false;
+	if( sscanf( vr_scope_offset->string, "%f %f %f", &offset.x, &offset.y, &offset.z ) != 3 )
+		offset.x = 0.0f, offset.y = 0.06f, offset.z = -0.08f;
+	size = bound( 0.01f, vr_scope_size->value, 0.5f );
+	/* the lens faces back along the aim (a quad faces its +Z), towards the eye behind the gun */
+	rotated = GL_OpenXRRotateVector( xr.hand_pose[xr.scope.hand].aim.orientation, offset );
+	quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+	quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+	quad->space = xr.local_space;
+	quad->pose.orientation = xr.hand_pose[xr.scope.hand].aim.orientation;
+	quad->pose.position.x = xr.hand_pose[xr.scope.hand].aim.position.x + rotated.x;
+	quad->pose.position.y = xr.hand_pose[xr.scope.hand].aim.position.y + rotated.y;
+	quad->pose.position.z = xr.hand_pose[xr.scope.hand].aim.position.z + rotated.z;
+	quad->subImage.swapchain = xr.scope.image.swapchain;
+	quad->subImage.imageRect.extent.width = xr.scope.image.width;
+	quad->subImage.imageRect.extent.height = xr.scope.image.height;
+	quad->size.width = size;
+	quad->size.height = size;
+	return true;
+}
+
 void GL_OpenXRFrameEnd( void )
 {
 	XrCompositionLayerProjectionView projection_views[REF_VR_MAX_EYES];
 	XrCompositionLayerProjection projection = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
 	XrCompositionLayerQuad ui = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrCompositionLayerQuad cinema = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-	const XrCompositionLayerBaseHeader *layers[4 + GL_OPENXR_HAND_HUD_COUNT];
+	const XrCompositionLayerBaseHeader *layers[5 + GL_OPENXR_HAND_HUD_COUNT];
 	XrCompositionLayerQuad beam = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+	XrCompositionLayerQuad scope = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 	XrCompositionLayerQuad hand_hud[GL_OPENXR_HAND_HUD_COUNT];
 	XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
 	/* The world view and the head-locked UI quad are submitted independently: in the main menu
@@ -2679,6 +2868,16 @@ void GL_OpenXRFrameEnd( void )
 			xr.eyes[i].waited = false;
 			eyes_ok = false;
 		}
+	}
+	if( xr.scope.image.acquired && xr.scope.image.waited )
+	{
+		/* interrupted scope render */
+		XrSwapchainImageReleaseInfo release_info = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		GL_OpenXRCheck( xrReleaseSwapchainImage( xr.scope.image.swapchain, &release_info ),
+			"xrReleaseSwapchainImage(interrupted scope)" );
+		xr.scope.image.acquired = false;
+		xr.scope.image.waited = false;
+		xr.scope.rendering = false;
 	}
 	if( xr.cinema.image.acquired && xr.cinema.image.waited )
 	{
@@ -2768,6 +2967,8 @@ void GL_OpenXRFrameEnd( void )
 		}
 		GL_OpenXRUpdateWeaponPointer( grid ? &hand_hud[GL_OPENXR_HAND_HUD_WEAPONS] : NULL );
 	}
+	if( frame_ok && eyes_ok && GL_OpenXRBuildScopeLayer( &scope ))
+		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&scope;
 	if( frame_ok && layer_count > 0 && GL_OpenXRBuildBeamLayer( &beam ))
 		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&beam;
 	submit = layer_count > 0;

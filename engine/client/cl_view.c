@@ -22,6 +22,7 @@ GNU General Public License for more details.
 #include "input.h" // touch
 #include "platform/platform.h" // GL_UpdateSwapInterval
 #include "vr/vr_client.h"
+#include "vr/vr_cs.h"
 
 /*
 ===============
@@ -394,7 +395,7 @@ void V_RenderView( void )
 	// not really critical but allows client.dll to take address of refdef and don't trigger ASan
 	static ref_params_t	rp;
 	ref_viewpass_t	rvp;
-	ref_viewpass_t	base_rvp;
+	ref_viewpass_t	base_rvp, scope_rvp;
 	int		viewnum = 0;
 	qboolean	cinema;
 
@@ -423,6 +424,7 @@ void V_RenderView( void )
 		V_GetRefParams( &rp, &rvp );
 		V_RefApplyOverview( &rvp );
 		V_ApplyRefUnderwater( &rvp );
+		scope_rvp = rvp; /* the client's view: from the eye along the weapon (Counter-Strike) */
 		if( !cinema )
 			CL_VRApplyHeadPose( &rvp ); /* the camera keeps its own angles (VR drops the body pitch) */
 		base_rvp = rvp;
@@ -463,6 +465,18 @@ void V_RenderView( void )
 				CL_VRDrawEyeScreenFade();
 				CL_VRDrawCinemaWorldFade();
 				CL_VREndEye( eye );
+			}
+			if( CL_VRCSScopeActive( ))
+			{
+				int width, height;
+				if( CL_VRBeginScope( &width, &height ))
+				{
+					rvp = scope_rvp;
+					rvp.fov_x = bound( 1.0f, cl.local.scr_fov, 150.0f );
+					rvp.fov_y = V_CalcFov( &rvp.fov_x, width, height );
+					GL_RenderFrame( &rvp );
+					CL_VREndScope();
+				}
 			}
 		}
 		else GL_RenderFrame( &rvp );

@@ -29,7 +29,7 @@ Scenario directives, one per line:
 | `xr <command>` | runtime control command (below) |
 | `con <command>` | engine console command |
 | `sleep <s>` | wait |
-| `shot <name> [both\|left\|right]` | composited view of the next frame → `<name>.png` |
+| `shot <name> [both\|left\|right] [layers]` | composited view of the next frame → `<name>.png`; `layers` also writes each overlay layer to `<name>.layerN.png` |
 | `wait-log "<regex>" [s]` | wait until the game log matches (default 60 s) |
 
 Runtime control commands (LOCAL space, metres and degrees; +X right, +Y up, -Z forward; pitch + = up,
