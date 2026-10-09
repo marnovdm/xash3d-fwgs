@@ -21,6 +21,7 @@ GNU General Public License for more details.
 #include "shake.h"
 #include "input.h"
 #include "eiface.h"
+#include "vr/vr_cs.h"
 
 #if XASH_LOW_MEMORY != 2
 int CL_UPDATE_BACKUP = SINGLEPLAYER_BACKUP;
@@ -1237,6 +1238,7 @@ set the view angle to this absolute value
 static void CL_ParseSetAngle( sizebuf_t *msg )
 {
 	MSG_ReadVec3Angles( msg, cl.viewangles );
+	CL_VRCSSetAngle( cl.viewangles[YAW] );
 }
 
 /*

@@ -14,6 +14,7 @@ the Free Software Foundation, either version 3 of the License, or
 #include "keydefs.h"
 #include "vr_client.h"
 #include "vr_game.h"
+#include "vr_cs.h"
 
 static CVAR_DEFINE_AUTO( vr_enable, "0", FCVAR_ARCHIVE, "enable desktop OpenXR rendering" );
 static CVAR_DEFINE_AUTO( vr_worldscale, "40", FCVAR_ARCHIVE, "game units per physical metre" );
@@ -213,6 +214,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_reversetorch );
 	Cvar_RegisterVariable( &vr_cinema );
 	Cvar_RegisterVariable( &vr_cinema_fade );
+	CL_VRCSRegisterCvars();
 	Cmd_AddCommand( "vr_poseinfo", CL_VRPoseInfo_f, "print VR head/centre/body angles (tilt debugging)" );
 	Cmd_AddCommand( "vr_testhaptic", CL_VRTestHaptic_f, "pulse both controllers for 0.5 s: vr_testhaptic [amplitude 0-1] [frequency Hz]" );
 	Cmd_AddCommand( "vr_recenter", CL_VRRecenter_f, "make the current head position and heading the VR reference" );
@@ -334,6 +336,7 @@ static void CL_VRCancelWeaponPointer( void )
 static void CL_VRResetInputState( qboolean release_menu )
 {
 	CL_VRResetUIPointer();
+	CL_VRCSReleaseInput();
 	Cvar_SetValue( vr_comfort_moving.name, 0.0f );
 	if( release_menu )
 	{
@@ -653,7 +656,8 @@ void CL_VRFrameBegin( void )
 	offhand = dominant == REF_VR_HAND_LEFT ? REF_VR_HAND_RIGHT : REF_VR_HAND_LEFT;
 	/* Lambda1VR keeps the legacy viewmodel/game-DLL handedness cvar in lockstep
 	 * with its control scheme. Preserve that contract for aware clients. */
-	Cvar_SetValue( "hand", dominant == REF_VR_HAND_LEFT ? 1.0f : 0.0f );
+	if( Cvar_FindVar( "hand" )) /* not every game has it (Counter-Strike) */
+		Cvar_SetValue( "hand", dominant == REF_VR_HAND_LEFT ? 1.0f : 0.0f );
 	if( !FBitSet( vr_frame.flags, REF_VR_FRAME_FOCUSED ) ||
 		!FBitSet( vr_frame.flags, REF_VR_FRAME_ACTIONS_VALID ))
 	{
@@ -696,6 +700,14 @@ void CL_VRFrameBegin( void )
 		vr_offhand_stick_chord = true;
 	if( menu != old_menu ) Key_Event( K_ESCAPE, menu );
 	vr_menu_active = menu;
+	if( CL_VRCSMode( ))
+	{
+		/* Counter-Strike (CSVR client): buttons, aim and hands are handled in vr_cs.c */
+		CL_VRCSFrame( CL_VRUIActive( ));
+		for( int i = 0; i < REF_VR_MAX_HANDS; ++i )
+			vr_previous_buttons[i] = vr_frame.hands[i].buttons;
+		return;
+	}
 	if( CL_VRUIActive() )
 	{
 		CL_VRCancelWeaponPointer();
@@ -1076,12 +1088,13 @@ void CL_VRApplyHeadPose( ref_viewpass_t *rvp )
 
 	CL_VRRelativePose( &vr_frame.head, &vr_center, &relative );
 	VectorCopy( rvp->vieworigin, vr_body_view_origin );
-	vr_body_view_yaw = rvp->viewangles[YAW];
+	/* Counter-Strike: the view angles are the weapon hand's, the body is under them */
+	vr_body_view_yaw = CL_VRCSMode() ? CL_VRCSBodyYaw() : rvp->viewangles[YAW];
 	vr_body_view_valid = true;
 	{
 		/* the body carries the head pitch for gameplay (swimming, ladders); the view gets
 		 * pitch/roll from the head pose below, so compose with the body yaw only */
-		vec3_t body_angles = { 0.0f, rvp->viewangles[YAW], 0.0f };
+		vec3_t body_angles = { 0.0f, vr_body_view_yaw, 0.0f };
 		AngleVectors( body_angles, body_forward, body_right, body_up );
 	}
 	VectorMA( rvp->vieworigin, vr_height_adjust.value * vr_worldscale.value, body_up, rvp->vieworigin );
@@ -1181,6 +1194,13 @@ void CL_VRAppendMove( float frametime, usercmd_t *cmd, qboolean active )
 		!FBitSet( vr_frame.flags, REF_VR_FRAME_ACTIONS_VALID ))
 	{
 		Cvar_SetValue( vr_comfort_moving.name, 0.0f );
+		return;
+	}
+
+	if( CL_VRCSMode( ))
+	{
+		CL_VRTransformVector( vr_head_delta, &vr_center, head_delta );
+		CL_VRCSAppendMove( frametime, cmd, head_delta );
 		return;
 	}
 
