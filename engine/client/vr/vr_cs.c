@@ -96,6 +96,7 @@ static CVAR_DEFINE_AUTO( vr_weapon_origin_z, "0", 0, "CS VR: drawn weapon's orig
 static CVAR_DEFINE_AUTO( vr_cs_converge, "1", FCVAR_ARCHIVE, "CS VR: aim the shot at what the barrel points at (the server fires from the eye; 0 = parallel to the barrel)" );
 static CVAR_DEFINE_AUTO( vr_aimdot_scale, "0.1", FCVAR_ARCHIVE, "CS VR: aim dot size (sprite scale per 100 units of distance)" );
 static CVAR_DEFINE_AUTO( vr_throw_scale, "3.75", FCVAR_ARCHIVE, "CS VR: grenade throw strength, multiplies the hand's speed at the release (as in Half-Life VR; read by the game server)" );
+static CVAR_DEFINE_AUTO( vr_throw_window, "0.1", FCVAR_ARCHIVE, "CS VR: the throw takes the hand's fastest moment in this many seconds up to the release (0 = the release frame only, as in Half-Life VR)" );
 static CVAR_DEFINE_AUTO( vr_cs_bots, "1", FCVAR_ARCHIVE, "CS: offline games fill both teams with bots (applied by the engine at every map start of your own server; 0 = no bots)" );
 static CVAR_DEFINE_AUTO( vr_cs_bot_count, "15", FCVAR_ARCHIVE, "CS: number of bots with vr_cs_bots 1 (more than the free slots need a larger Max players in New Game)" );
 static CVAR_DEFINE_AUTO( vr_cs_bot_difficulty, "1", FCVAR_ARCHIVE, "CS: bot difficulty 0 easy, 1 normal, 2 hard, 3 expert (bots added from now on)" );
@@ -141,7 +142,7 @@ static convar_t *const vr_cs_cvars[] = {
 	&vr_hand_swap, &vr_haptics_weapon, &vr_haptics_yaw, &vr_ladder, &vr_shielded, &vr_spectator,
 	&vr_weapon_calibration_update, &vr_weapon_pivot_name, &vr_weapon_pivot_x, &vr_weapon_pivot_y,
 	&vr_weapon_pivot_z, &vr_weapon_pivot_pitch, &vr_weapon_pivot_yaw, &vr_weapon_pivot_scale,
-	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_cs_skip_dead_round, &vr_aimdot, &vr_cs_converge, &vr_weapon_origin_x, &vr_weapon_origin_y, &vr_weapon_origin_z, &vr_aimdot_scale, &vr_throw_scale, &vr_cs_bots, &vr_cs_bot_count, &vr_cs_bot_difficulty, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
+	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_cs_skip_dead_round, &vr_aimdot, &vr_cs_converge, &vr_weapon_origin_x, &vr_weapon_origin_y, &vr_weapon_origin_z, &vr_aimdot_scale, &vr_throw_scale, &vr_throw_window, &vr_cs_bots, &vr_cs_bot_count, &vr_cs_bot_difficulty, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
 	&vr_button_alt, &vr_button_a, &vr_button_b, &vr_button_x, &vr_button_y, &vr_button_grip_left,
 	&vr_button_thumbstick_press_left, &vr_button_trigger_left, &vr_button_grip_right,
 	&vr_button_thumbstick_dup_right, &vr_button_thumbstick_ddown_right, &vr_button_thumbstick_dleft_right,
@@ -187,6 +188,11 @@ static int vr_cs_last_health;
 /* grenade throw: the trigger release is held back one frame so "vr_throw" reaches the server first; the
  * usercmd carries the throw direction for a while (stock servers throw along the view angles) */
 static vec3_t vr_cs_throw_angles;
+/* the weapon hand's recent velocities (tracking space): the hand is often already slowing down in the frame the
+ * finger lets go, so the throw takes the fastest of the last vr_throw_window seconds */
+#define VR_CS_THROW_SAMPLES 64
+static struct { double time; vec3_t velocity; } vr_cs_throw_samples[VR_CS_THROW_SAMPLES];
+static int vr_cs_throw_sample_next;
 static double vr_cs_throw_until;
 static qboolean vr_cs_releasing; /* CL_VRCSReleaseInput: a held grenade is not thrown when the menu opens */
 
@@ -459,15 +465,44 @@ static qboolean CL_VRCSGrenadeWeapon( void )
 
 /* Grenade released: tell the server the weapon hand's velocity and position (game units, world frame) so it
  * throws like Half-Life VR does (hand speed x 2/3 x vr_throw_scale, from the hand; ReGameDLL patch). The
- * velocity is the controller's own at this frame, unsmoothed. The usercmd also points the view along the
+ * velocity is the controller's own, unsmoothed, from the fastest frame of the last vr_throw_window seconds. The usercmd also points the view along the
  * swing for a moment, so a stock server throws the grenade the way the arm moved. */
+static void CL_VRCSSampleThrow( const ref_vr_hand_t *hand )
+{
+	if( !FBitSet( hand->flags, REF_VR_HAND_GRIP_VALID ))
+		return;
+	vr_cs_throw_samples[vr_cs_throw_sample_next].time = host.realtime;
+	VectorCopy( hand->linear_velocity, vr_cs_throw_samples[vr_cs_throw_sample_next].velocity );
+	vr_cs_throw_sample_next = ( vr_cs_throw_sample_next + 1 ) % VR_CS_THROW_SAMPLES;
+}
+
+/* the fastest hand velocity of the last vr_throw_window seconds, the release frame's included */
+static void CL_VRCSThrowVelocity( const ref_vr_hand_t *hand, vec3_t out )
+{
+	float best = VectorLength( hand->linear_velocity );
+	double since = host.realtime - bound( 0.0f, vr_throw_window.value, 0.5f );
+
+	VectorCopy( hand->linear_velocity, out );
+	if( vr_throw_window.value <= 0.0f )
+		return;
+	for( int i = 0; i < VR_CS_THROW_SAMPLES; i++ )
+	{
+		float speed = VectorLength( vr_cs_throw_samples[i].velocity );
+		if( vr_cs_throw_samples[i].time >= since && speed > best )
+		{
+			best = speed;
+			VectorCopy( vr_cs_throw_samples[i].velocity, out );
+		}
+	}
+}
+
 static void CL_VRCSThrow( int weapon_hand )
 {
 	const ref_vr_frame_t *frame = CL_VRGetFrame();
 	const ref_vr_hand_t *hand = &frame->hands[weapon_hand];
 	ref_vr_pose_t center;
 	vec3_t local, velocity, position, rel_pos, rel_ang, eye, forward, right, up;
-	vec3_t body_angles;
+	vec3_t body_angles, hand_velocity;
 	float scale = CL_VRGetWorldScale();
 	float pitch;
 
@@ -478,10 +513,12 @@ static void CL_VRCSThrow( int weapon_hand )
 	VectorSet( body_angles, 0.0f, CL_VRCSBodyYaw(), 0.0f );
 	AngleVectors( body_angles, forward, right, up );
 
+	CL_VRCSThrowVelocity( hand, hand_velocity );
+
 	/* recentre frame (forward, left, up) -> world */
-	local[0] = DotProduct( hand->linear_velocity, center.forward );
-	local[1] = -DotProduct( hand->linear_velocity, center.right );
-	local[2] = DotProduct( hand->linear_velocity, center.up );
+	local[0] = DotProduct( hand_velocity, center.forward );
+	local[1] = -DotProduct( hand_velocity, center.right );
+	local[2] = DotProduct( hand_velocity, center.up );
 	VectorScale( forward, local[0] * scale, velocity );
 	VectorMA( velocity, -local[1] * scale, right, velocity );
 	VectorMA( velocity, local[2] * scale, up, velocity );
@@ -495,7 +532,8 @@ static void CL_VRCSThrow( int weapon_hand )
 
 	CL_ServerCommand( true, "vr_throw %.1f %.1f %.1f %.1f %.1f %.1f", velocity[0], velocity[1], velocity[2],
 		position[0], position[1], position[2] );
-	Con_Reportf( "CS VR: grenade released, hand %.0f units/s\n", VectorLength( velocity ));
+	Con_Printf( "CS VR: grenade released, hand %.0f units/s (release frame %.0f)\n", VectorLength( velocity ),
+		VectorLength( hand->linear_velocity ) * scale );
 
 	/* stock throw: pitch p is thrown at -10 + p * 80/90 (up) or * 100/90 (down); invert that so the
 	 * grenade leaves along the swing */
@@ -833,6 +871,7 @@ void CL_VRCSFrame( qboolean ui_active )
 		return;
 	}
 	Cvar_DirectSet( &vr_gamemode, "1" );
+	CL_VRCSSampleThrow( &frame->hands[weapon_hand] );
 	{
 		/* the classic crosshair ignores vr_xhair; CSVR's engine forces the client's own one too */
 		convar_t *xhair = Cvar_FindVar( "xhair_enable" );
