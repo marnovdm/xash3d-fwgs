@@ -280,6 +280,7 @@ static cvar_t *vr_weapon_pointer_yaw;
 static cvar_t *vr_hud_radar_scale;
 static cvar_t *vr_hud_radar_tilt;
 static cvar_t *vr_hud_radar_yaw;
+static cvar_t *vr_hud_radar_spin;
 static cvar_t *vr_hud_strip_scale;
 
 void GL_OpenXRInit( void )
@@ -353,6 +354,8 @@ void GL_OpenXRInit( void )
 		"Counter-Strike: radar and number strip tilt in degrees about the controller's sideways axis (-90 = facing straight up off the back of the hand)" );
 	vr_hud_radar_yaw = gEngfuncs.Cvar_Get( "vr_hud_radar_yaw", "0", FCVAR_ARCHIVE,
 		"Counter-Strike: radar and number strip turned inwards in degrees, mirrored per hand" );
+	vr_hud_radar_spin = gEngfuncs.Cvar_Get( "vr_hud_radar_spin", "90", FCVAR_ARCHIVE,
+		"Counter-Strike: radar and number strip turned in their own plane, degrees, mirrored per hand (90 = text along the forearm, read towards the fingers, like the Half-Life hand panels; 0 = top towards the knuckles)" );
 	vr_hud_strip_scale = gEngfuncs.Cvar_Get( "vr_hud_strip_scale", "0.0004", FCVAR_ARCHIVE,
 		"Counter-Strike: number strip (health, armour, money, round timer) size, metres per HUD pixel; it sits next to the radar towards the knuckles" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_WEAPONS] = gEngfuncs.Cvar_Get( "vr_weapon_pointer_offset", "0 0.035 -0.35", FCVAR_ARCHIVE,
@@ -2361,7 +2364,11 @@ static qboolean GL_OpenXRBuildWatchLayer( int index, XrCompositionLayerQuad *qua
 	const float tilt = DEG2RAD( bound( -90.0f, vr_hud_radar_tilt->value, 90.0f ));
 	/* inwards = towards +X (right) on the left hand, -X on the right hand */
 	const float yaw = DEG2RAD( bound( -180.0f, vr_hud_radar_yaw->value, 180.0f )) * ( hand == REF_VR_HAND_LEFT ? 1.0f : -1.0f );
+	/* the text's right turned towards the fingers: +spin on the left hand, mirrored on the right */
+	const float spin = DEG2RAD( bound( -360.0f, vr_hud_radar_spin->value, 360.0f )) * ( hand == REF_VR_HAND_LEFT ? 1.0f : -1.0f );
 	XrQuaternionf turn = { 0.0f, 0.0f, 0.0f, 1.0f }, lean = { 0.0f, 0.0f, 0.0f, 1.0f };
+	const XrQuaternionf roll = { 0.0f, 0.0f, sinf( spin * 0.5f ), cosf( spin * 0.5f ) };
+	XrQuaternionf plane;
 	float offset[3] = { 0.0f, 0.0f, 0.0f };
 	XrVector3f along;
 
@@ -2384,7 +2391,9 @@ static qboolean GL_OpenXRBuildWatchLayer( int index, XrCompositionLayerQuad *qua
 	lean.w = cosf( tilt * 0.5f );
 	turn.y = sinf( yaw * 0.5f );
 	turn.w = cosf( yaw * 0.5f );
-	quad->pose.orientation = GL_OpenXRQuatMultiply( xr.hand_pose[hand].aim.orientation, GL_OpenXRQuatMultiply( turn, lean ));
+	/* the plane on the wrist; its +Y points towards the knuckles. The panel is then turned in that plane. */
+	plane = GL_OpenXRQuatMultiply( xr.hand_pose[hand].aim.orientation, GL_OpenXRQuatMultiply( turn, lean ));
+	quad->pose.orientation = GL_OpenXRQuatMultiply( plane, roll );
 	along.x = bound( -0.5f, offset[0], 0.5f );
 	along.y = bound( -0.5f, offset[1], 0.5f );
 	along.z = bound( -0.5f, offset[2], 0.5f );
@@ -2394,11 +2403,15 @@ static qboolean GL_OpenXRBuildWatchLayer( int index, XrCompositionLayerQuad *qua
 	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
 	if( index != radar )
 	{
-		/* next to the watch face towards the knuckles (the panel's up), in its plane, with a small gap */
+		/* next to the watch face towards the knuckles (the plane's up), in its plane, with a small gap; each
+		 * panel's extent along that direction depends on how far it is turned */
 		const XrVector3f up = { 0.0f, 1.0f, 0.0f };
-		const XrVector3f axis = GL_OpenXRRotateVector( quad->pose.orientation, up );
-		const float face = xr.hand_hud[radar].valid ? radar_metres * xr.hand_hud[radar].hud_height : 0.0f;
-		const float shift = 0.5f * ( face + quad->size.height ) + ( face > 0.0f ? 0.005f : 0.0f );
+		const XrVector3f axis = GL_OpenXRRotateVector( plane, up );
+		const float c = fabsf( cosf( spin )), sn = fabsf( sinf( spin ));
+		const float face = xr.hand_hud[radar].valid ?
+			radar_metres * ( c * xr.hand_hud[radar].hud_height + sn * xr.hand_hud[radar].hud_width ) : 0.0f;
+		const float self = c * quad->size.height + sn * quad->size.width;
+		const float shift = 0.5f * ( face + self ) + ( face > 0.0f ? 0.005f : 0.0f );
 		quad->pose.position.x += axis.x * shift;
 		quad->pose.position.y += axis.y * shift;
 		quad->pose.position.z += axis.z * shift;
