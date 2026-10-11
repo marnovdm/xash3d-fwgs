@@ -241,6 +241,7 @@ typedef struct
 typedef struct
 {
 	XrPosef aim, grip;
+	XrVector3f velocity; /* linear, LOCAL space, m/s (set with "vel") */
 	int grip_override;
 	int tracked;
 } hand_t;
@@ -426,6 +427,13 @@ static void ControlCommand( char *line )
 			rt.hands[hand].grip_override = 1;
 		}
 		UpdateGrip( hand );
+	}
+	else if( !strcmp( word, "vel" ) && sscanf( line, "%*s %15s %f %f %f", side, &v[0], &v[1], &v[2] ) == 4 &&
+		( hand = ParseHand( side )) >= 0 )
+	{
+		rt.hands[hand].velocity.x = v[0];
+		rt.hands[hand].velocity.y = v[1];
+		rt.hands[hand].velocity.z = v[2];
 	}
 	else if( !strcmp( word, "track" ) && sscanf( line, "%*s %15s %f", side, &v[0] ) == 2 && ( hand = ParseHand( side )) >= 0 )
 		rt.hands[hand].tracked = v[0] != 0.0f;
@@ -1314,7 +1322,15 @@ static XrResult XRAPI_CALL LocateSpace( XrSpace space, XrSpace base, XrTime time
 	location->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
 		XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
 	if( velocity )
+	{
+		const space_t *located = FROM_HANDLE( space_t, space );
+		int hand = located->kind == SPACE_ACTION ? HandFromPath( located->subaction ) : -1;
+
 		velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+		/* the base spaces the engine uses (LOCAL/STAGE) are not rotated against LOCAL here */
+		if( hand >= 0 )
+			velocity->linearVelocity = rt.hands[hand].velocity;
+	}
 	return XR_SUCCESS;
 }
 

@@ -41,6 +41,7 @@ yaw + = left, roll + = tilt left; the head starts at the origin):
 | `aim left\|right x y z pitch yaw roll` | controller aim pose; the grip pose follows (`FAKEXR_GRIP_PITCH`) |
 | `grip left\|right x y z pitch yaw roll` | set the grip pose explicitly |
 | `track left\|right 0\|1` | controller tracked |
+| `vel left\|right vx vy vz` | controller linear velocity (m/s, LOCAL space; kept until set again) |
 | `input left\|right <component> <v> [<y>]` | input under `/user/hand/<hand>/input/`, e.g. `trigger/value 1`, `thumbstick 0 1`, `a/click 1`, `y/click 1` |
 | `shot <file.png> [both\|left\|right]` | as above (the runner adds the path) |
 | `exit` | ask the application to end the session |
