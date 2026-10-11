@@ -594,6 +594,7 @@ void CL_VRFrameBegin( void )
 	vr_frame.version = REF_VR_FRAME_VERSION;
 	vr_frame.struct_size = sizeof( vr_frame );
 	vr_frame_begun = false;
+	CL_VRCSBots();
 
 	if( !ref.initialized || !ref.dllFuncs.R_VRFrameBegin )
 	{

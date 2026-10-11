@@ -96,6 +96,9 @@ static CVAR_DEFINE_AUTO( vr_weapon_origin_z, "0", 0, "CS VR: drawn weapon's orig
 static CVAR_DEFINE_AUTO( vr_cs_converge, "1", FCVAR_ARCHIVE, "CS VR: aim the shot at what the barrel points at (the server fires from the eye; 0 = parallel to the barrel)" );
 static CVAR_DEFINE_AUTO( vr_aimdot_scale, "0.1", FCVAR_ARCHIVE, "CS VR: aim dot size (sprite scale per 100 units of distance)" );
 static CVAR_DEFINE_AUTO( vr_throw_scale, "3.75", FCVAR_ARCHIVE, "CS VR: grenade throw strength, multiplies the hand's speed at the release (as in Half-Life VR; read by the game server)" );
+static CVAR_DEFINE_AUTO( vr_cs_bots, "1", FCVAR_ARCHIVE, "CS: offline games fill both teams with bots (applied by the engine at every map start of your own server; 0 = no bots)" );
+static CVAR_DEFINE_AUTO( vr_cs_bot_count, "15", FCVAR_ARCHIVE, "CS: number of bots with vr_cs_bots 1 (more than the free slots need a larger Max players in New Game)" );
+static CVAR_DEFINE_AUTO( vr_cs_bot_difficulty, "1", FCVAR_ARCHIVE, "CS: bot difficulty 0 easy, 1 normal, 2 hard, 3 expert (bots added from now on)" );
 static CVAR_DEFINE_AUTO( vr_weapon_calibration_on, "0", FCVAR_ARCHIVE, "CS VR: right stick adjusts the weapon grip (x/y/z/pitch/yaw/scale)" );
 static CVAR_DEFINE_AUTO( vr_thumbstick_deadzone_right, "0.8", FCVAR_ARCHIVE, "CS VR: right stick deflection for turning and weapon changes" );
 static CVAR_DEFINE_AUTO( vr_button_alt, "vr_button_x", FCVAR_ARCHIVE, "CS VR: button that switches the other buttons to their _alt commands while held" );
@@ -138,7 +141,7 @@ static convar_t *const vr_cs_cvars[] = {
 	&vr_hand_swap, &vr_haptics_weapon, &vr_haptics_yaw, &vr_ladder, &vr_shielded, &vr_spectator,
 	&vr_weapon_calibration_update, &vr_weapon_pivot_name, &vr_weapon_pivot_x, &vr_weapon_pivot_y,
 	&vr_weapon_pivot_z, &vr_weapon_pivot_pitch, &vr_weapon_pivot_yaw, &vr_weapon_pivot_scale,
-	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_cs_skip_dead_round, &vr_aimdot, &vr_cs_converge, &vr_weapon_origin_x, &vr_weapon_origin_y, &vr_weapon_origin_z, &vr_aimdot_scale, &vr_throw_scale, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
+	&vr_6dof, &vr_xhair, &vr_haptics_enable, &vr_cs_grip_origin, &vr_cs_skip_dead_round, &vr_aimdot, &vr_cs_converge, &vr_weapon_origin_x, &vr_weapon_origin_y, &vr_weapon_origin_z, &vr_aimdot_scale, &vr_throw_scale, &vr_cs_bots, &vr_cs_bot_count, &vr_cs_bot_difficulty, &vr_weapon_calibration_on, &vr_thumbstick_deadzone_right,
 	&vr_button_alt, &vr_button_a, &vr_button_b, &vr_button_x, &vr_button_y, &vr_button_grip_left,
 	&vr_button_thumbstick_press_left, &vr_button_trigger_left, &vr_button_grip_right,
 	&vr_button_thumbstick_dup_right, &vr_button_thumbstick_ddown_right, &vr_button_thumbstick_dleft_right,
@@ -775,6 +778,35 @@ static void CL_VRCSSkipDeadRound( void )
 		return;
 	Con_Printf( "CS VR: you are dead, killing the bots to end the round (vr_cs_skip_dead_round)\n" );
 	Cbuf_AddText( "bot_kill\n" );
+}
+
+/* Bots for offline games, from the menu's Bots page. ReGameDLL runs cstrike/game.cfg at every map start, which
+ * would overwrite menu changes, so the settings are engine cvars applied here instead: at each map start of our
+ * own server (after game.cfg, once we are in the game) and whenever they change. Fill mode counts humans in the
+ * quota, so it is the bot count plus the human players. Runs in VR and flat. */
+void CL_VRCSBots( void )
+{
+	static int applied_servercount = -1;
+	static int applied_quota = -1, applied_difficulty = -1;
+	int quota, difficulty;
+
+	if( !vr_cs_mode || !SV_Active() || cls.state != ca_active )
+	{
+		if( cls.state != ca_active )
+			applied_servercount = -1;
+		return;
+	}
+	quota = vr_cs_bots.value != 0.0f ? bound( 0, (int)vr_cs_bot_count.value, 31 ) + SV_HumanClients() : 0;
+	difficulty = bound( 0, (int)vr_cs_bot_difficulty.value, 3 );
+	if( applied_servercount == cl.servercount && quota == applied_quota && difficulty == applied_difficulty )
+		return;
+	if( applied_servercount != cl.servercount )
+		Con_Printf( "CS: bots %s (vr_cs_bots %d, vr_cs_bot_count %d, vr_cs_bot_difficulty %d)\n",
+			quota ? "fill both teams" : "off", (int)vr_cs_bots.value, (int)vr_cs_bot_count.value, difficulty );
+	Cbuf_AddText( va( "bot_quota_mode fill\nbot_difficulty %d\nbot_quota %d\n", difficulty, quota ));
+	applied_servercount = cl.servercount;
+	applied_quota = quota;
+	applied_difficulty = difficulty;
 }
 
 void CL_VRCSFrame( qboolean ui_active )

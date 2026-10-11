@@ -22,6 +22,8 @@ float CL_VRCSBodyYaw( void );
 qboolean CL_VRCSFreeView( void );
 /* zoomed with a scoped weapon: the engine renders the scope lens */
 qboolean CL_VRCSScopeActive( void );
+/* every frame, VR or not: bot settings for offline games (vr_cs_bots*) */
+void CL_VRCSBots( void );
 /* the server set the view angles (spawn, teleport): turn the body so the gun points that way */
 void CL_VRCSSetAngle( float view_yaw );
 
