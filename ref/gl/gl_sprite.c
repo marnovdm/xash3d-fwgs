@@ -400,6 +400,8 @@ void R_DrawSpriteModel( cl_entity_t *e )
 	if( e->curstate.rendermode == kRenderGlow || e->curstate.rendermode == kRenderTransAdd )
 		R_AllowFog( false );
 
+	const qboolean additive_normal = e->curstate.rendermode == kRenderNormal && psprite->texFormat == SPR_ADDITIVE;
+
 	// select properly rendermode
 	switch( e->curstate.rendermode )
 	{
@@ -421,7 +423,15 @@ void R_DrawSpriteModel( cl_entity_t *e )
 		break;
 	case kRenderNormal:
 	default:
-		pglDisable( GL_BLEND );
+		// An additive-format sprite drawn in normal mode showed its black background as an opaque square
+		// (c4a3's end_xbeam_exp flares on the walls when the Nihilanth dies). Its art is made to be added.
+		if( additive_normal )
+		{
+			pglEnable( GL_BLEND );
+			pglBlendFunc( GL_SRC_ALPHA, GL_ONE );
+			pglDepthMask( GL_FALSE );
+		}
+		else pglDisable( GL_BLEND );
 		break;
 	}
 
@@ -570,7 +580,7 @@ void R_DrawSpriteModel( cl_entity_t *e )
 	if( e->curstate.rendermode == kRenderGlow || e->curstate.rendermode == kRenderTransAdd )
 		R_AllowFog( true );
 
-	if( e->curstate.rendermode != kRenderNormal )
+	if( e->curstate.rendermode != kRenderNormal || additive_normal )
 	{
 		pglDisable( GL_BLEND );
 		pglTexEnvi( GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE );
