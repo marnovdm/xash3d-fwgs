@@ -102,13 +102,13 @@ static CVAR_DEFINE_AUTO( vr_button_alt, "vr_button_x", FCVAR_ARCHIVE, "CS VR: bu
 static CVAR_DEFINE_AUTO( vr_button_a, "+jump", FCVAR_ARCHIVE, "CS VR: right Cross/A" );
 static CVAR_DEFINE_AUTO( vr_button_b, "+duck", FCVAR_ARCHIVE, "CS VR: right Circle/B" );
 static CVAR_DEFINE_AUTO( vr_button_x, "drop", FCVAR_ARCHIVE, "CS VR: left Square/X" );
-static CVAR_DEFINE_AUTO( vr_button_y, "+vr_scoreboard", FCVAR_ARCHIVE, "CS VR: left Triangle/Y" );
+static CVAR_DEFINE_AUTO( vr_button_y, "+vr_weaponpointer", FCVAR_ARCHIVE, "CS VR: left Triangle/Y (hold: weapon grid on the off hand, point with the gun, release to switch)" );
 static CVAR_DEFINE_AUTO( vr_button_grip_left, "buy", FCVAR_ARCHIVE, "CS VR: left grip" );
-static CVAR_DEFINE_AUTO( vr_button_thumbstick_press_left, "", FCVAR_ARCHIVE, "CS VR: left stick click" );
+static CVAR_DEFINE_AUTO( vr_button_thumbstick_press_left, "+vr_scoreboard", FCVAR_ARCHIVE, "CS VR: left stick click" );
 static CVAR_DEFINE_AUTO( vr_button_trigger_left, "+use", FCVAR_ARCHIVE, "CS VR: left trigger" );
 static CVAR_DEFINE_AUTO( vr_button_grip_right, "+reload", FCVAR_ARCHIVE, "CS VR: right grip" );
-static CVAR_DEFINE_AUTO( vr_button_thumbstick_dup_right, "+vr_weapon_prev", FCVAR_ARCHIVE, "CS VR: right stick up" );
-static CVAR_DEFINE_AUTO( vr_button_thumbstick_ddown_right, "+vr_weapon_next", FCVAR_ARCHIVE, "CS VR: right stick down" );
+static CVAR_DEFINE_AUTO( vr_button_thumbstick_dup_right, "", FCVAR_ARCHIVE, "CS VR: right stick up (+vr_weapon_prev = previous weapon)" );
+static CVAR_DEFINE_AUTO( vr_button_thumbstick_ddown_right, "", FCVAR_ARCHIVE, "CS VR: right stick down (+vr_weapon_next = next weapon)" );
 static CVAR_DEFINE_AUTO( vr_button_thumbstick_dleft_right, "+vr_left", FCVAR_ARCHIVE, "CS VR: right stick left" );
 static CVAR_DEFINE_AUTO( vr_button_thumbstick_dright_right, "+vr_right", FCVAR_ARCHIVE, "CS VR: right stick right" );
 static CVAR_DEFINE_AUTO( vr_button_thumbstick_press_right, "+attack2", FCVAR_ARCHIVE, "CS VR: right stick click" );
@@ -121,8 +121,8 @@ static CVAR_DEFINE_AUTO( vr_button_grip_left_alt, "", FCVAR_ARCHIVE, "CS VR: lef
 static CVAR_DEFINE_AUTO( vr_button_thumbstick_press_left_alt, "", FCVAR_ARCHIVE, "CS VR: left stick click with the alt button held" );
 static CVAR_DEFINE_AUTO( vr_button_trigger_left_alt, "impulse 201", FCVAR_ARCHIVE, "CS VR: left trigger with the alt button held (spray)" );
 static CVAR_DEFINE_AUTO( vr_button_grip_right_alt, "nightvision", FCVAR_ARCHIVE, "CS VR: right grip with the alt button held" );
-static CVAR_DEFINE_AUTO( vr_button_thumbstick_dup_right_alt, "+vr_weapon_prev", FCVAR_ARCHIVE, "CS VR: right stick up with the alt button held" );
-static CVAR_DEFINE_AUTO( vr_button_thumbstick_ddown_right_alt, "+vr_weapon_next", FCVAR_ARCHIVE, "CS VR: right stick down with the alt button held" );
+static CVAR_DEFINE_AUTO( vr_button_thumbstick_dup_right_alt, "", FCVAR_ARCHIVE, "CS VR: right stick up with the alt button held" );
+static CVAR_DEFINE_AUTO( vr_button_thumbstick_ddown_right_alt, "", FCVAR_ARCHIVE, "CS VR: right stick down with the alt button held" );
 static CVAR_DEFINE_AUTO( vr_button_thumbstick_dleft_right_alt, "+vr_left", FCVAR_ARCHIVE, "CS VR: right stick left with the alt button held" );
 static CVAR_DEFINE_AUTO( vr_button_thumbstick_dright_right_alt, "+vr_right", FCVAR_ARCHIVE, "CS VR: right stick right with the alt button held" );
 static CVAR_DEFINE_AUTO( vr_button_thumbstick_press_right_alt, "", FCVAR_ARCHIVE, "CS VR: right stick click with the alt button held" );
@@ -183,7 +183,6 @@ static qboolean vr_cs_attack_from_use;
 static int vr_cs_last_health;
 /* grenade throw: the trigger release is held back one frame so "vr_throw" reaches the server first; the
  * usercmd carries the throw direction for a while (stock servers throw along the view angles) */
-static int vr_cs_throw_hold;
 static vec3_t vr_cs_throw_angles;
 static double vr_cs_throw_until;
 static qboolean vr_cs_releasing; /* CL_VRCSReleaseInput: a held grenade is not thrown when the menu opens */
@@ -379,6 +378,8 @@ static void CL_VRCSCommand( const char *command, qboolean release )
 		Cvar_DirectSet( &vr_hand_click, "0" );
 		Cbuf_AddText( "-use\n" );
 	}
+	else if( !Q_strcmp( line, "-vr_weaponpointer" ) && vr_cs_releasing )
+		Cbuf_AddText( "-vr_weaponpointer cancel\n" ); /* menu opened / focus lost: close without switching */
 	else
 	{
 		if( !Q_strcmp( line, "+attack2" ))
