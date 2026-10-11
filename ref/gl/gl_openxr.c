@@ -2862,6 +2862,7 @@ void GL_OpenXRFrameEnd( void )
 	const qboolean frame_ok = xr.frame_begun && xr.frame_state.shouldRender && xr.views_valid;
 	qboolean eyes_ok = frame_ok;
 	qboolean submit;
+	qboolean on_cinema = false;
 	uint32_t layer_count = 0;
 
 	if( !xr.frame_begun )
@@ -2926,7 +2927,10 @@ void GL_OpenXRFrameEnd( void )
 	}
 	/* under the UI quad, so game text (chapter titles, game_text) stays readable over the camera view */
 	if( frame_ok && GL_OpenXRBuildCinemaLayer( &cinema ))
+	{
 		layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&cinema;
+		on_cinema = true;
+	}
 	if( !xr.frame_begun )
 		return; /* the repeat may have shut the session down */
 	if( frame_ok && xr.ui.ready )
@@ -2942,10 +2946,26 @@ void GL_OpenXRFrameEnd( void )
 			ui.subImage.imageRect.extent.height = xr.ui.height;
 			{
 				XrVector3f offset;
-				offset.x = xr.ui_world_active ? 0.0f : bound( -1.0f, vr_ui_offset_x->value, 1.0f );
-				offset.y = xr.ui_world_active ? 0.0f : bound( -1.0f, vr_ui_offset_y->value, 1.0f );
+				/* Game text during a camera scene (the c5a1 end credits, chapter titles) goes on the cinema
+				 * screen, where the desktop draws it over the picture, 1 cm in front of it; head-locked it
+				 * hung off to one side (vr_ui_offset_x/y) and slid across the room-fixed screen. Same size as
+				 * the screen: both images are 16:9. */
+				const qboolean ui_on_cinema = on_cinema && !xr.ui_world_active;
+				offset.x = xr.ui_world_active || ui_on_cinema ? 0.0f : bound( -1.0f, vr_ui_offset_x->value, 1.0f );
+				offset.y = xr.ui_world_active || ui_on_cinema ? 0.0f : bound( -1.0f, vr_ui_offset_y->value, 1.0f );
 				offset.z = -bound( 0.2f, vr_ui_distance->value, 10.0f );
-				if( xr.ui_world_active )
+				if( ui_on_cinema )
+				{
+					XrVector3f rotated;
+					offset.z += 0.01f;
+					rotated = GL_OpenXRRotateVector( xr.cinema.anchor.orientation, offset );
+					ui.space = xr.local_space;
+					ui.pose.orientation = xr.cinema.anchor.orientation;
+					ui.pose.position.x = xr.cinema.anchor.position.x + rotated.x;
+					ui.pose.position.y = xr.cinema.anchor.position.y + rotated.y;
+					ui.pose.position.z = xr.cinema.anchor.position.z + rotated.z;
+				}
+				else if( xr.ui_world_active )
 				{
 					/* menu/console: hangs in the room where it opened */
 					XrVector3f rotated = GL_OpenXRRotateVector( xr.ui_anchor.orientation, offset );
@@ -2963,7 +2983,9 @@ void GL_OpenXRFrameEnd( void )
 				}
 			}
 			ui.size.width = width;
-			ui.size.height = GL_OpenXRUIHeight( width );
+			/* on the cinema screen the text keeps the image's own aspect, like the screen (vr_ui_height is the HUD's) */
+			ui.size.height = on_cinema && !xr.ui_world_active ? width * (float)xr.ui.height / (float)xr.ui.width :
+				GL_OpenXRUIHeight( width );
 			layers[layer_count++] = (const XrCompositionLayerBaseHeader *)&ui;
 		}
 	}
