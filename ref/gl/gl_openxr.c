@@ -91,13 +91,17 @@ extern XVisualInfo *glXGetVisualFromFBConfig( Display *display, GLXFBConfig conf
  * shown while open, with a beam from the weapon hand; where the beam hits is sent back as vr_weapon_pointer_cursor. The
  * client draws the grid in up to three rows when it is wider than the HUD (vr_hud_weapons_rect, _weapons2_, _weapons3_);
  * here they are put side by side again, so the panel is always one row. */
-enum { GL_OPENXR_HAND_HUD_STATUS, GL_OPENXR_HAND_HUD_AMMO, GL_OPENXR_HAND_HUD_WEAPONS, GL_OPENXR_HAND_HUD_COUNT };
+/* Counter-Strike adds a watch layout on the off hand: the radar (vr_hud_radar_rect) as a watch face on the wrist and,
+ * towards the knuckles, the status panel as a two-row number strip (health + armour, money + round timer:
+ * vr_hud_money_rect, vr_hud_timer_rect). Only games that report those boxes get it; Half-Life never does. */
+enum { GL_OPENXR_HAND_HUD_STATUS, GL_OPENXR_HAND_HUD_AMMO, GL_OPENXR_HAND_HUD_WEAPONS, GL_OPENXR_HAND_HUD_RADAR, GL_OPENXR_HAND_HUD_COUNT };
 enum { GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_AMMO, GL_OPENXR_HUD_BOX_DAMAGE,
-	GL_OPENXR_HUD_BOX_FLASHLIGHT, GL_OPENXR_HUD_BOX_WEAPONS, GL_OPENXR_HUD_BOX_WEAPONS2, GL_OPENXR_HUD_BOX_WEAPONS3, GL_OPENXR_HUD_BOX_COUNT };
-#define GL_OPENXR_HAND_HUD_MAX_BOXES 4
+	GL_OPENXR_HUD_BOX_FLASHLIGHT, GL_OPENXR_HUD_BOX_WEAPONS, GL_OPENXR_HUD_BOX_WEAPONS2, GL_OPENXR_HUD_BOX_WEAPONS3,
+	GL_OPENXR_HUD_BOX_MONEY, GL_OPENXR_HUD_BOX_TIMER, GL_OPENXR_HUD_BOX_RADAR, GL_OPENXR_HUD_BOX_COUNT };
+#define GL_OPENXR_HAND_HUD_MAX_BOXES 6
 /* slots side by side in the hand HUD swapchain, in units of a GL_OPENXR_HAND_HUD_WIDTH-wide image */
-static const uint32_t gl_openxr_hand_hud_slot[GL_OPENXR_HAND_HUD_COUNT][2] = { { 0, 512 }, { 512, 512 }, { 1024, 1024 } };
-#define GL_OPENXR_HAND_HUD_WIDTH  2048
+static const uint32_t gl_openxr_hand_hud_slot[GL_OPENXR_HAND_HUD_COUNT][2] = { { 0, 512 }, { 512, 512 }, { 1024, 1024 }, { 2048, 512 } };
+#define GL_OPENXR_HAND_HUD_WIDTH  2560
 #define GL_OPENXR_HAND_HUD_HEIGHT 512
 
 /* Cinema screen for scripted cameras (trigger_camera): 16:9 like the menu panel. The engine computes the
@@ -212,6 +216,7 @@ typedef struct gl_openxr_state_s
 			int px, py, w, h;   /* where it sits in the panel, HUD pixels from the panel's top left */
 		} box[GL_OPENXR_HAND_HUD_MAX_BOXES];
 	} hand_hud[GL_OPENXR_HAND_HUD_COUNT];
+	qboolean hand_hud_strip; /* Counter-Strike watch layout: radar on the wrist, status panel = number strip */
 	struct
 	{
 		qboolean valid;       /* the weapon grid is up and the weapon hand is tracked: draw the beam */
@@ -272,6 +277,10 @@ static cvar_t *vr_weapon_pointer_scale;
 static cvar_t *vr_scope_size;
 static cvar_t *vr_scope_offset;
 static cvar_t *vr_weapon_pointer_yaw;
+static cvar_t *vr_hud_radar_scale;
+static cvar_t *vr_hud_radar_tilt;
+static cvar_t *vr_hud_radar_yaw;
+static cvar_t *vr_hud_strip_scale;
 
 void GL_OpenXRInit( void )
 {
@@ -330,6 +339,22 @@ void GL_OpenXRInit( void )
 		"set by the client: pointer weapon grid, second row (shown right of the first)" );
 	vr_hud_rect[GL_OPENXR_HUD_BOX_WEAPONS3] = gEngfuncs.Cvar_Get( "vr_hud_weapons3_rect", "", 0,
 		"set by the client: pointer weapon grid, third row (shown right of the second)" );
+	vr_hud_rect[GL_OPENXR_HUD_BOX_MONEY] = gEngfuncs.Cvar_Get( "vr_hud_money_rect", "", 0,
+		"set by the client (Counter-Strike): money \"x y w h screenwidth screenheight\"" );
+	vr_hud_rect[GL_OPENXR_HUD_BOX_TIMER] = gEngfuncs.Cvar_Get( "vr_hud_timer_rect", "", 0,
+		"set by the client (Counter-Strike): round timer \"x y w h screenwidth screenheight\"" );
+	vr_hud_rect[GL_OPENXR_HUD_BOX_RADAR] = gEngfuncs.Cvar_Get( "vr_hud_radar_rect", "", 0,
+		"set by the client (Counter-Strike): radar and location name \"x y w h screenwidth screenheight\"" );
+	vr_hud_offset[GL_OPENXR_HAND_HUD_RADAR] = gEngfuncs.Cvar_Get( "vr_hud_radar_offset", "0 0.02 0.08", FCVAR_ARCHIVE,
+		"Counter-Strike: radar (watch face) centre from the off-hand palm, metres along the aim axes: right up back (0.08 back = on the wrist)" );
+	vr_hud_radar_scale = gEngfuncs.Cvar_Get( "vr_hud_radar_scale", "0.0005", FCVAR_ARCHIVE,
+		"Counter-Strike: radar size, metres per HUD pixel" );
+	vr_hud_radar_tilt = gEngfuncs.Cvar_Get( "vr_hud_radar_tilt", "-75", FCVAR_ARCHIVE,
+		"Counter-Strike: radar and number strip tilt in degrees about the controller's sideways axis (-90 = facing straight up off the back of the hand)" );
+	vr_hud_radar_yaw = gEngfuncs.Cvar_Get( "vr_hud_radar_yaw", "0", FCVAR_ARCHIVE,
+		"Counter-Strike: radar and number strip turned inwards in degrees, mirrored per hand" );
+	vr_hud_strip_scale = gEngfuncs.Cvar_Get( "vr_hud_strip_scale", "0.0004", FCVAR_ARCHIVE,
+		"Counter-Strike: number strip (health, armour, money, round timer) size, metres per HUD pixel; it sits next to the radar towards the knuckles" );
 	vr_hud_offset[GL_OPENXR_HAND_HUD_WEAPONS] = gEngfuncs.Cvar_Get( "vr_weapon_pointer_offset", "0 0.035 -0.35", FCVAR_ARCHIVE,
 		"pointer weapon grid centre from the in-game off hand (flashlight), metres along the aim axes: right up back (-0.35 = out past the flashlight)" );
 	vr_weapon_pointer_scale = gEngfuncs.Cvar_Get( "vr_weapon_pointer_scale", "0.00065", FCVAR_ARCHIVE,
@@ -2098,6 +2123,59 @@ static void GL_OpenXRDrawWeaponPointerDot( void )
 	pglClearColor( 0.0f, 0.0f, 0.0f, 0.0f );
 }
 
+/* Counter-Strike number strip: health + armour in the first row, money + round timer in the second, each row's
+ * boxes side by side with a gap, rows left-aligned; stretched to fill the status slot like the other panels. */
+static void GL_OpenXRLayoutStrip( const qboolean box_valid[GL_OPENXR_HUD_BOX_COUNT], int origins[GL_OPENXR_HUD_BOX_COUNT][2],
+	int sizes[GL_OPENXR_HUD_BOX_COUNT][2], float *scale )
+{
+	static const int rows[2][2] = { { GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT },
+		{ GL_OPENXR_HUD_BOX_MONEY, GL_OPENXR_HUD_BOX_TIMER } };
+	const int p = GL_OPENXR_HAND_HUD_STATUS, gap = 12, row_gap = 6;
+	int width = 0, height = 0;
+
+	xr.hand_hud[p].box_count = 0;
+	for( int r = 0; r < 2; ++r )
+	{
+		int x = 0, row_height = 0, first = xr.hand_hud[p].box_count;
+		for( int j = 0; j < 2; ++j )
+		{
+			const int b = rows[r][j], n = xr.hand_hud[p].box_count;
+			if( !box_valid[b] )
+				continue;
+			if( x > 0 )
+				x += gap;
+			xr.hand_hud[p].box[n].index = b;
+			xr.hand_hud[p].box[n].hud_x = origins[b][0];
+			xr.hand_hud[p].box[n].hud_y = origins[b][1];
+			xr.hand_hud[p].box[n].w = sizes[b][0];
+			xr.hand_hud[p].box[n].h = sizes[b][1];
+			xr.hand_hud[p].box[n].px = x;
+			xr.hand_hud[p].box_count++;
+			x += sizes[b][0];
+			row_height = Q_max( row_height, sizes[b][1] );
+		}
+		if( xr.hand_hud[p].box_count == first )
+			continue;
+		if( height > 0 )
+			height += row_gap;
+		/* vertically centred in their row */
+		for( int j = first; j < xr.hand_hud[p].box_count; ++j )
+			xr.hand_hud[p].box[j].py = height + ( row_height - xr.hand_hud[p].box[j].h ) / 2;
+		height += row_height;
+		width = Q_max( width, x );
+	}
+	if( width <= 0 || height <= 0 )
+		return;
+	*scale = (float)xr.hud.height / height;
+	xr.hand_hud[p].valid = true;
+	xr.hand_hud[p].hud_width = width;
+	xr.hand_hud[p].hud_height = height;
+	xr.hand_hud[p].base_width = width;
+	xr.hand_hud[p].x = gl_openxr_hand_hud_slot[p][0] * xr.hud.width / GL_OPENXR_HAND_HUD_WIDTH;
+	xr.hand_hud[p].width = gl_openxr_hand_hud_slot[p][1] * xr.hud.width / GL_OPENXR_HAND_HUD_WIDTH;
+	xr.hand_hud[p].height = xr.hud.height;
+}
+
 /* Runs with the finished UI framebuffer bound (after the alpha fix-up): copies the status, ammo and weapon grid
  * boxes into the hand HUD swapchain and erases them from the head-locked UI. */
 static void GL_OpenXRCaptureHandHUD( void )
@@ -2110,9 +2188,11 @@ static void GL_OpenXRCaptureHandHUD( void )
 	static const int panel_boxes[GL_OPENXR_HAND_HUD_COUNT][GL_OPENXR_HAND_HUD_MAX_BOXES] = {
 		/* the flashlight is always there with the suit, so it sits before the damage icons, which come and go;
 		 * both extend the panel to the right, the health end stays put */
-		{ GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_FLASHLIGHT, GL_OPENXR_HUD_BOX_DAMAGE },
-		{ GL_OPENXR_HUD_BOX_AMMO, -1, -1, -1 },
-		{ GL_OPENXR_HUD_BOX_WEAPONS, GL_OPENXR_HUD_BOX_WEAPONS2, GL_OPENXR_HUD_BOX_WEAPONS3, -1 },
+		{ GL_OPENXR_HUD_BOX_HEALTH, GL_OPENXR_HUD_BOX_SUIT, GL_OPENXR_HUD_BOX_FLASHLIGHT, GL_OPENXR_HUD_BOX_DAMAGE,
+			GL_OPENXR_HUD_BOX_MONEY, GL_OPENXR_HUD_BOX_TIMER },
+		{ GL_OPENXR_HUD_BOX_AMMO, -1, -1, -1, -1, -1 },
+		{ GL_OPENXR_HUD_BOX_WEAPONS, GL_OPENXR_HUD_BOX_WEAPONS2, GL_OPENXR_HUD_BOX_WEAPONS3, -1, -1, -1 },
+		{ GL_OPENXR_HUD_BOX_RADAR, -1, -1, -1, -1, -1 },
 	};
 	int rects[GL_OPENXR_HUD_BOX_COUNT][4], origins[GL_OPENXR_HUD_BOX_COUNT][2], sizes[GL_OPENXR_HUD_BOX_COUNT][2];
 	qboolean box_valid[GL_OPENXR_HUD_BOX_COUNT];
@@ -2132,9 +2212,15 @@ static void GL_OpenXRCaptureHandHUD( void )
 	}
 	if( !any )
 		return;
+	xr.hand_hud_strip = box_valid[GL_OPENXR_HUD_BOX_MONEY] || box_valid[GL_OPENXR_HUD_BOX_TIMER] || box_valid[GL_OPENXR_HUD_BOX_RADAR];
 	/* panel content = its boxes stacked (or side by side), stretched to fill the slot */
 	for( int p = 0; p < GL_OPENXR_HAND_HUD_COUNT; ++p )
 	{
+		if( p == GL_OPENXR_HAND_HUD_STATUS && xr.hand_hud_strip )
+		{
+			GL_OpenXRLayoutStrip( box_valid, origins, sizes, &scale[p] );
+			continue;
+		}
 		/* health and suit side by side like the desktop HUD (with a gap), weapon grid rows joined into one row */
 		const qboolean side_by_side = p == GL_OPENXR_HAND_HUD_WEAPONS || p == GL_OPENXR_HAND_HUD_STATUS;
 		const int gap = p == GL_OPENXR_HAND_HUD_STATUS ? 12 : 0;
@@ -2257,7 +2343,67 @@ static void GL_OpenXRCaptureHandHUD( void )
  * with the gun's laser sight and the flashlight model (LOCAL space: +Y up). */
 static float GL_OpenXRGameHandDrop( void )
 {
+	/* Counter-Strike (vr_gamemode, only set by its VR mode) raises the hands with the eyes */
+	if( gEngfuncs.pfnGetCvarFloat( "vr_gamemode" ) > 0.5f )
+		return 0.0f;
 	return bound( -1.0f, gEngfuncs.pfnGetCvarFloat( "vr_height_adjust" ), 1.0f );
+}
+
+/* Counter-Strike watch layout on the off hand: the radar as a watch face on the wrist (vr_hud_radar_*), the number
+ * strip (status panel) in the same plane next to it towards the knuckles, sized by vr_hud_strip_scale. */
+static qboolean GL_OpenXRBuildWatchLayer( int index, XrCompositionLayerQuad *quad )
+{
+	const int weapon_hand = GL_OpenXRPointerHand();
+	const int hand = weapon_hand == REF_VR_HAND_LEFT ? REF_VR_HAND_RIGHT : REF_VR_HAND_LEFT;
+	const int radar = GL_OPENXR_HAND_HUD_RADAR;
+	const float radar_metres = bound( 0.00005f, vr_hud_radar_scale->value, 0.005f );
+	const float metres = index == radar ? radar_metres : bound( 0.00005f, vr_hud_strip_scale->value, 0.005f );
+	const float tilt = DEG2RAD( bound( -90.0f, vr_hud_radar_tilt->value, 90.0f ));
+	/* inwards = towards +X (right) on the left hand, -X on the right hand */
+	const float yaw = DEG2RAD( bound( -180.0f, vr_hud_radar_yaw->value, 180.0f )) * ( hand == REF_VR_HAND_LEFT ? 1.0f : -1.0f );
+	XrQuaternionf turn = { 0.0f, 0.0f, 0.0f, 1.0f }, lean = { 0.0f, 0.0f, 0.0f, 1.0f };
+	float offset[3] = { 0.0f, 0.0f, 0.0f };
+	XrVector3f along;
+
+	if( !xr.hud.ready || !xr.hand_hud[index].valid || !xr.hand_pose[hand].grip_valid || !xr.hand_pose[hand].aim_valid )
+		return false;
+	sscanf( vr_hud_offset[radar]->string, "%f %f %f", &offset[0], &offset[1], &offset[2] );
+
+	quad->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+	quad->eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+	quad->space = xr.local_space;
+	quad->subImage.swapchain = xr.hud.swapchain;
+	quad->subImage.imageRect.offset.x = xr.hand_hud[index].x;
+	quad->subImage.imageRect.extent.width = xr.hand_hud[index].width;
+	quad->subImage.imageRect.extent.height = xr.hand_hud[index].height;
+	quad->size.width = metres * xr.hand_hud[index].hud_width;
+	quad->size.height = metres * xr.hand_hud[index].hud_height;
+	/* aim pose axes at the grip, as the other hand panels; tilted to face up off the back of the hand, so the
+	 * panel's top points towards the knuckles */
+	lean.x = sinf( tilt * 0.5f );
+	lean.w = cosf( tilt * 0.5f );
+	turn.y = sinf( yaw * 0.5f );
+	turn.w = cosf( yaw * 0.5f );
+	quad->pose.orientation = GL_OpenXRQuatMultiply( xr.hand_pose[hand].aim.orientation, GL_OpenXRQuatMultiply( turn, lean ));
+	along.x = bound( -0.5f, offset[0], 0.5f );
+	along.y = bound( -0.5f, offset[1], 0.5f );
+	along.z = bound( -0.5f, offset[2], 0.5f );
+	along = GL_OpenXRRotateVector( xr.hand_pose[hand].aim.orientation, along );
+	quad->pose.position.x = xr.hand_pose[hand].grip.position.x + along.x;
+	quad->pose.position.y = xr.hand_pose[hand].grip.position.y + along.y;
+	quad->pose.position.z = xr.hand_pose[hand].grip.position.z + along.z;
+	if( index != radar )
+	{
+		/* next to the watch face towards the knuckles (the panel's up), in its plane, with a small gap */
+		const XrVector3f up = { 0.0f, 1.0f, 0.0f };
+		const XrVector3f axis = GL_OpenXRRotateVector( quad->pose.orientation, up );
+		const float face = xr.hand_hud[radar].valid ? radar_metres * xr.hand_hud[radar].hud_height : 0.0f;
+		const float shift = 0.5f * ( face + quad->size.height ) + ( face > 0.0f ? 0.005f : 0.0f );
+		quad->pose.position.x += axis.x * shift;
+		quad->pose.position.y += axis.y * shift;
+		quad->pose.position.z += axis.z * shift;
+	}
+	return true;
 }
 
 /* Quad for one hand HUD panel, in that controller's grip space so the compositor keeps it on the hand. */
@@ -2281,6 +2427,8 @@ static qboolean GL_OpenXRBuildHandHUDLayer( int index, XrCompositionLayerQuad *q
 	XrQuaternionf orientation, frame;
 	XrVector3f along;
 
+	if( index == GL_OPENXR_HAND_HUD_RADAR || ( index == GL_OPENXR_HAND_HUD_STATUS && xr.hand_hud_strip ))
+		return GL_OpenXRBuildWatchLayer( index, quad );
 	if( !xr.hud.ready || !xr.hand_hud[index].valid || !xr.hand_pose[hand].grip_valid || !xr.hand_pose[hand].aim_valid )
 		return false;
 	sscanf( vr_hud_offset[ammo ? GL_OPENXR_HAND_HUD_AMMO : index]->string, "%f %f %f", &offset[0], &offset[1], &offset[2] );
