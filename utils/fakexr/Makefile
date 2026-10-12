@@ -8,7 +8,7 @@ all: build/fakexr32/libfakexr.so build/fakexr64/libfakexr.so
 
 build/fakexr%/libfakexr.so: $(SRC)
 	mkdir -p $(dir $@)
-	$(CC) -m$* -shared -fPIC -fvisibility=hidden $(CFLAGS) -o $@ $(SRC) -lGL -lm
+	$(CC) -m$* -shared -fPIC -fvisibility=hidden $(CFLAGS) -o $@ $(SRC) -lGL -lz -lm
 	printf '{\n  "file_format_version": "1.0.0",\n  "runtime": {\n    "name": "fakexr",\n    "library_path": "./libfakexr.so"\n  }\n}\n' > $(dir $@)fakexr.json
 
 clean:

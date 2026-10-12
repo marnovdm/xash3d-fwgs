@@ -20,8 +20,21 @@ Control commands, one per line (angles in degrees, positions in metres, OpenXR L
   track left|right 0|1                                controller tracked or not
   input left|right <component> <value> [<y>]          e.g. "input right trigger/value 1", "input left thumbstick 0 1",
                                                       "input right a/click 1" (path under /user/hand/<hand>/input/)
-  shot  <file.png> [both|left|right]                  composite the next submitted frame (written atomically)
+  move  head|left|right <x> <y> <z> <pitch> <yaw> <roll> <seconds> [smooth|linear]
+                                                      move there over time (smooth = ease in/out, the default);
+                                                      the matching linear/angular velocity is reported meanwhile
+  vel   left|right <vx> <vy> <vz>                     extra linear velocity (m/s), added to a move's own
+  state focused|visible|synchronized                  session state, stepping through the ones between: visible =
+                                                      dashboard (inputs inactive), synchronized = headset asleep
+                                                      (shouldRender false)
+  status                                              log poses, active inputs, session state and the measured fps
+  shot  <file.png> [both|left|right] [layers] [rect=x0,y0,x1,y1] [px=<n>]
+                                                      composite the next submitted frame (written atomically) plus
+                                                      <file>.json (every layer's space, pose, size and box in the
+                                                      PNG); layers = each quad's image too; rect = that part of the
+                                                      eye only (pixels of a normal shot), px = its longer side
   exit                                                ask the application to end the session
+Haptic pulses are logged ("fakexr: haptic ...").
 Environment: FAKEXR_CONTROL (FIFO path), FAKEXR_EYE_SIZE (default 960), FAKEXR_FPS (default 90, 0 = unthrottled),
 FAKEXR_PROFILE (default /interaction_profiles/oculus/touch_controller), FAKEXR_GRIP_PITCH (aim -> grip pitch, default 0),
 FAKEXR_IPD (default 0.064), FAKEXR_VERBOSE (1 = log every call that fails).
@@ -44,6 +57,7 @@ FAKEXR_IPD (default 0.064), FAKEXR_VERBOSE (1 = log every call that fails).
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #define EXPORT __attribute__(( visibility( "default" )))
 #define ARRAY_COUNT( a ) ( sizeof( a ) / sizeof(( a )[0] ))
@@ -125,6 +139,39 @@ static XrQuaternionf QuatFromAngles( float pitch, float yaw, float roll )
 	XrQuaternionf qx = QuatAxisAngle( 1, 0, 0, DEG2RAD( pitch ));
 	XrQuaternionf qz = QuatAxisAngle( 0, 0, 1, DEG2RAD( roll ));
 	return QuatMul( QuatMul( qy, qx ), qz );
+}
+
+/* inverse of QuatFromAngles, in degrees */
+static void QuatToAngles( XrQuaternionf q, float *pitch, float *yaw, float *roll )
+{
+	float r02 = 2 * ( q.x * q.z + q.w * q.y ), r22 = 1 - 2 * ( q.x * q.x + q.y * q.y );
+	float r10 = 2 * ( q.x * q.y + q.w * q.z ), r11 = 1 - 2 * ( q.x * q.x + q.z * q.z );
+	float r12 = 2 * ( q.y * q.z - q.w * q.x );
+
+	r12 = r12 > 1.0f ? 1.0f : r12 < -1.0f ? -1.0f : r12;
+	*pitch = asinf( -r12 ) * 180.0f / (float)M_PI;
+	*yaw = atan2f( r02, r22 ) * 180.0f / (float)M_PI;
+	*roll = atan2f( r10, r11 ) * 180.0f / (float)M_PI;
+}
+
+/* rotation taking a to b (b = r * a) as a unit axis and an angle in radians, the short way round */
+static float QuatDelta( XrQuaternionf a, XrQuaternionf b, XrVector3f *axis )
+{
+	XrQuaternionf r = QuatMul( b, QuatConj( a ));
+	float s;
+
+	if( r.w < 0 )
+	{
+		r.x = -r.x; r.y = -r.y; r.z = -r.z; r.w = -r.w;
+	}
+	s = sqrtf( r.x * r.x + r.y * r.y + r.z * r.z );
+	if( s < 1e-6f )
+	{
+		axis->x = 1; axis->y = axis->z = 0;
+		return 0.0f;
+	}
+	axis->x = r.x / s; axis->y = r.y / s; axis->z = r.z / s;
+	return 2.0f * atan2f( s, r.w );
 }
 
 static XrPosef PoseIdentity( void )
@@ -241,10 +288,20 @@ typedef struct
 typedef struct
 {
 	XrPosef aim, grip;
-	XrVector3f velocity; /* linear, LOCAL space, m/s (set with "vel") */
+	XrVector3f velocity; /* linear, LOCAL space, m/s (set with "vel"), added to the motion's own */
 	int grip_override;
 	int tracked;
 } hand_t;
+
+/* a "move" in progress: head (MOTION_HEAD) or a hand's aim pose, from -> to over duration */
+#define MOTION_HEAD 2
+typedef struct
+{
+	int active, smooth;
+	XrPosef from, to;
+	XrTime start, duration;
+	XrVector3f linear, angular; /* current velocity, LOCAL space */
+} motion_t;
 
 static struct
 {
@@ -263,8 +320,11 @@ static struct
 	XrPath profile;
 	XrPath hand_path[2];
 
+	XrSessionState session_state;
 	XrPosef head;
 	hand_t hands[2];
+	motion_t motion[3]; /* left, right, head */
+	float frame_interval; /* measured, smoothed, seconds */
 	float ipd;
 	uint32_t eye_size;
 	float fps;
@@ -282,6 +342,8 @@ static struct
 	char shot_path[1024];
 	int shot_eyes; /* bit 0 left, bit 1 right */
 	int shot_layers; /* also write every quad layer's image */
+	float shot_rect[4]; /* part of each eye to show: u0 v0 u1 v1, 0..1, top-left origin (zoom) */
+	uint32_t shot_width, shot_height; /* output size per eye */
 	GLuint compose_fbo, compose_texture;
 	uint32_t compose_width, compose_height;
 	uint64_t haptic_count;
@@ -343,6 +405,8 @@ static void PushEvent( const void *event, size_t size )
 	rt.event_count++;
 }
 
+static const char *SessionStateName( XrSessionState state );
+
 static XrTime NowNs( void )
 {
 	struct timespec ts;
@@ -359,6 +423,8 @@ static void PushSessionState( XrSessionState state )
 	event.state = state;
 	event.time = NowNs();
 	PushEvent( &event, sizeof( event ));
+	rt.session_state = state;
+	Log( "session state %s", SessionStateName( state ));
 }
 
 /* ---------- control FIFO ---------- */
@@ -404,21 +470,173 @@ static void UpdateGrip( int hand )
 	}
 }
 
+static XrTime NowNs( void );
+static void PushSessionState( XrSessionState state );
+
+/* the pose a motion slot drives */
+static XrPosef *MotionTarget( int slot )
+{
+	return slot == MOTION_HEAD ? &rt.head : &rt.hands[slot].aim;
+}
+
+static void SetMotionPose( int slot, XrPosef pose )
+{
+	if( slot != MOTION_HEAD && rt.hands[slot].grip_override )
+	{
+		/* an explicit grip stays rigidly attached to the aim pose */
+		XrPosef rel = PoseMul( PoseInv( rt.hands[slot].aim ), rt.hands[slot].grip );
+		rt.hands[slot].grip = PoseMul( pose, rel );
+	}
+	*MotionTarget( slot ) = pose;
+	if( slot != MOTION_HEAD )
+		UpdateGrip( slot );
+}
+
+/* advance every move to time t: interpolated pose plus the matching velocity */
+static void MotionUpdate( XrTime t )
+{
+	for( int slot = 0; slot < 3; ++slot )
+	{
+		motion_t *m = &rt.motion[slot];
+		XrVector3f axis;
+		XrPosef pose;
+		float u, s, rate, angle;
+
+		if( !m->active )
+			continue;
+		u = m->duration > 0 ? (float)( t - m->start ) / (float)m->duration : 1.0f;
+		u = u < 0 ? 0 : u;
+		if( u >= 1.0f )
+		{
+			SetMotionPose( slot, m->to );
+			m->active = 0;
+			memset( &m->linear, 0, sizeof( m->linear ));
+			memset( &m->angular, 0, sizeof( m->angular ));
+			continue;
+		}
+		/* smooth = smoothstep: starts and stops gently like a real arm; linear = constant speed */
+		s = m->smooth ? u * u * ( 3 - 2 * u ) : u;
+		rate = ( m->smooth ? 6 * u * ( 1 - u ) : 1.0f ) / ( m->duration / 1e9f );
+		angle = QuatDelta( m->from.orientation, m->to.orientation, &axis );
+		pose.position.x = m->from.position.x + ( m->to.position.x - m->from.position.x ) * s;
+		pose.position.y = m->from.position.y + ( m->to.position.y - m->from.position.y ) * s;
+		pose.position.z = m->from.position.z + ( m->to.position.z - m->from.position.z ) * s;
+		pose.orientation = QuatMul( QuatAxisAngle( axis.x, axis.y, axis.z, angle * s ), m->from.orientation );
+		SetMotionPose( slot, pose );
+		m->linear.x = ( m->to.position.x - m->from.position.x ) * rate;
+		m->linear.y = ( m->to.position.y - m->from.position.y ) * rate;
+		m->linear.z = ( m->to.position.z - m->from.position.z ) * rate;
+		m->angular.x = axis.x * angle * rate;
+		m->angular.y = axis.y * angle * rate;
+		m->angular.z = axis.z * angle * rate;
+	}
+}
+
+static const char *SessionStateName( XrSessionState state )
+{
+	switch( state )
+	{
+	case XR_SESSION_STATE_IDLE: return "idle";
+	case XR_SESSION_STATE_READY: return "ready";
+	case XR_SESSION_STATE_SYNCHRONIZED: return "synchronized";
+	case XR_SESSION_STATE_VISIBLE: return "visible";
+	case XR_SESSION_STATE_FOCUSED: return "focused";
+	case XR_SESSION_STATE_STOPPING: return "stopping";
+	case XR_SESSION_STATE_EXITING: return "exiting";
+	default: return "unknown";
+	}
+}
+
+/* walk synchronized <-> visible <-> focused one step at a time, like a real runtime */
+static void SetRunningState( XrSessionState target )
+{
+	if( !rt.session_running )
+	{
+		Log( "state: session not running" );
+		return;
+	}
+	if( rt.session_state < XR_SESSION_STATE_SYNCHRONIZED || rt.session_state > XR_SESSION_STATE_FOCUSED )
+	{
+		Log( "state: session is %s", SessionStateName( rt.session_state ));
+		return;
+	}
+	while( rt.session_state != target )
+	{
+		XrSessionState next = rt.session_state < target ? rt.session_state + 1 : rt.session_state - 1;
+		PushSessionState( next );
+	}
+}
+
+static void LogPose( const char *name, XrPosef p, int tracked )
+{
+	float pitch, yaw, roll;
+	QuatToAngles( p.orientation, &pitch, &yaw, &roll );
+	Log( "  %-10s %6.3f %6.3f %6.3f  %7.1f %7.1f %7.1f%s", name, p.position.x, p.position.y, p.position.z,
+		pitch, yaw, roll, tracked ? "" : "  (not tracked)" );
+}
+
 static void ControlCommand( char *line )
 {
-	char word[64], side[16], component[200];
-	float v[6];
+	char word[64], side[16], component[200], mode[16];
+	float v[7];
 	int hand;
 
 	if( sscanf( line, "%63s", word ) != 1 || word[0] == '#' )
 		return;
 
 	if( !strcmp( word, "head" ) && sscanf( line, "%*s %f %f %f %f %f %f", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5] ) == 6 )
+	{
+		rt.motion[MOTION_HEAD].active = 0;
+		memset( &rt.motion[MOTION_HEAD].linear, 0, sizeof( rt.motion[MOTION_HEAD].linear ));
+		memset( &rt.motion[MOTION_HEAD].angular, 0, sizeof( rt.motion[MOTION_HEAD].angular ));
 		rt.head = PoseFromWords( v[0], v[1], v[2], v[3], v[4], v[5] );
+	}
+	else if( !strcmp( word, "move" ) && sscanf( line, "%*s %15s %f %f %f %f %f %f %f", side,
+		&v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6] ) == 8 &&
+		(( hand = ParseHand( side )) >= 0 || !strcmp( side, "head" )) && v[6] >= 0 )
+	{
+		int slot = hand >= 0 ? hand : MOTION_HEAD;
+		motion_t *m = &rt.motion[slot];
+
+		mode[0] = '\0';
+		sscanf( line, "%*s %*s %*f %*f %*f %*f %*f %*f %*f %15s", mode );
+		m->from = *MotionTarget( slot );
+		m->to = PoseFromWords( v[0], v[1], v[2], v[3], v[4], v[5] );
+		m->start = NowNs();
+		m->duration = (XrTime)( v[6] * 1e9f );
+		m->smooth = strcmp( mode, "linear" ) != 0;
+		m->active = 1;
+	}
+	else if( !strcmp( word, "state" ) && sscanf( line, "%*s %15s", side ) == 1 )
+	{
+		if( !strcmp( side, "focused" )) SetRunningState( XR_SESSION_STATE_FOCUSED );
+		else if( !strcmp( side, "visible" )) SetRunningState( XR_SESSION_STATE_VISIBLE );
+		else if( !strcmp( side, "synchronized" )) SetRunningState( XR_SESSION_STATE_SYNCHRONIZED );
+		else Log( "state: focused, visible or synchronized" );
+	}
+	else if( !strcmp( word, "status" ))
+	{
+		Log( "status: frame %llu, %.1f fps measured, session %s, %llu haptic pulses",
+			(unsigned long long)rt.frame_index, rt.frame_interval > 0 ? 1.0f / rt.frame_interval : 0.0f,
+			SessionStateName( rt.session_state ), (unsigned long long)rt.haptic_count );
+		LogPose( "head", rt.head, 1 );
+		LogPose( "left aim", rt.hands[0].aim, rt.hands[0].tracked );
+		LogPose( "left grip", rt.hands[0].grip, rt.hands[0].tracked );
+		LogPose( "right aim", rt.hands[1].aim, rt.hands[1].tracked );
+		LogPose( "right grip", rt.hands[1].grip, rt.hands[1].tracked );
+		for( uint32_t i = 0; i < rt.input_count; ++i )
+		{
+			if( rt.inputs[i].value[0] != 0.0f || rt.inputs[i].value[1] != 0.0f )
+				Log( "  input %s = %g %g", PathString( rt.inputs[i].path ), rt.inputs[i].value[0], rt.inputs[i].value[1] );
+		}
+	}
 	else if(( !strcmp( word, "aim" ) || !strcmp( word, "grip" )) &&
 		sscanf( line, "%*s %15s %f %f %f %f %f %f", side, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5] ) == 7 &&
 		( hand = ParseHand( side )) >= 0 )
 	{
+		rt.motion[hand].active = 0;
+		memset( &rt.motion[hand].linear, 0, sizeof( rt.motion[hand].linear ));
+		memset( &rt.motion[hand].angular, 0, sizeof( rt.motion[hand].angular ));
 		if( word[0] == 'a' )
 			rt.hands[hand].aim = PoseFromWords( v[0], v[1], v[2], v[3], v[4], v[5] );
 		else
@@ -453,14 +671,44 @@ static void ControlCommand( char *line )
 			input->value[1] = v[1];
 		}
 	}
-	else if( !strcmp( word, "shot" ) && sscanf( line, "%*s %1023s %15s", rt.shot_path, side ) >= 1 )
+	else if( !strcmp( word, "shot" ) && sscanf( line, "%*s %1023s", rt.shot_path ) == 1 )
 	{
-		char extra[16] = "";
-		if( sscanf( line, "%*s %*s %15s", side ) != 1 || !strcmp( side, "both" ))
-			rt.shot_eyes = 3;
-		else
-			rt.shot_eyes = !strcmp( side, "right" ) ? 2 : 1;
-		rt.shot_layers = sscanf( line, "%*s %*s %*s %15s", extra ) == 1 && !strcmp( extra, "layers" );
+		/* shot <file> [both|left|right] [layers] [rect=x0,y0,x1,y1] [px=<width>]
+		 * rect: the part of the eye to render, in pixels of a normal shot (eye size, top-left origin); the
+		 * runtime re-projects it at px wide, so panels come out at their full texture detail */
+		char *token, *save = NULL;
+		float r[4], px = 0;
+		int words = 0;
+
+		rt.shot_eyes = 3;
+		rt.shot_layers = 0;
+		rt.shot_rect[0] = rt.shot_rect[1] = 0.0f;
+		rt.shot_rect[2] = rt.shot_rect[3] = 1.0f;
+		for( token = strtok_r( line, " \t", &save ); token; token = strtok_r( NULL, " \t", &save ))
+		{
+			if( words++ < 2 )
+				continue; /* "shot" and the file */
+			if( !strcmp( token, "left" )) rt.shot_eyes = 1;
+			else if( !strcmp( token, "right" )) rt.shot_eyes = 2;
+			else if( !strcmp( token, "both" )) rt.shot_eyes = 3;
+			else if( !strcmp( token, "layers" )) rt.shot_layers = 1;
+			else if( sscanf( token, "rect=%f,%f,%f,%f", &r[0], &r[1], &r[2], &r[3] ) == 4 && r[2] > r[0] && r[3] > r[1] )
+			{
+				for( int k = 0; k < 4; ++k )
+					rt.shot_rect[k] = r[k] / rt.eye_size;
+			}
+			else if( sscanf( token, "px=%f", &px ) == 1 ) {}
+			else Log( "shot: ignoring '%s'", token );
+		}
+		{
+			/* px = the longer side of the output (per eye); the other follows the rect's aspect */
+			float aspect = ( rt.shot_rect[2] - rt.shot_rect[0] ) / ( rt.shot_rect[3] - rt.shot_rect[1] );
+			uint32_t longer = px >= 16 && px <= 8192 ? (uint32_t)px : rt.eye_size;
+			rt.shot_width = aspect >= 1.0f ? longer : (uint32_t)( longer * aspect + 0.5f );
+			rt.shot_height = aspect >= 1.0f ? (uint32_t)( longer / aspect + 0.5f ) : longer;
+			if( rt.shot_width < 1 ) rt.shot_width = 1;
+			if( rt.shot_height < 1 ) rt.shot_height = 1;
+		}
 	}
 	else if( !strcmp( word, "exit" ))
 	{
@@ -553,73 +801,50 @@ static int WritePNG( const char *path, const uint8_t *rgba, uint32_t width, uint
 {
 	size_t row = (size_t)width * 3 + 1;
 	size_t raw_size = row * height;
-	size_t blocks = ( raw_size + 65534 ) / 65535;
-	size_t z_size = 2 + raw_size + blocks * 5 + 4;
+	uLongf z_size = compressBound( (uLong)raw_size );
 	uint8_t *raw = malloc( raw_size );
 	uint8_t *z = malloc( z_size );
 	uint8_t ihdr[13];
-	uint32_t a = 1, b = 0;
-	size_t zo = 0;
 	char temp[1100];
-	FILE *f;
+	FILE *f = NULL;
 
-	if( !raw || !z )
+	if( raw && z )
 	{
-		free( raw );
-		free( z );
-		return 0;
-	}
-	for( uint32_t y = 0; y < height; ++y )
-	{
-		const uint8_t *src = rgba + (size_t)( height - 1 - y ) * width * 4;
-		uint8_t *dst = raw + y * row;
-		*dst++ = 0;
-		for( uint32_t x = 0; x < width; ++x )
+		/* bottom-up GL rows -> top-down PNG rows, RGBA -> RGB, filter "sub" per row (compresses far better) */
+		for( uint32_t y = 0; y < height; ++y )
 		{
-			*dst++ = src[x * 4 + 0];
-			*dst++ = src[x * 4 + 1];
-			*dst++ = src[x * 4 + 2];
+			const uint8_t *src = rgba + (size_t)( height - 1 - y ) * width * 4;
+			uint8_t *dst = raw + y * row;
+			*dst++ = 1;
+			for( uint32_t x = 0; x < width; ++x )
+			{
+				for( int c = 0; c < 3; ++c )
+					*dst++ = (uint8_t)( src[x * 4 + c] - ( x ? src[( x - 1 ) * 4 + c] : 0 ));
+			}
 		}
+		if( compress2( z, &z_size, raw, (uLong)raw_size, 6 ) != Z_OK )
+			z_size = 0;
 	}
-	z[zo++] = 0x78;
-	z[zo++] = 0x01;
-	for( size_t pos = 0; pos < raw_size; )
+	if( z_size )
 	{
-		size_t n = raw_size - pos > 65535 ? 65535 : raw_size - pos;
-		z[zo++] = pos + n >= raw_size ? 1 : 0;
-		z[zo++] = (uint8_t)( n & 0xFF );
-		z[zo++] = (uint8_t)( n >> 8 );
-		z[zo++] = (uint8_t)( ~n & 0xFF );
-		z[zo++] = (uint8_t)(( ~n >> 8 ) & 0xFF );
-		memcpy( z + zo, raw + pos, n );
-		zo += n;
-		pos += n;
-	}
-	for( size_t i = 0; i < raw_size; ++i )
-	{
-		a = ( a + raw[i] ) % 65521;
-		b = ( b + a ) % 65521;
-	}
-	PutBE32( z + zo, ( b << 16 ) | a );
-	zo += 4;
+		PutBE32( ihdr, width );
+		PutBE32( ihdr + 4, height );
+		ihdr[8] = 8;  /* bit depth */
+		ihdr[9] = 2;  /* RGB */
+		ihdr[10] = ihdr[11] = ihdr[12] = 0;
 
-	PutBE32( ihdr, width );
-	PutBE32( ihdr + 4, height );
-	ihdr[8] = 8;  /* bit depth */
-	ihdr[9] = 2;  /* RGB */
-	ihdr[10] = ihdr[11] = ihdr[12] = 0;
-
-	snprintf( temp, sizeof( temp ), "%s.tmp", path );
-	f = fopen( temp, "wb" );
-	if( f )
-	{
-		static const uint8_t signature[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
-		fwrite( signature, 1, 8, f );
-		WriteChunk( f, "IHDR", ihdr, 13 );
-		WriteChunk( f, "IDAT", z, (uint32_t)zo );
-		WriteChunk( f, "IEND", NULL, 0 );
-		fclose( f );
-		rename( temp, path );
+		snprintf( temp, sizeof( temp ), "%s.tmp", path );
+		f = fopen( temp, "wb" );
+		if( f )
+		{
+			static const uint8_t signature[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n' };
+			fwrite( signature, 1, 8, f );
+			WriteChunk( f, "IHDR", ihdr, 13 );
+			WriteChunk( f, "IDAT", z, (uint32_t)z_size );
+			WriteChunk( f, "IEND", NULL, 0 );
+			fclose( f );
+			rename( temp, path );
+		}
 	}
 	free( raw );
 	free( z );
@@ -703,6 +928,18 @@ static void ProjectionForFov( XrFovf fov, float near_z, float far_z )
 	glFrustum( l, r, b, t, near_z, far_z );
 }
 
+/* the eye's field of view narrowed to the shot rectangle */
+static XrFovf ShotFov( int eye )
+{
+	XrFovf fov = rt.fov[eye], out;
+	float tl = tanf( fov.angleLeft ), tr = tanf( fov.angleRight ), tu = tanf( fov.angleUp ), td = tanf( fov.angleDown );
+	out.angleLeft = atanf( tl + rt.shot_rect[0] * ( tr - tl ));
+	out.angleRight = atanf( tl + rt.shot_rect[2] * ( tr - tl ));
+	out.angleUp = atanf( tu - rt.shot_rect[1] * ( tu - td ));
+	out.angleDown = atanf( tu - rt.shot_rect[3] * ( tu - td ));
+	return out;
+}
+
 static const space_t *SpaceFromHandle( XrSpace space )
 {
 	return FROM_HANDLE( const space_t, space );
@@ -743,7 +980,7 @@ static void ComposeEye( int eye, const XrFrameEndInfo *info, int x_offset )
 	XrPosef eye_pose = EyePose( eye );
 	XrPosef view = PoseInv( eye_pose );
 
-	glViewport( x_offset, 0, rt.eye_size, rt.eye_size );
+	glViewport( x_offset, 0, rt.shot_width, rt.shot_height );
 	for( uint32_t i = 0; i < info->layerCount; ++i )
 	{
 		const XrCompositionLayerBaseHeader *base = info->layers[i];
@@ -762,7 +999,8 @@ static void ComposeEye( int eye, const XrFrameEndInfo *info, int x_offset )
 			SetLayerBlend( projection->layerFlags );
 			glMatrixMode( GL_PROJECTION );
 			glLoadIdentity();
-			glOrtho( 0, 1, 0, 1, -1, 1 );
+			/* GL texture rows run bottom-up: the rect's top (v0) is the high end */
+			glOrtho( rt.shot_rect[0], rt.shot_rect[2], 1.0f - rt.shot_rect[3], 1.0f - rt.shot_rect[1], -1, 1 );
 			glMatrixMode( GL_MODELVIEW );
 			glLoadIdentity();
 			glBegin( GL_QUADS );
@@ -788,7 +1026,7 @@ static void ComposeEye( int eye, const XrFrameEndInfo *info, int x_offset )
 			quad_pose = PoseMul( space_pose, quad->pose );
 			BindSubImage( &quad->subImage, uv );
 			SetLayerBlend( quad->layerFlags );
-			ProjectionForFov( rt.fov[eye], 0.02f, 100.0f );
+			ProjectionForFov( ShotFov( eye ), 0.02f, 100.0f );
 			glMatrixMode( GL_MODELVIEW );
 			view_m = Mat4FromPose( view );
 			model = Mat4FromPose( quad_pose );
@@ -808,7 +1046,7 @@ static void Compose( const XrFrameEndInfo *info )
 {
 	GLint draw_fbo = 0, read_fbo = 0, program = 0, active = 0, pack_buffer = 0, viewport[4];
 	GLboolean srgb;
-	uint32_t width = rt.eye_size * (( rt.shot_eyes == 3 ) ? 2 : 1), height = rt.eye_size;
+	uint32_t width = rt.shot_width * (( rt.shot_eyes == 3 ) ? 2 : 1), height = rt.shot_height;
 	uint8_t *pixels;
 	int x = 0;
 
@@ -880,7 +1118,7 @@ static void Compose( const XrFrameEndInfo *info )
 		if( !( rt.shot_eyes & ( 1 << eye )))
 			continue;
 		ComposeEye( eye, info, x );
-		x += rt.eye_size;
+		x += rt.shot_width;
 	}
 
 	pixels = malloc( (size_t)width * height * 4 );
@@ -931,6 +1169,156 @@ static void Compose( const XrFrameEndInfo *info )
 	gl.ActiveTexture( (GLenum)active );
 	gl.UseProgram( (GLuint)program );
 	glViewport( viewport[0], viewport[1], viewport[2], viewport[3] );
+}
+
+
+/* ---------- shot metadata (<shot>.json) ---------- */
+
+static void JsonPose( FILE *f, XrPosef p )
+{
+	float pitch, yaw, roll;
+	QuatToAngles( p.orientation, &pitch, &yaw, &roll );
+	fprintf( f, "{\"pos\": [%.4f, %.4f, %.4f], \"ang\": [%.2f, %.2f, %.2f]}",
+		p.position.x, p.position.y, p.position.z, pitch, yaw, roll );
+}
+
+static void JsonSpace( FILE *f, const space_t *space )
+{
+	if( space->kind == SPACE_REFERENCE )
+	{
+		fprintf( f, "\"%s\"", space->reference == XR_REFERENCE_SPACE_TYPE_VIEW ? "view" :
+			space->reference == XR_REFERENCE_SPACE_TYPE_STAGE ? "stage" : "local" );
+		return;
+	}
+	{
+		int hand = HandFromPath( space->subaction ), is_aim = 0;
+		for( uint32_t i = 0; i < rt.binding_count; ++i )
+		{
+			const binding_t *b = &rt.bindings[i];
+			if( b->profile == rt.profile && b->action == space->action && hand >= 0 && PathIsUnderHand( b->path, hand ))
+			{
+				is_aim = strstr( PathString( b->path ), "/aim/pose" ) != NULL;
+				break;
+			}
+		}
+		fprintf( f, "\"%s %s %s\"", hand == 0 ? "left" : hand == 1 ? "right" : "?",
+			is_aim ? "aim" : "grip", space->action ? space->action->name : "" );
+	}
+}
+
+/* pixel box of a quad in the shot PNG for one eye (top-left origin); 0 when it is not in front of the eye */
+static int QuadScreenBox( const XrPosef *quad_pose, XrExtent2Df size, int eye, int x_offset, float box[4] )
+{
+	XrPosef view = PoseInv( EyePose( eye ));
+	XrFovf fov = ShotFov( eye );
+	float tl = tanf( fov.angleLeft ), tr = tanf( fov.angleRight ), tu = tanf( fov.angleUp ), td = tanf( fov.angleDown );
+
+	box[0] = box[1] = 1e9f;
+	box[2] = box[3] = -1e9f;
+	for( int c = 0; c < 4; ++c )
+	{
+		XrPosef corner = PoseIdentity();
+		XrVector3f p;
+		float u, v;
+
+		corner.position.x = ( c & 1 ? 0.5f : -0.5f ) * size.width;
+		corner.position.y = ( c & 2 ? 0.5f : -0.5f ) * size.height;
+		p = PoseMul( view, PoseMul( *quad_pose, corner )).position;
+		if( p.z > -0.01f )
+			return 0;
+		u = ( p.x / -p.z - tl ) / ( tr - tl );
+		v = ( p.y / -p.z - td ) / ( tu - td );
+		u = x_offset + u * rt.shot_width;
+		v = ( 1.0f - v ) * rt.shot_height;
+		if( u < box[0] ) box[0] = u;
+		if( v < box[1] ) box[1] = v;
+		if( u > box[2] ) box[2] = u;
+		if( v > box[3] ) box[3] = v;
+	}
+	return 1;
+}
+
+static void WriteShotJSON( const XrFrameEndInfo *info )
+{
+	char path[1100], temp[1110];
+	FILE *f;
+
+	snprintf( path, sizeof( path ), "%.*s.json", (int)strlen( rt.shot_path ) - 4, rt.shot_path );
+	snprintf( temp, sizeof( temp ), "%s.tmp", path );
+	if( !( f = fopen( temp, "w" )))
+		return;
+	fprintf( f, "{\n\"frame\": %llu, \"session\": \"%s\", \"eye_size\": %u, \"eyes\": \"%s\",\n",
+		(unsigned long long)rt.frame_index, SessionStateName( rt.session_state ), rt.eye_size,
+		rt.shot_eyes == 3 ? "both" : rt.shot_eyes == 2 ? "right" : "left" );
+	fprintf( f, "\"shot_size\": [%u, %u], \"rect\": [%.1f, %.1f, %.1f, %.1f],\n", rt.shot_width, rt.shot_height,
+		rt.shot_rect[0] * rt.eye_size, rt.shot_rect[1] * rt.eye_size, rt.shot_rect[2] * rt.eye_size, rt.shot_rect[3] * rt.eye_size );
+	fprintf( f, "\"head\": " ); JsonPose( f, rt.head );
+	for( int h = 0; h < 2; ++h )
+	{
+		fprintf( f, ",\n\"%s\": {\"tracked\": %s, \"aim\": ", h ? "right" : "left", rt.hands[h].tracked ? "true" : "false" );
+		JsonPose( f, rt.hands[h].aim );
+		fprintf( f, ", \"grip\": " );
+		JsonPose( f, rt.hands[h].grip );
+		fprintf( f, ", \"moving\": %s}", rt.motion[h].active ? "true" : "false" );
+	}
+	fprintf( f, ",\n\"layers\": [" );
+	for( uint32_t i = 0; i < info->layerCount; ++i )
+	{
+		const XrCompositionLayerBaseHeader *base = info->layers[i];
+
+		fprintf( f, "%s\n  {\"index\": %u, \"flags\": %llu", i ? "," : "", i, (unsigned long long)base->layerFlags );
+		if( base->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION )
+		{
+			const XrCompositionLayerProjection *proj = (const XrCompositionLayerProjection *)base;
+			fprintf( f, ", \"type\": \"projection\", \"space\": " );
+			JsonSpace( f, SpaceFromHandle( proj->space ));
+			fprintf( f, ", \"views\": %u", proj->viewCount );
+		}
+		else if( base->type == XR_TYPE_COMPOSITION_LAYER_QUAD )
+		{
+			const XrCompositionLayerQuad *quad = (const XrCompositionLayerQuad *)base;
+			const swapchain_t *chain = FROM_HANDLE( const swapchain_t, quad->subImage.swapchain );
+			XrPosef space_pose, pose;
+			int tracked = SpacePose( SpaceFromHandle( quad->space ), &space_pose );
+
+			fprintf( f, ", \"type\": \"quad\", \"space\": " );
+			JsonSpace( f, SpaceFromHandle( quad->space ));
+			fprintf( f, ", \"tracked\": %s, \"eye\": \"%s\", \"size\": [%.4f, %.4f], \"image\": [%u, %u, %d, %d, %d, %d]",
+				tracked ? "true" : "false",
+				quad->eyeVisibility == XR_EYE_VISIBILITY_LEFT ? "left" : quad->eyeVisibility == XR_EYE_VISIBILITY_RIGHT ? "right" : "both",
+				quad->size.width, quad->size.height, chain->width, chain->height,
+				quad->subImage.imageRect.offset.x, quad->subImage.imageRect.offset.y,
+				quad->subImage.imageRect.extent.width, quad->subImage.imageRect.extent.height );
+			if( tracked )
+			{
+				int x = 0;
+				pose = PoseMul( space_pose, quad->pose );
+				fprintf( f, ",\n   \"pose\": " );
+				JsonPose( f, pose );
+				fprintf( f, ", \"from_head\": " );
+				JsonPose( f, PoseMul( PoseInv( rt.head ), pose ));
+				/* where it lands in the PNG of this shot: [x0, y0, x1, y1], may reach outside the eye */
+				for( int eye = 0; eye < 2; ++eye )
+				{
+					float box[4];
+					if( !( rt.shot_eyes & ( 1 << eye )))
+						continue;
+					fprintf( f, ", \"png_%s\": ", eye ? "right" : "left" );
+					if( QuadScreenBox( &pose, quad->size, eye, x, box ))
+						fprintf( f, "[%.0f, %.0f, %.0f, %.0f]", box[0], box[1], box[2], box[3] );
+					else
+						fprintf( f, "null" );
+					x += rt.shot_width;
+				}
+			}
+		}
+		else
+			fprintf( f, ", \"type\": \"other\", \"structure\": %d", (int)base->type );
+		fprintf( f, "}" );
+	}
+	fprintf( f, "\n]\n}\n" );
+	fclose( f );
+	rename( temp, path );
 }
 
 /* ---------- OpenXR: instance ---------- */
@@ -1326,10 +1714,22 @@ static XrResult XRAPI_CALL LocateSpace( XrSpace space, XrSpace base, XrTime time
 		const space_t *located = FROM_HANDLE( space_t, space );
 		int hand = located->kind == SPACE_ACTION ? HandFromPath( located->subaction ) : -1;
 
+		const motion_t *m = hand >= 0 ? &rt.motion[hand] :
+			( located->kind == SPACE_REFERENCE && located->reference == XR_REFERENCE_SPACE_TYPE_VIEW ) ? &rt.motion[MOTION_HEAD] : NULL;
+
 		velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
 		/* the base spaces the engine uses (LOCAL/STAGE) are not rotated against LOCAL here */
+		if( m )
+		{
+			velocity->linearVelocity = m->linear;
+			velocity->angularVelocity = m->angular;
+		}
 		if( hand >= 0 )
-			velocity->linearVelocity = rt.hands[hand].velocity;
+		{
+			velocity->linearVelocity.x += rt.hands[hand].velocity.x;
+			velocity->linearVelocity.y += rt.hands[hand].velocity.y;
+			velocity->linearVelocity.z += rt.hands[hand].velocity.z;
+		}
 	}
 	return XR_SUCCESS;
 }
@@ -1472,14 +1872,25 @@ static XrResult XRAPI_CALL WaitFrame( XrSession session, const XrFrameWaitInfo *
 		}
 		clock_nanosleep( CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL );
 	}
-	clock_gettime( CLOCK_MONOTONIC, &rt.last_wait );
+	{
+		struct timespec now;
+		clock_gettime( CLOCK_MONOTONIC, &now );
+		if( rt.last_wait.tv_sec )
+		{
+			float dt = (float)( now.tv_sec - rt.last_wait.tv_sec ) + ( now.tv_nsec - rt.last_wait.tv_nsec ) / 1e9f;
+			rt.frame_interval = rt.frame_interval > 0 ? rt.frame_interval * 0.9f + dt * 0.1f : dt;
+		}
+		rt.last_wait = now;
+	}
 	ControlPoll();
 	state->predictedDisplayPeriod = period;
 	state->predictedDisplayTime = NowNs() + period;
 	if( state->predictedDisplayTime <= rt.last_display_time )
 		state->predictedDisplayTime = rt.last_display_time + 1;
 	rt.last_display_time = state->predictedDisplayTime;
-	state->shouldRender = XR_TRUE;
+	MotionUpdate( NowNs( ));
+	/* synchronized = headset off/asleep: the app keeps its frame loop but need not render */
+	state->shouldRender = rt.session_state == XR_SESSION_STATE_VISIBLE || rt.session_state == XR_SESSION_STATE_FOCUSED;
 	return XR_SUCCESS;
 }
 
@@ -1496,6 +1907,7 @@ static XrResult XRAPI_CALL EndFrame( XrSession session, const XrFrameEndInfo *in
 	rt.frame_index++;
 	if( rt.shot_path[0] )
 	{
+		WriteShotJSON( info ); /* before the PNG: the runner waits for the PNG */
 		Compose( info );
 		rt.shot_path[0] = '\0';
 	}
@@ -1613,6 +2025,9 @@ static int ActionValue( const XrActionStateGetInfo *info, float now[2], float be
 	int bound = 0;
 
 	now[0] = now[1] = before[0] = before[1] = 0.0f;
+	/* input belongs to the focused app only (dashboard open / headset off = inactive) */
+	if( rt.session_state != XR_SESSION_STATE_FOCUSED )
+		return 0;
 	for( uint32_t i = 0; i < rt.binding_count; ++i )
 	{
 		const binding_t *b = &rt.bindings[i];
@@ -1690,8 +2105,7 @@ static XrResult XRAPI_CALL ApplyHapticFeedback( XrSession session, const XrHapti
 	const XrHapticVibration *vibration = (const XrHapticVibration *)haptic;
 	(void)session;
 	rt.haptic_count++;
-	if( verbose )
-		Log( "haptic %s: %.3f s, %.0f Hz, amplitude %.2f", PathString( info->subactionPath ),
+	Log( "haptic %s: %.3f s, %.0f Hz, amplitude %.2f", PathString( info->subactionPath ),
 			vibration->duration == XR_INFINITE_DURATION ? -1.0 : vibration->duration / 1e9,
 			vibration->frequency, vibration->amplitude );
 	return XR_SUCCESS;

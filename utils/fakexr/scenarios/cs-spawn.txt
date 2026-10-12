@@ -1,0 +1,16 @@
+# Counter-Strike VR: start de_dust2 (or $MAP via "con map" afterwards) with bots and spawn as a CT.
+# Use with: fakexr-run live <scenario> -game cstrike   (scenario: include cs-spawn.txt)
+# maxplayers must be set before the map: a console "map" keeps 1 slot (the menu's New Game sets it),
+# and with 1 slot the bots cannot join and the player is stuck dead after jointeam.
+wait-log "OpenXR: initialized" 60
+con developer 2
+con maxplayers 16
+mark
+con map de_dust2
+wait-log "Custom resource propagation complete" 120
+sleep 3
+con jointeam 2
+sleep 1
+con joinclass 1
+wait-log "game_round_freeze_end|ucmd->spawn" 60
+sleep 3

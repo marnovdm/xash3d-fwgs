@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Send directives to a running "fakexr-run --serve" session and print what they return.
+#
+# Usage: fakexr-ctl [-o <out dir>] <directive...>      one directive (the words are joined), e.g.
+#                                                      fakexr-ctl xr move right 0.3 -0.2 -0.5 0 0 0 0.25
+#        fakexr-ctl [-o <out dir>] -f <scenario>       every line of a scenario file, stopping at the first failure
+#        fakexr-ctl [-o <out dir>] stop                quit the game and end the session
+# The out dir defaults to $FAKEXR_OUT or ./fakexr-out, as for fakexr-run. Exit status = the directive's.
+set -euo pipefail
+
+out=${FAKEXR_OUT:-./fakexr-out}
+file=
+while [[ $# -gt 0 ]]; do
+	case $1 in
+	-o) out=$2; shift 2 ;;
+	-f) file=$2; shift 2 ;;
+	*) break ;;
+	esac
+done
+out=$(realpath -m "$out")
+ctl=$out/ctl
+[[ -p $ctl/in && -f $out/serve.pid ]] && kill -0 "$(cat "$out/serve.pid")" 2>/dev/null ||
+	{ echo "fakexr-ctl: no session serving in $out (start one with fakexr-run --serve)" >&2; exit 1; }
+
+send() {
+	local line=$1 id rc
+	id=$$-$RANDOM-$SECONDS
+	printf '%s\t%s\n' "$id" "$line" >"$ctl/in"
+	until [[ -f $ctl/$id.rc ]]; do
+		if ! kill -0 "$(cat "$out/serve.pid" 2>/dev/null)" 2>/dev/null; then
+			[[ $line == stop ]] && return 0
+			echo "fakexr-ctl: the session ended (see $out/game.log)" >&2
+			return 1
+		fi
+		sleep 0.05
+	done
+	cat "$ctl/$id.out"
+	rc=$(cat "$ctl/$id.rc")
+	rm -f "$ctl/$id.out" "$ctl/$id.rc"
+	return "$rc"
+}
+
+if [[ -n $file ]]; then
+	# include resolves relative to the session's working directory, so send absolute includes
+	dir=$(cd "$(dirname "$file")" && pwd)
+	while IFS= read -r line || [[ -n $line ]]; do
+		[[ $line =~ ^include[[:space:]]+([^/].*)$ && -f $dir/${BASH_REMATCH[1]} ]] && line="include $dir/${BASH_REMATCH[1]}"
+		send "$line" || { echo "fakexr-ctl: failed: $line" >&2; exit 1; }
+	done <"$file"
+else
+	[[ $# -ge 1 ]] || { sed -n '2,8p' "$0"; exit 2; }
+	send "$*"
+fi
