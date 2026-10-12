@@ -151,7 +151,9 @@ PNG (may reach outside it; `null` when behind the eye). Poses are `{"pos": [x, y
 Virtual PS VR2 Sense controllers: each run also creates the two evdev game controllers the kernel makes for the real
 Sense over Bluetooth ("PlayStation VR2 Sense Controller (L)/(R)", 054c:0e45/0e46, 6 axes, 20 buttons) via uinput
 (`fakexr-sense-devices`), so games find them through SDL as on the real setup (`FAKEXR_SENSE_DEVICES=0` = none).
-They exist system-wide for the duration of the run.
+They exist system-wide for the duration of the run. Runs refuse to start while SteamVR is running
+(`FAKEXR_ALLOW_DURING_VR=1` overrides): the GPU load would cost a VR game frames, and its gamepad code would see
+the two extra (idle) controllers. VR input itself is unaffected (SteamVR/Ignition read the real Sense over HID).
 
 Desktop isolation: test programs get no D-Bus session (`FAKEXR_DBUS=1` keeps it), so they cannot inhibit or wake
 the screensaver; verified with `dbus-monitor` (2026-10-12). A **locked/blanked desktop does not stall GPU tests**

@@ -57,7 +57,8 @@
 # FAKEXR_AUDIO (1 = real audio output; default silent: SDL dummy, OpenAL null, no PulseAudio/PipeWire), FAKEXR_DBUS (1 = give the program the desktop's
 # D-Bus session; default none, so it cannot inhibit/wake the screensaver), FAKEXR_OVERLAY (directory copied over
 # the thin root, e.g. freshly built libxash.so or valve/cl_dlls/client.so to test without installing),
-# FAKEXR_CACHE (shader/font cache, default ~/.cache/fakexr), FAKEXR_SENSE_DEVICES (0 = no virtual PS VR2 Sense
+# FAKEXR_ALLOW_DURING_VR (1 = run even while SteamVR runs; default refuse: GPU load + virtual gamepads would
+# disturb a VR game), FAKEXR_CACHE (shader/font cache, default ~/.cache/fakexr), FAKEXR_SENSE_DEVICES (0 = no virtual PS VR2 Sense
 # controllers as evdev gamepads; default on, like the real controllers over Bluetooth), plus the runtime's own FAKEXR_*.
 # The game's output goes to $OUT/game.log.
 set -euo pipefail
@@ -91,6 +92,12 @@ fi
 
 [[ -f $json ]] || { echo "fakexr-run: build the runtime first (make -C $here)" >&2; exit 1; }
 command -v bwrap >/dev/null || { echo "fakexr-run: bubblewrap (bwrap) is required for the write guard" >&2; exit 1; }
+# a test renders a full PS VR2 stereo image at 120 fps on the same GPU and plugs in two (idle) virtual gamepads:
+# it would cost a running VR game frames (reprojection) and may make it see extra controllers
+if pgrep -x vrcompositor >/dev/null && [[ ${FAKEXR_ALLOW_DURING_VR:-0} != 1 ]]; then
+	echo "fakexr-run: SteamVR is running (a VR game may be in use): not starting a test (FAKEXR_ALLOW_DURING_VR=1 overrides)" >&2
+	exit 1
+fi
 
 out=$(realpath -m "${FAKEXR_OUT:-./fakexr-out}")
 mkdir -p "$out"
