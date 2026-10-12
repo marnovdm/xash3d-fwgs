@@ -54,7 +54,7 @@
 # FAKEXR_GPU (1 = render on the GPU through VirtualGL, 0 = llvmpipe; default: GPU when vglrun is installed and
 # the desktop X server in $DISPLAY is reachable; FAKEXR_VGL_DEVICE overrides the 3D X server; on the GPU
 # FAKEXR_EYE_SIZE defaults to 2884, SteamVR's real width here, instead of 960),
-# FAKEXR_AUDIO (1 = real audio output; default silent SDL dummy driver), FAKEXR_DBUS (1 = give the program the desktop's
+# FAKEXR_AUDIO (1 = real audio output; default silent: SDL dummy, OpenAL null, no PulseAudio/PipeWire), FAKEXR_DBUS (1 = give the program the desktop's
 # D-Bus session; default none, so it cannot inhibit/wake the screensaver), FAKEXR_OVERLAY (directory copied over
 # the thin root, e.g. freshly built libxash.so or valve/cl_dlls/client.so to test without installing),
 # FAKEXR_CACHE (shader/font cache, default ~/.cache/fakexr), plus the runtime's own FAKEXR_*.
@@ -279,8 +279,12 @@ fi
 	cd "$root"
 	# SDL otherwise tickles org.freedesktop.ScreenSaver on the desktop's session bus (SimulateUserActivity),
 	# which wakes the real, blanked monitors although the game draws into Xvfb
+	# silent by default, whatever the program uses: SDL's dummy driver, OpenAL Soft's null backend, and unreachable
+	# PulseAudio/PipeWire servers for anything else (an OpenAL game, Doom 3 BFG VR / SelacoVR, otherwise played on the
+	# desktop's speakers)
 	audio=()
-	[[ ${FAKEXR_AUDIO:-0} == 1 ]] || audio=(SDL_AUDIODRIVER=dummy)
+	[[ ${FAKEXR_AUDIO:-0} == 1 ]] || audio=(SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null
+		PULSE_SERVER=unix:/nonexistent/fakexr-no-audio PIPEWIRE_REMOTE=/nonexistent/fakexr-no-audio)
 	# no D-Bus session for the test program: it cannot inhibit or wake the desktop's screensaver, post notifications
 	# or start services; an unreachable address also stops libdbus from auto-launching a bus (FAKEXR_DBUS=1 keeps it)
 	[[ ${FAKEXR_DBUS:-0} == 1 ]] || audio+=(DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/fakexr-no-session-bus)
