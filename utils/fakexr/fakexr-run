@@ -240,6 +240,10 @@ fi
 if [[ $gpu != 0 ]]; then
 	gpu=1
 	vgl=(vglrun -d "$vgl_device")
+	# VirtualGL copies the game's desktop window back into Xvfb every frame; the headset images come straight from
+	# the swapchains, so skip that: Doom 3 VR went from ~100 to the full 119.88 fps (FAKEXR_VGL_READBACK=1 keeps it,
+	# e.g. to screenshot the game's own window)
+	[[ ${FAKEXR_VGL_READBACK:-0} == 1 ]] || export VGL_READBACK=none
 	# VirtualGL renders through the desktop's X server: note whether it is blanked or locked (Source games under
 	# Proton stalled on the real desktop while the screensaver was up; whether GLX pbuffers do is being checked)
 	desk_state=$(xset -display "$vgl_device" q 2>/dev/null | sed -n 's/^ *Monitor is //p')

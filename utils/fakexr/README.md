@@ -56,7 +56,9 @@ runner links those in (`cstrike/custom/extras.pk3` holds the CS VR models and th
 `-game` is taken from the arguments (`fakexr-run live s.txt -game cstrike`), else `$FAKEXR_GAME`, else `valve`.
 Output (PNGs, JSON, `game.log`) goes to `$FAKEXR_OUT` (default `./fakexr-out`).
 
-Rendering: with VirtualGL installed the game's GL runs on the GPU at ~120 fps and 2884×2940 per eye; without it
+Rendering: with VirtualGL installed the game's GL runs on the GPU at the full 119.88 fps and 2884×2940 per eye (VirtualGL's
+per-frame copy of the game window into Xvfb is off, `VGL_READBACK=none`: it cost Doom 3 VR and Lambda1VR ~20 %; `FAKEXR_VGL_READBACK=1`
+keeps it); without it
 llvmpipe manages 7–17 fps at 960 px, too slow for anything that depends on motion over time. `FAKEXR_GPU=0/1`
 forces either. VirtualGL uses its GLX back end through the desktop's X server (`$DISPLAY`, hidden pbuffers: the
 game window stays in Xvfb and nothing appears on the monitors); without a reachable X server the runner falls back
