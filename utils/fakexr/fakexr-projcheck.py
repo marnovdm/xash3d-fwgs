@@ -102,6 +102,13 @@ def main():
         if np.abs(s["pos"] - shots[0]["pos"]).max() > 1e-3:
             sys.exit(f"{s['name']}: the eye moved ({s['pos']} vs {shots[0]['pos']}); turn with 'look'")
     base, turned = shots[0], shots[1:]
+    # a view that did not change at all means the scene is not live (menu, loading screen, stale image), not a
+    # projection error: say so instead of fitting noise
+    for t in turned:
+        if t["img"].shape == base["img"].shape and float(np.abs(t["img"] - base["img"]).mean()) * 255 < 0.5:
+            print(f"projection check: CANNOT TELL, {t['name'].rsplit('/', 1)[-1]} is the same image as the base "
+                  "(the view did not turn: not in a map, paused, or a stale image)")
+            sys.exit(2)
 
     best = (np.inf, 1.0, 1.0)
     for step, span, centre in ((0.05, 0.4, None), (0.01, 0.05, True), (0.002, 0.01, True)):
