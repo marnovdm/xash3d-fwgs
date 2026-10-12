@@ -9,13 +9,14 @@
 #              refused). Either way the game runs in a bubblewrap sandbox in which $HOME is read-only except the
 #              output and cache directories (and a copied root), so it cannot touch the install, its settings or saves.
 #   Directives, one per line (# comments; $OUT = the output directory):
-#     xr <command>                  fakexr control command (head/aim/grip/move/vel/track/input/state/status/exit)
+#     xr <command>                  fakexr control command (head/aim/grip/move/look/vel/track/input/fov/state/status/exit)
 #     con <command>                 engine console command (via -stdincmd)
 #     sleep <seconds>
-#     shot <name> [both|left|right] [layers] [rect=x0,y0,x1,y1] [px=<width>]
+#     shot <name> [both|left|right] [layers] [world] [rect=x0,y0,x1,y1] [px=<width>]
 #                                   composited view -> $OUT/<name>.png + <name>.json (layer poses, spaces and where
 #                                   each panel lands in the PNG); "layers" also writes each quad image to <name>.layerN.png;
-#                                   rect = only that part of the eye (normal-shot pixels), re-rendered with px as the longer side
+#                                   rect = only that part of the eye (normal-shot pixels), re-rendered with px as the longer side;
+#                                   world = the 3D view only, without the panels
 #     zoom <name> <shot> <layer> [left|right] [px] [margin %]
 #                                   re-render the area of a panel seen in an earlier shot, sharp (default 1024 px on the longer side)
 #     panel <shot> <layer> [left|right] [<margin px>]
@@ -25,13 +26,20 @@
 #     wait-log "<regex>" [seconds]  wait until the game log matches (default 60 s)
 #     expect-log "<regex>"          fail unless the log already matches
 #     log [<regex>]                 print the game log since the mark (lines matching regex)
-#     status                        print the runtime's poses, inputs, session state, measured fps
+#     status                        print the runtime's poses, inputs, session state, measured fps and the projection
+#                                   check (every frame: submitted fov/eye pose/pixel aspect vs what was handed out;
+#                                   mismatches are logged as "fakexr: projection mismatch")
+#     check-projection [left|right] [degrees]
+#                                   shoot the 3D view, turn the head about that eye (pitch, yaw, roll; default 12)
+#                                   and check that the images line up under the declared projection (catches an app
+#                                   that renders with another field of view or aspect ratio than it declares)
 #     include <file>                run another scenario file (relative to this one, or utils/fakexr/scenarios/)
 #
 # Environment: FAKEXR_OUT (default ./fakexr-out), FAKEXR_GAME (default: -game from the args, else valve),
 # FAKEXR_DISPLAY (use this X display instead of starting Xvfb), FAKEXR_SCREEN (Xvfb screen, default 1280x720x24),
-# FAKEXR_GPU (1 = render on the GPU through VirtualGL, 0 = llvmpipe; default 1 when vglrun is installed; on the
-# GPU FAKEXR_EYE_SIZE defaults to 2048 instead of 960),
+# FAKEXR_GPU (1 = render on the GPU through VirtualGL, 0 = llvmpipe; default: GPU when vglrun is installed and
+# the desktop X server in $DISPLAY is reachable; FAKEXR_VGL_DEVICE overrides the 3D X server; on the GPU
+# FAKEXR_EYE_SIZE defaults to 2048 instead of 960),
 # FAKEXR_AUDIO (1 = real audio output; default silent SDL dummy driver), FAKEXR_OVERLAY (directory copied over
 # the thin root, e.g. freshly built libxash.so or valve/cl_dlls/client.so to test without installing),
 # FAKEXR_CACHE (shader/font cache, default ~/.cache/fakexr), plus the runtime's own FAKEXR_*.
@@ -160,15 +168,31 @@ if [[ -z $display ]]; then
 	for _ in $(seq 1 50); do [[ -e /tmp/.X11-unix/X${display#:} ]] && break; sleep 0.1; done
 fi
 
-# ---- GPU through VirtualGL (GL goes to the GPU's EGL device, the window stays in Xvfb) ----
+# ---- GPU through VirtualGL: the game's window stays in Xvfb, its GL runs on the GPU ----
+# VirtualGL's GLX back end renders through the desktop's X server ($DISPLAY, usually :0) into hidden pbuffers
+# (nothing appears on the monitors). Its EGL back end (-d egl, needs no X server) is NOT used by default: with
+# VirtualGL 3.1.5 it hands the runtime the first rendered image of each swapchain forever (the engine renders
+# into its own framebuffers, which that back end mishandles), so every shot is stale.
 gpu=${FAKEXR_GPU:-auto}
 vgl=()
-if [[ $gpu == auto ]]; then
-	command -v vglrun >/dev/null && gpu=1 || gpu=0
+vgl_device=${FAKEXR_VGL_DEVICE:-}
+if [[ $gpu != 0 ]]; then
+	if ! command -v vglrun >/dev/null; then
+		[[ $gpu == 1 ]] && { echo "fakexr-run: FAKEXR_GPU=1 needs virtualgl + lib32-virtualgl" >&2; exit 1; }
+		gpu=0
+	elif [[ -z $vgl_device ]]; then
+		if [[ -n ${DISPLAY:-} ]] && xset -display "$DISPLAY" q >/dev/null 2>&1; then
+			vgl_device=$DISPLAY
+		else
+			[[ $gpu == 1 ]] && { echo "fakexr-run: GPU needs a reachable X server in \$DISPLAY (or FAKEXR_VGL_DEVICE)" >&2; exit 1; }
+			echo "fakexr-run: no X server reachable for VirtualGL, rendering on llvmpipe" >&2
+			gpu=0
+		fi
+	fi
 fi
-if [[ $gpu == 1 ]]; then
-	command -v vglrun >/dev/null || { echo "fakexr-run: FAKEXR_GPU=1 needs virtualgl + lib32-virtualgl" >&2; exit 1; }
-	vgl=(vglrun -d "${FAKEXR_VGL_DEVICE:-egl}")
+if [[ $gpu != 0 ]]; then
+	gpu=1
+	vgl=(vglrun -d "$vgl_device")
 	# the GPU keeps up with a headset-like resolution (PS VR2: 2000x2040 per eye), llvmpipe does not
 	export FAKEXR_EYE_SIZE=${FAKEXR_EYE_SIZE:-2048}
 fi
@@ -291,6 +315,25 @@ PY
 		local name x0 y0 x1 y1 dst
 		read -r name x0 y0 x1 y1 dst <<<"$rest"
 		crop box "$out/$name.png" "$x0" "$y0" "$x1" "$y1" "$out/${dst:-$name.crop}.png"
+		;;
+	check-projection)
+		# shots before/after turning the head about one eye; the fit tells whether the image uses the declared fov
+		local eye deg shots=() turn i=0
+		read -r eye deg <<<"$rest"
+		eye=${eye:-left} deg=${deg:-12}
+		printf 'look 0 0 0 %s\n' "$eye" >&3
+		sleep 0.5
+		take_shot projcheck-0 "$eye world" >/dev/null || return 1
+		shots+=("$out/projcheck-0.png")
+		for turn in "$deg 0 0" "0 $deg 0" "0 0 $deg"; do
+			i=$((i + 1))
+			printf 'look %s %s\n' "$turn" "$eye" >&3
+			sleep 0.5
+			take_shot "projcheck-$i" "$eye world" >/dev/null || return 1
+			shots+=("$out/projcheck-$i.png")
+		done
+		printf 'look 0 0 0 %s\n' "$eye" >&3
+		python3 -I "$here/fakexr-projcheck.py" "${shots[@]}"
 		;;
 	mark) mark=$(stat -c %s "$log") ;;
 	wait-log | expect-log)

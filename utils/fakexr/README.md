@@ -40,9 +40,12 @@ runner links those in (`cstrike/custom/extras.pk3` holds the CS VR models and th
 `-game` is taken from the arguments (`fakexr-run live s.txt -game cstrike`), else `$FAKEXR_GAME`, else `valve`.
 Output (PNGs, JSON, `game.log`) goes to `$FAKEXR_OUT` (default `./fakexr-out`).
 
-Rendering: with VirtualGL installed the game's GL runs on the GPU (`vglrun -d egl`; the window stays in the hidden
-Xvfb, the monitors are not touched) at ~90 fps and 2048 px per eye; without it llvmpipe manages 7–17 fps at 960 px,
-too slow for anything that depends on motion over time. `FAKEXR_GPU=0/1` forces either. Audio goes to SDL's dummy
+Rendering: with VirtualGL installed the game's GL runs on the GPU at ~90 fps and 2048 px per eye; without it
+llvmpipe manages 7–17 fps at 960 px, too slow for anything that depends on motion over time. `FAKEXR_GPU=0/1`
+forces either. VirtualGL uses its GLX back end through the desktop's X server (`$DISPLAY`, hidden pbuffers: the
+game window stays in Xvfb and nothing appears on the monitors); without a reachable X server the runner falls back
+to llvmpipe. Not the EGL back end (`-d egl`): with VirtualGL 3.1.5 it hands the runtime the first image of each
+swapchain forever, so every shot is stale (found 2026-10-12: head turns did not change the shots). Audio goes to SDL's dummy
 driver (silent) unless `FAKEXR_AUDIO=1`.
 
 ### Scenario directives
@@ -54,7 +57,7 @@ One per line, `#` comments, `$OUT` = the output directory:
 | `xr <command>` | runtime control command (below) |
 | `con <command>` | engine console command |
 | `sleep <s>` | wait |
-| `shot <name> [both\|left\|right] [layers] [rect=x0,y0,x1,y1] [px=N]` | composited view of the next frame → `<name>.png` + `<name>.json`; `layers` also writes each quad layer's image to `<name>.layerN.png`; `rect` renders only that part of the eye (pixels of a normal shot) with `px` as its longer side |
+| `shot <name> [both\|left\|right] [layers] [world] [rect=x0,y0,x1,y1] [px=N]` | composited view of the next frame → `<name>.png` + `<name>.json`; `layers` also writes each quad layer's image to `<name>.layerN.png`; `world` leaves the panels out; `rect` renders only that part of the eye (pixels of a normal shot) with `px` as its longer side |
 | `zoom <name> <shot> <layer> [left\|right] [px] [margin %]` | re-render the area of a panel seen in an earlier shot, sharp (default 1024 px) |
 | `panel <shot> <layer> [left\|right] [margin px]` | crop a panel out of a shot as it is (no re-render) |
 | `crop <shot> x0 y0 x1 y1 [name]` | crop a pixel box out of a shot |
@@ -62,7 +65,8 @@ One per line, `#` comments, `$OUT` = the output directory:
 | `wait-log "<regex>" [s]` | wait until the game log matches (default 60 s) |
 | `expect-log "<regex>"` | fail unless the log already matches |
 | `log ["<regex>"]` | print the game log since the mark |
-| `status` | print poses, held inputs, session state, measured fps |
+| `status` | print poses, held inputs, session state, measured fps, projection check counters |
+| `check-projection [left\|right] [degrees]` | rotation consistency test: 3D-only shots before and after turning the head about that eye (pitch, yaw, roll; default 12°), fitted by `fakexr-projcheck.py`; fails unless the image uses the declared field of view (scale 1.000 ± 2 %). Needs a still scene (not paused: the paused game fades the world to black) |
 | `include <file>` | run another scenario (relative to this one, or `scenarios/`) |
 
 Ready-made includes in `scenarios/`: `hl-start.txt` (c1a0, cheats, god, all weapons) and `cs-spawn.txt` (de_dust2
@@ -80,6 +84,8 @@ head starts at the origin:
 | `head x y z pitch yaw roll` | head pose (jump) |
 | `aim left\|right x y z pitch yaw roll` | controller aim pose (jump); the grip pose follows (`FAKEXR_GRIP_PITCH`) |
 | `grip left\|right x y z pitch yaw roll` | set the grip pose explicitly |
+| `look pitch yaw roll [left\|right]` | turn the head about that eye (the eye stays put: no parallax) |
+| `fov left\|right\|both l r u d` | field of view handed out (degrees, left/down negative) |
 | `move head\|left\|right x y z pitch yaw roll <s> [smooth\|linear]` | move there over time; the matching linear and angular velocity is reported meanwhile, so throws and swing gestures work like with a real arm |
 | `vel left\|right vx vy vz` | extra controller linear velocity (m/s, kept until set again), added to a move's |
 | `track left\|right 0\|1` | controller tracked |
@@ -93,9 +99,27 @@ The runtime presents Touch controllers (`FAKEXR_PROFILE`), like SteamVR does for
 On the Touch layout Triangle = left `y/click`, Square = left `x/click`, Cross/Circle = right `a/click`/`b/click`,
 Options = left `menu/click`.
 
+### Projection checks
+
+Two checks catch an app that renders with another field of view or aspect ratio than it declares (Black Mesa VR
+squashed the world ~29 % vertically that way; here it would read "vertical 0.710"):
+
+1. **Every frame** (runtime): the fov and eye pose each projection view says it used are compared with what
+   `xrLocateViews` handed out, and the image's pixel aspect with that fov. Mismatches are logged as
+   `fakexr: projection mismatch ...`; `status` prints the counters and worst values; the shot JSON has them per eye.
+2. **`check-projection`** (image based): without parallax, a turned view must line up with the base view under the
+   declared projection; the fit reports the real horizontal/vertical scale. Self-test: `fakexr-projcheck.py
+   --declared-scale 1.1 0.8 <shots>` must report 0.909 / 1.250.
+
+Default field of view: 52° out, 44° in, 48° up and 48.6° down per eye, so the vertical tan extent equals the
+horizontal one and the recommended square image has square pixels (until 2026-10-12 it was 52° down, which made
+every image's pixels 6 % taller than wide).
+
 ### The shot JSON
 
-`frame`, `session`, `eye_size`, `shot_size`, `rect`, the head and both hands' aim/grip poses, and per layer: type,
+`frame`, `session`, `eye_size`, `shot_size`, `rect`, `world_only`, `eye_left`/`eye_right` (pose, fov in degrees,
+and `check`: fov/pose/pixel-aspect difference of the submitted view), the head and both hands' aim/grip poses, and
+per layer: type,
 space (`local`/`view`/`stage` or `<hand> aim|grip <action>`), `tracked`, `eye`, `size` (m), swapchain image size,
 `pose` (LOCAL), `from_head` (pose in the head's frame) and `png_left`/`png_right` = the panel's pixel box in this
 PNG (may reach outside it; `null` when behind the eye). Poses are `{"pos": [x, y, z], "ang": [pitch, yaw, roll]}`.

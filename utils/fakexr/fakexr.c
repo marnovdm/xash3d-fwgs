@@ -23,18 +23,25 @@ Control commands, one per line (angles in degrees, positions in metres, OpenXR L
   move  head|left|right <x> <y> <z> <pitch> <yaw> <roll> <seconds> [smooth|linear]
                                                       move there over time (smooth = ease in/out, the default);
                                                       the matching linear/angular velocity is reported meanwhile
+  look  <pitch> <yaw> <roll> [left|right]             turn the head to these angles about that eye (default left):
+                                                      the eye stays put, a pure rotation of its view (no parallax)
   vel   left|right <vx> <vy> <vz>                     extra linear velocity (m/s), added to a move's own
   state focused|visible|synchronized                  session state, stepping through the ones between: visible =
                                                       dashboard (inputs inactive), synchronized = headset asleep
                                                       (shouldRender false)
-  status                                              log poses, active inputs, session state and the measured fps
-  shot  <file.png> [both|left|right] [layers] [rect=x0,y0,x1,y1] [px=<n>]
+  fov   left|right|both <left> <right> <up> <down>    field of view handed out, degrees (left/down negative)
+  status                                              log poses, active inputs, session state, measured fps and the
+                                                      projection check (below)
+  shot  <file.png> [both|left|right] [layers] [world] [rect=x0,y0,x1,y1] [px=<n>]
                                                       composite the next submitted frame (written atomically) plus
                                                       <file>.json (every layer's space, pose, size and box in the
                                                       PNG); layers = each quad's image too; rect = that part of the
-                                                      eye only (pixels of a normal shot), px = its longer side
+                                                      eye only (pixels of a normal shot), px = its longer side;
+                                                      world = projection layers only (no panels)
   exit                                                ask the application to end the session
-Haptic pulses are logged ("fakexr: haptic ...").
+Haptic pulses are logged ("fakexr: haptic ..."). Every submitted frame is checked against what LocateViews handed
+out: each projection view's fov and eye pose, and whether its image's pixel aspect fits that fov; a difference is
+logged as "fakexr: projection mismatch ..." (an app rendering one aspect/fov while declaring another).
 Environment: FAKEXR_CONTROL (FIFO path), FAKEXR_EYE_SIZE (default 960), FAKEXR_FPS (default 90, 0 = unthrottled),
 FAKEXR_PROFILE (default /interaction_profiles/oculus/touch_controller), FAKEXR_GRIP_PITCH (aim -> grip pitch, default 0),
 FAKEXR_IPD (default 0.064), FAKEXR_VERBOSE (1 = log every call that fails).
@@ -342,11 +349,22 @@ static struct
 	char shot_path[1024];
 	int shot_eyes; /* bit 0 left, bit 1 right */
 	int shot_layers; /* also write every quad layer's image */
+	int shot_world; /* projection layers only (no panels) */
 	float shot_rect[4]; /* part of each eye to show: u0 v0 u1 v1, 0..1, top-left origin (zoom) */
 	uint32_t shot_width, shot_height; /* output size per eye */
 	GLuint compose_fbo, compose_texture;
 	uint32_t compose_width, compose_height;
 	uint64_t haptic_count;
+
+	/* projection check: what LocateViews gave (LOCAL eye poses + fov) vs what each frame says it rendered */
+	XrPosef given_pose[2];
+	XrFovf given_fov[2];
+	int views_given;
+	uint64_t projection_frames, projection_bad_frames;
+	float worst_fov_deg, worst_pos_mm, worst_rot_deg, worst_aspect;
+	char last_projection_problem[256];
+	struct timespec last_projection_log;
+	struct { float fov_deg, pos_mm, rot_deg, aspect; int valid; } frame_check[2]; /* this frame, for the shot json */
 } rt;
 
 static const char *PathString( XrPath path )
@@ -472,6 +490,7 @@ static void UpdateGrip( int hand )
 
 static XrTime NowNs( void );
 static void PushSessionState( XrSessionState state );
+static XrPosef EyePose( int eye );
 
 /* the pose a motion slot drives */
 static XrPosef *MotionTarget( int slot )
@@ -614,11 +633,48 @@ static void ControlCommand( char *line )
 		else if( !strcmp( side, "synchronized" )) SetRunningState( XR_SESSION_STATE_SYNCHRONIZED );
 		else Log( "state: focused, visible or synchronized" );
 	}
+	else if( !strcmp( word, "look" ) && sscanf( line, "%*s %f %f %f", &v[0], &v[1], &v[2] ) == 3 )
+	{
+		/* turn the head to these angles about one eye (default left), so that eye does not move: a pure rotation
+		 * of its view, no parallax (for comparing shots) */
+		int eye = 0;
+		XrPosef eye_pose, offset = PoseIdentity();
+		XrVector3f r;
+
+		if( sscanf( line, "%*s %*f %*f %*f %15s", side ) == 1 && !strcmp( side, "right" ))
+			eye = 1;
+		eye_pose = EyePose( eye );
+		offset.position.x = eye ? rt.ipd * 0.5f : -rt.ipd * 0.5f;
+		rt.motion[MOTION_HEAD].active = 0;
+		memset( &rt.motion[MOTION_HEAD].linear, 0, sizeof( rt.motion[MOTION_HEAD].linear ));
+		memset( &rt.motion[MOTION_HEAD].angular, 0, sizeof( rt.motion[MOTION_HEAD].angular ));
+		rt.head.orientation = QuatFromAngles( v[0], v[1], v[2] );
+		r = QuatRotate( rt.head.orientation, offset.position );
+		rt.head.position.x = eye_pose.position.x - r.x;
+		rt.head.position.y = eye_pose.position.y - r.y;
+		rt.head.position.z = eye_pose.position.z - r.z;
+	}
+	else if( !strcmp( word, "fov" ) && sscanf( line, "%*s %15s %f %f %f %f", side, &v[0], &v[1], &v[2], &v[3] ) == 5 )
+	{
+		/* fov left|right|both <left> <right> <up> <down> in degrees, as OpenXR angles (left/down negative) */
+		for( int eye = 0; eye < 2; ++eye )
+		{
+			if(( eye == 0 && !strcmp( side, "right" )) || ( eye == 1 && !strcmp( side, "left" )))
+				continue;
+			rt.fov[eye].angleLeft = DEG2RAD( v[0] );
+			rt.fov[eye].angleRight = DEG2RAD( v[1] );
+			rt.fov[eye].angleUp = DEG2RAD( v[2] );
+			rt.fov[eye].angleDown = DEG2RAD( v[3] );
+		}
+	}
 	else if( !strcmp( word, "status" ))
 	{
 		Log( "status: frame %llu, %.1f fps measured, session %s, %llu haptic pulses",
 			(unsigned long long)rt.frame_index, rt.frame_interval > 0 ? 1.0f / rt.frame_interval : 0.0f,
 			SessionStateName( rt.session_state ), (unsigned long long)rt.haptic_count );
+		Log( "  projection: %llu of %llu frames off; worst fov %.2f deg, pose %.1f mm %.2f deg, pixel aspect %.3f",
+			(unsigned long long)rt.projection_bad_frames, (unsigned long long)rt.projection_frames,
+			rt.worst_fov_deg, rt.worst_pos_mm, rt.worst_rot_deg, rt.worst_aspect > 0 ? rt.worst_aspect : 1.0f );
 		LogPose( "head", rt.head, 1 );
 		LogPose( "left aim", rt.hands[0].aim, rt.hands[0].tracked );
 		LogPose( "left grip", rt.hands[0].grip, rt.hands[0].tracked );
@@ -682,6 +738,7 @@ static void ControlCommand( char *line )
 
 		rt.shot_eyes = 3;
 		rt.shot_layers = 0;
+		rt.shot_world = 0;
 		rt.shot_rect[0] = rt.shot_rect[1] = 0.0f;
 		rt.shot_rect[2] = rt.shot_rect[3] = 1.0f;
 		for( token = strtok_r( line, " \t", &save ); token; token = strtok_r( NULL, " \t", &save ))
@@ -692,6 +749,7 @@ static void ControlCommand( char *line )
 			else if( !strcmp( token, "right" )) rt.shot_eyes = 2;
 			else if( !strcmp( token, "both" )) rt.shot_eyes = 3;
 			else if( !strcmp( token, "layers" )) rt.shot_layers = 1;
+			else if( !strcmp( token, "world" )) rt.shot_world = 1;
 			else if( sscanf( token, "rect=%f,%f,%f,%f", &r[0], &r[1], &r[2], &r[3] ) == 4 && r[2] > r[0] && r[3] > r[1] )
 			{
 				for( int k = 0; k < 4; ++k )
@@ -1010,7 +1068,7 @@ static void ComposeEye( int eye, const XrFrameEndInfo *info, int x_offset )
 			glTexCoord2f( uv[0], uv[3] ); glVertex2f( 0, 1 );
 			glEnd();
 		}
-		else if( base->type == XR_TYPE_COMPOSITION_LAYER_QUAD )
+		else if( base->type == XR_TYPE_COMPOSITION_LAYER_QUAD && !rt.shot_world )
 		{
 			const XrCompositionLayerQuad *quad = (const XrCompositionLayerQuad *)base;
 			XrPosef space_pose, quad_pose;
@@ -1172,6 +1230,85 @@ static void Compose( const XrFrameEndInfo *info )
 }
 
 
+
+/* ---------- projection check ---------- */
+
+#define RAD2DEG( a ) (( a ) * 180.0f / (float)M_PI )
+
+/* Compare every projection view the app submits with what LocateViews handed out: field of view, eye pose, and
+ * whether the image's pixel aspect fits the declared field of view (a squashed/stretched world otherwise). Logs
+ * "fakexr: projection mismatch ..." (at most once a second, and whenever the problem changes) and counts frames. */
+static void CheckProjection( const XrFrameEndInfo *info )
+{
+	char problem[256] = "";
+
+	rt.frame_check[0].valid = rt.frame_check[1].valid = 0;
+	if( !rt.views_given )
+		return;
+	for( uint32_t i = 0; i < info->layerCount; ++i )
+	{
+		const XrCompositionLayerProjection *proj = (const XrCompositionLayerProjection *)info->layers[i];
+		XrPosef space_pose;
+
+		if( proj->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION || !SpacePose( SpaceFromHandle( proj->space ), &space_pose ))
+			continue;
+		for( uint32_t eye = 0; eye < proj->viewCount && eye < 2; ++eye )
+		{
+			const XrCompositionLayerProjectionView *pv = &proj->views[eye];
+			XrPosef pose = PoseMul( space_pose, pv->pose );
+			XrFovf g = rt.given_fov[eye], f = pv->fov;
+			XrVector3f axis;
+			float fov_deg = 0, pos_mm, rot_deg, aspect, a[4], b[4];
+			float w = (float)pv->subImage.imageRect.extent.width, h = (float)pv->subImage.imageRect.extent.height;
+
+			a[0] = g.angleLeft; a[1] = g.angleRight; a[2] = g.angleUp; a[3] = g.angleDown;
+			b[0] = f.angleLeft; b[1] = f.angleRight; b[2] = f.angleUp; b[3] = f.angleDown;
+			for( int k = 0; k < 4; ++k )
+				fov_deg = fmaxf( fov_deg, fabsf( RAD2DEG( a[k] - b[k] )));
+			pos_mm = 1000.0f * sqrtf(( pose.position.x - rt.given_pose[eye].position.x ) * ( pose.position.x - rt.given_pose[eye].position.x ) +
+				( pose.position.y - rt.given_pose[eye].position.y ) * ( pose.position.y - rt.given_pose[eye].position.y ) +
+				( pose.position.z - rt.given_pose[eye].position.z ) * ( pose.position.z - rt.given_pose[eye].position.z ));
+			rot_deg = RAD2DEG( QuatDelta( rt.given_pose[eye].orientation, pose.orientation, &axis ));
+			/* pixel aspect: (image w / h) against (tan extent x / tan extent y) of the fov it says it used */
+			aspect = ( h > 0 ) ? ( w / h ) / (( tanf( f.angleRight ) - tanf( f.angleLeft )) / ( tanf( f.angleUp ) - tanf( f.angleDown ))) : 1.0f;
+
+			rt.frame_check[eye].fov_deg = fov_deg;
+			rt.frame_check[eye].pos_mm = pos_mm;
+			rt.frame_check[eye].rot_deg = rot_deg;
+			rt.frame_check[eye].aspect = aspect;
+			rt.frame_check[eye].valid = 1;
+			rt.worst_fov_deg = fmaxf( rt.worst_fov_deg, fov_deg );
+			rt.worst_pos_mm = fmaxf( rt.worst_pos_mm, pos_mm );
+			rt.worst_rot_deg = fmaxf( rt.worst_rot_deg, rot_deg );
+			if( fabsf( aspect - 1.0f ) > fabsf( rt.worst_aspect - 1.0f ))
+				rt.worst_aspect = aspect;
+
+			if( !problem[0] && ( fov_deg > 0.05f || pos_mm > 0.5f || rot_deg > 0.05f || fabsf( aspect - 1.0f ) > 0.01f ))
+			{
+				snprintf( problem, sizeof( problem ),
+					"%s eye: fov given %.1f/%.1f/%.1f/%.1f submitted %.1f/%.1f/%.1f/%.1f deg (l/r/u/d), pose off %.1f mm %.2f deg, "
+					"pixel aspect %.3f (image %ux%u)", eye ? "right" : "left",
+					RAD2DEG( g.angleLeft ), RAD2DEG( g.angleRight ), RAD2DEG( g.angleUp ), RAD2DEG( g.angleDown ),
+					RAD2DEG( f.angleLeft ), RAD2DEG( f.angleRight ), RAD2DEG( f.angleUp ), RAD2DEG( f.angleDown ),
+					pos_mm, rot_deg, aspect, pv->subImage.imageRect.extent.width, pv->subImage.imageRect.extent.height );
+			}
+		}
+	}
+	rt.projection_frames++;
+	if( problem[0] )
+	{
+		struct timespec now;
+		clock_gettime( CLOCK_MONOTONIC, &now );
+		rt.projection_bad_frames++;
+		if( strcmp( problem, rt.last_projection_problem ) || now.tv_sec - rt.last_projection_log.tv_sec >= 1 )
+		{
+			Log( "projection mismatch (frame %llu): %s", (unsigned long long)rt.frame_index, problem );
+			rt.last_projection_log = now;
+		}
+	}
+	snprintf( rt.last_projection_problem, sizeof( rt.last_projection_problem ), "%s", problem );
+}
+
 /* ---------- shot metadata (<shot>.json) ---------- */
 
 static void JsonPose( FILE *f, XrPosef p )
@@ -1252,6 +1389,19 @@ static void WriteShotJSON( const XrFrameEndInfo *info )
 		rt.shot_eyes == 3 ? "both" : rt.shot_eyes == 2 ? "right" : "left" );
 	fprintf( f, "\"shot_size\": [%u, %u], \"rect\": [%.1f, %.1f, %.1f, %.1f],\n", rt.shot_width, rt.shot_height,
 		rt.shot_rect[0] * rt.eye_size, rt.shot_rect[1] * rt.eye_size, rt.shot_rect[2] * rt.eye_size, rt.shot_rect[3] * rt.eye_size );
+	fprintf( f, "\"world_only\": %s,\n", rt.shot_world ? "true" : "false" );
+	for( int eye = 0; eye < 2; ++eye )
+	{
+		XrFovf fv = rt.fov[eye];
+		fprintf( f, "\"eye_%s\": {\"pose\": ", eye ? "right" : "left" );
+		JsonPose( f, EyePose( eye ));
+		fprintf( f, ", \"fov\": [%.4f, %.4f, %.4f, %.4f]", RAD2DEG( fv.angleLeft ), RAD2DEG( fv.angleRight ),
+			RAD2DEG( fv.angleUp ), RAD2DEG( fv.angleDown ));
+		if( rt.frame_check[eye].valid )
+			fprintf( f, ", \"check\": {\"fov_deg\": %.3f, \"pos_mm\": %.2f, \"rot_deg\": %.3f, \"pixel_aspect\": %.4f}",
+				rt.frame_check[eye].fov_deg, rt.frame_check[eye].pos_mm, rt.frame_check[eye].rot_deg, rt.frame_check[eye].aspect );
+		fprintf( f, "},\n" );
+	}
 	fprintf( f, "\"head\": " ); JsonPose( f, rt.head );
 	for( int h = 0; h < 2; ++h )
 	{
@@ -1342,7 +1492,11 @@ static XrResult XRAPI_CALL EnumerateInstanceExtensionProperties( const char *lay
 static void InitDefaults( void )
 {
 	const char *env;
-	float l = DEG2RAD( 52.0f ), r = DEG2RAD( 44.0f ), u = DEG2RAD( 48.0f ), d = DEG2RAD( 52.0f );
+	float l = DEG2RAD( 52.0f ), r = DEG2RAD( 44.0f ), u = DEG2RAD( 48.0f ), d;
+
+	/* the down angle makes the vertical extent equal the horizontal one: the recommended image is square, so
+	 * pixels stay square (it was 52 deg, which made every image 6 % taller per pixel than wide) */
+	d = atanf( tanf( l ) + tanf( r ) - tanf( u ));
 
 	memset( &rt, 0, sizeof( rt ));
 	rt.control_fd = -1;
@@ -1755,7 +1909,10 @@ static XrResult XRAPI_CALL LocateViews( XrSession session, const XrViewLocateInf
 	{
 		views[i].pose = PoseMul( PoseInv( base ), EyePose( i ));
 		views[i].fov = rt.fov[i];
+		rt.given_pose[i] = EyePose( i );
+		rt.given_fov[i] = rt.fov[i];
 	}
+	rt.views_given = 1;
 	state->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
 		XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT;
 	return XR_SUCCESS;
@@ -1905,6 +2062,7 @@ static XrResult XRAPI_CALL EndFrame( XrSession session, const XrFrameEndInfo *in
 	(void)session;
 	CHECK_TYPE( info, XR_TYPE_FRAME_END_INFO );
 	rt.frame_index++;
+	CheckProjection( info );
 	if( rt.shot_path[0] )
 	{
 		WriteShotJSON( info ); /* before the PNG: the runner waits for the PNG */
