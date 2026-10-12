@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Virtual PS VR2 Sense controllers for tests: two evdev game controllers like the ones the kernel creates when the
+real Sense controllers connect over Bluetooth (hid-generic: "PlayStation VR2 Sense Controller (L)" 054c:0e45 and
+"(R)" 054c:0e46, bus 0005, 6 axes, 20 buttons). Games see them through SDL/evdev exactly as on the desktop with the
+headset in use (Doom 3 BFG VR crashed with them present while headless tests had none).
+
+Usage: fakexr-sense-devices [--ready-file PATH]   creates both, writes PATH when ready, stays until SIGTERM/SIGINT.
+Needs write access to /dev/uinput (this PC: ACL for the user). The devices are system-wide while they exist.
+"""
+import signal, sys, time
+from evdev import UInput, AbsInfo, ecodes as e
+
+# 20 buttons, 6 axes (HID ranges 0..255, centre 128)
+BUTTONS = [e.BTN_SOUTH, e.BTN_EAST, e.BTN_C, e.BTN_NORTH, e.BTN_WEST, e.BTN_Z, e.BTN_TL, e.BTN_TR, e.BTN_TL2,
+           e.BTN_TR2, e.BTN_SELECT, e.BTN_START, e.BTN_MODE, e.BTN_THUMBL, e.BTN_THUMBR,
+           e.BTN_TRIGGER_HAPPY1, e.BTN_TRIGGER_HAPPY2, e.BTN_TRIGGER_HAPPY3, e.BTN_TRIGGER_HAPPY4, e.BTN_TRIGGER_HAPPY5]
+AXES = [e.ABS_X, e.ABS_Y, e.ABS_Z, e.ABS_RX, e.ABS_RY, e.ABS_RZ]
+
+
+def make(side, product):
+	caps = {
+		e.EV_KEY: BUTTONS,
+		e.EV_ABS: [(a, AbsInfo(value=128 if a in (e.ABS_X, e.ABS_Y, e.ABS_RX, e.ABS_RY) else 0, min=0, max=255,
+			fuzz=0, flat=0, resolution=0)) for a in AXES],
+	}
+	return UInput(caps, name=f'PlayStation VR2 Sense Controller ({side})', bustype=e.BUS_BLUETOOTH,
+		vendor=0x054c, product=product, version=0x0100)
+
+
+devices = [make('L', 0x0e45), make('R', 0x0e46)]
+for d in devices:
+	print(f'fakexr-sense-devices: {d.name} at {d.device.path}', flush=True)
+if '--ready-file' in sys.argv:
+	open(sys.argv[sys.argv.index('--ready-file') + 1], 'w').close()
+
+running = True
+def stop(*_):
+	global running
+	running = False
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+while running:
+	time.sleep(0.2)
+for d in devices:
+	d.close()

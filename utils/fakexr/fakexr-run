@@ -57,7 +57,8 @@
 # FAKEXR_AUDIO (1 = real audio output; default silent: SDL dummy, OpenAL null, no PulseAudio/PipeWire), FAKEXR_DBUS (1 = give the program the desktop's
 # D-Bus session; default none, so it cannot inhibit/wake the screensaver), FAKEXR_OVERLAY (directory copied over
 # the thin root, e.g. freshly built libxash.so or valve/cl_dlls/client.so to test without installing),
-# FAKEXR_CACHE (shader/font cache, default ~/.cache/fakexr), plus the runtime's own FAKEXR_*.
+# FAKEXR_CACHE (shader/font cache, default ~/.cache/fakexr), FAKEXR_SENSE_DEVICES (0 = no virtual PS VR2 Sense
+# controllers as evdev gamepads; default on, like the real controllers over Bluetooth), plus the runtime's own FAKEXR_*.
 # The game's output goes to $OUT/game.log.
 set -euo pipefail
 
@@ -184,12 +185,13 @@ con_fifo=$work/console.fifo
 mkfifo "$xr_fifo" "$con_fifo"
 ctl_dir=$out/ctl
 
-xvfb_pid= game_pid=
+xvfb_pid= game_pid= sense_pid=
 cleanup() {
 	[[ -n $game_pid ]] && kill "$game_pid" 2>/dev/null || true
+	[[ -n $sense_pid ]] && kill "$sense_pid" 2>/dev/null || true
 	[[ -n $xvfb_pid ]] && kill "$xvfb_pid" 2>/dev/null || true
 	exec 3>&- 4>&- 5>&- 2>/dev/null || true
-	rm -f "$xr_fifo" "$con_fifo" "$out/serve.pid"
+	rm -f "$xr_fifo" "$con_fifo" "$out/serve.pid" "$work/sense-ready"
 	rmdir "$work" 2>/dev/null || true
 	if [[ -n $rodir ]]; then
 		# belt and braces next to the sandbox: report anything in the install newer than this run's start
@@ -256,6 +258,21 @@ if [[ $gpu != 0 ]]; then
 	echo "fakexr-run: desktop $vgl_device for VirtualGL: monitor ${desk_state:-unknown}" >&2
 	# the GPU keeps up with the real thing: SteamVR asks for 2884x2940 per eye on this PC (llvmpipe does not)
 	export FAKEXR_EYE_SIZE=${FAKEXR_EYE_SIZE:-2884}
+fi
+
+# ---- the PS VR2 Sense controllers as the desktop sees them (evdev game controllers, like the real ones over
+# Bluetooth): games find them through SDL, as they do on the real setup (Doom 3 BFG VR crashed with them present
+# while headless runs had none). System-wide while the run lasts. FAKEXR_SENSE_DEVICES=0 = none.
+if [[ ${FAKEXR_SENSE_DEVICES:-1} != 0 ]]; then
+	if [[ -w /dev/uinput ]] && python3 -c 'import evdev' 2>/dev/null; then
+		"$here/fakexr-sense-devices" --ready-file "$work/sense-ready" >"$out/sense-devices.log" 2>&1 &
+		sense_pid=$!
+		for _ in $(seq 1 30); do [[ -e $work/sense-ready ]] && break; sleep 0.1; done
+		sleep 0.5 # let udev give the new nodes their permissions
+		[[ -e $work/sense-ready ]] || echo "fakexr-run: virtual Sense controllers did not start (see sense-devices.log)" >&2
+	else
+		echo "fakexr-run: no virtual Sense controllers (needs a writable /dev/uinput and python-evdev)" >&2
+	fi
 fi
 
 # ---- sandbox: $HOME read-only except what this run may write ----
