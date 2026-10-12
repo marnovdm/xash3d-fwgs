@@ -444,6 +444,7 @@ PY
 		[[ $cmd != release ]] && printf 'input %s 1\n' "$path" >&3
 		if [[ $cmd == press ]]; then sleep "${secs:-0.2}"; fi
 		[[ $cmd != hold ]] && printf 'input %s 0\n' "$path" >&3
+		return 0 # the test above is false for hold, which would end the case with status 1
 		;;
 	key)
 		local win
