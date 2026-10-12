@@ -23,7 +23,7 @@ static CVAR_DEFINE_AUTO( vr_comfort_moving, "0", 0, "whether VR locomotion is ac
 static CVAR_DEFINE_AUTO( vr_turn_angle, "45", FCVAR_ARCHIVE, "snap-turn angle, or smooth-turn speed basis" );
 static CVAR_DEFINE_AUTO( vr_smoothturn, "1", FCVAR_ARCHIVE, "use continuous turning instead of snap turning" );
 static CVAR_DEFINE_AUTO( vr_walkdirection, "1", FCVAR_ARCHIVE, "movement direction: 0 off-hand, 1 head" );
-static CVAR_DEFINE_AUTO( vr_swap_jumpduck, "1", FCVAR_ARCHIVE, "1: primary (Cross/A) jumps, secondary (Circle/B) ducks, like HL2VR; 0: Lambda1VR layout" );
+static CVAR_DEFINE_AUTO( vr_swap_jumpduck, "1", FCVAR_ARCHIVE, "1: primary button (Cross/A) jumps, secondary (Circle/B) ducks; 0: the reverse (original Lambda1VR layout)" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_threshold, "0.85", FCVAR_ARCHIVE, "stick deflection (0-1) that opens/steps the weapon menu; must also be mostly vertical" );
 static CVAR_DEFINE_AUTO( vr_ladder_aim, "0", FCVAR_ARCHIVE, "ladder climb direction: 0 look up/down (head), 1 point the off-hand controller" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_up_next, "0", FCVAR_ARCHIVE, "weapon menu stick direction: 0 up = previous weapon, down = next (Lambda1VR); 1 up = next" );
