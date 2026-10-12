@@ -15,7 +15,7 @@ layers (projection + quads) the way a real compositor would and writes the resul
 Control commands, one per line (angles in degrees, positions in metres, OpenXR LOCAL space:
 +X right, +Y up, -Z forward; pitch + = up, yaw + = left, roll + = tilt left):
   head  <x> <y> <z> <pitch> <yaw> <roll>
-  aim   left|right <x> <y> <z> <pitch> <yaw> <roll>   controller aim pose (grip follows, see FAKEXR_GRIP_PITCH)
+  aim   left|right <x> <y> <z> <pitch> <yaw> <roll>   controller aim pose (grip follows: psvr2 = Sony's Sense offset)
   grip  left|right <x> <y> <z> <pitch> <yaw> <roll>   override the grip pose
   track left|right 0|1                                controller tracked or not
   input left|right <component> <value> [<y>]          e.g. "input right trigger/value 1", "input left thumbstick 0 1",
@@ -46,7 +46,8 @@ Environment: FAKEXR_PRESET (psvr2 = this PC's PS VR2 via SteamVR + Ignition, the
 and 119.88 Hz; square = the old square eye), FAKEXR_EYE_SIZE (image width, default 960; the height follows the
 preset), FAKEXR_FPS (default 119.88 for psvr2, 90 for square; 0 = unthrottled), FAKEXR_API_MAX (OpenXR versions accepted:
 1.0 like SteamVR 2.18, or 1.1), FAKEXR_FLOOR (STAGE floor below the start, 1.65 m),
-FAKEXR_PROFILE (default /interaction_profiles/oculus/touch_controller), FAKEXR_GRIP_PITCH (aim -> grip pitch, default 0),
+FAKEXR_PROFILE (default /interaction_profiles/oculus/touch_controller), FAKEXR_GRIP_PITCH (extra grip pitch in degrees on top of
+the preset's aim -> grip relation: psvr2 = Sony's Sense values, grip 60 deg above aim; e.g. -15 to try a global tilt),
 FAKEXR_IPD (default 0.064), FAKEXR_VERBOSE (1 = log every call that fails).
 */
 
@@ -387,6 +388,7 @@ static struct
 	uint32_t eye_w, eye_h; /* recommended per-eye image */
 	float fps;
 	float grip_pitch;
+	XrPosef grip_from_aim; /* the controller's grip pose in its aim pose's frame (psvr2: Sony's Sense values) */
 	float floor; /* LOCAL origin height above the STAGE floor */
 	XrFovf fov[2];
 
@@ -535,9 +537,9 @@ static void UpdateGrip( int hand )
 {
 	if( !rt.hands[hand].grip_override )
 	{
-		XrPosef offset = PoseIdentity();
-		offset.orientation = QuatAxisAngle( 1, 0, 0, DEG2RAD( rt.grip_pitch ));
-		rt.hands[hand].grip = PoseMul( rt.hands[hand].aim, offset );
+		XrPosef extra = PoseIdentity();
+		extra.orientation = QuatAxisAngle( 1, 0, 0, DEG2RAD( rt.grip_pitch ));
+		rt.hands[hand].grip = PoseMul( PoseMul( rt.hands[hand].aim, rt.grip_from_aim ), extra );
 	}
 }
 
@@ -1770,6 +1772,20 @@ static void InitDefaults( void )
 	rt.eye_h = psvr2 ? (uint32_t)( rt.eye_w * 2940.0f / 2884.0f + 0.5f ) : rt.eye_w;
 	rt.fps = ( env = getenv( "FAKEXR_FPS" )) ? (float)atof( env ) : psvr2 ? 119.88f : 90.0f;
 	rt.grip_pitch = ( env = getenv( "FAKEXR_GRIP_PITCH" )) ? (float)atof( env ) : 0.0f;
+	rt.grip_from_aim = PoseIdentity();
+	if( psvr2 )
+	{
+		/* Sony's SteamVR driver defines the Sense poses in its render models (resources/rendermodels/
+		 * playstation_vr2_sense_*.json): openxr_aim origin (+-0.007, -0.03895, 0.00950), pitch -39.4 deg;
+		 * openxr_grip origin (+-0.007, -0.00183, 0.10195), pitch +20.6 deg. So the grip a game holds weapons by is
+		 * pitched 60 deg up from the aim ray and sits ~3 cm below / 9.5 cm behind it: grip = aim * inv(aim_c) * grip_c */
+		XrPosef aim_c = PoseIdentity(), grip_c = PoseIdentity();
+		aim_c.position.y = -0.03894766f; aim_c.position.z = 0.00949694f;
+		aim_c.orientation = QuatAxisAngle( 1, 0, 0, DEG2RAD( -39.4f ));
+		grip_c.position.y = -0.00182941f; grip_c.position.z = 0.1019482f;
+		grip_c.orientation = QuatAxisAngle( 1, 0, 0, DEG2RAD( 20.6f ));
+		rt.grip_from_aim = PoseMul( PoseInv( aim_c ), grip_c );
+	}
 	rt.floor = ( env = getenv( "FAKEXR_FLOOR" )) ? (float)atof( env ) : 1.65f;
 	verbose = ( env = getenv( "FAKEXR_VERBOSE" )) && atoi( env );
 

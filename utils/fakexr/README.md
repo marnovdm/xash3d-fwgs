@@ -9,7 +9,10 @@ and writes a PNG plus a JSON description of every layer.
 **Emulates this PC's PS VR2 through SteamVR 2.18 + Ignition** (`FAKEXR_PRESET=psvr2`, the default): per-eye
 tangents out 1.826 / in 0.947 / up-down 1.330 (as SteamVR reports them; Black Mesa VR helper log), recommended image
 2884×2940 per eye (SteamVR's `GetRecommendedRenderTargetSize` with this PC's supersampling), 119.88 Hz, OpenXR 1.0
-only (SteamVR 2.18 refuses 1.1), the Touch interaction profile SteamVR presents for the Sense controllers, a STAGE
+only (SteamVR 2.18 refuses 1.1), the Touch interaction profile SteamVR presents for the Sense controllers, the Sense's
+grip pose relative to its aim pose as Sony's driver defines them (`resources/rendermodels/playstation_vr2_sense_*.json`:
+aim pitched -39.4°, grip +20.6° against the controller body, so grip = aim pitched up 60°, ~3 cm lower, ~9.5 cm back;
+`FAKEXR_GRIP_PITCH` adds an extra grip pitch, e.g. to mirror a global tilt), a STAGE
 floor 1.65 m below the start. `FAKEXR_PRESET=square` = the older square eye.
 
 Not simulated: reprojection, lens distortion, SteamVR's own binding UI/remaps for OpenVR games. Haptic pulses are
@@ -103,7 +106,7 @@ head starts at the origin:
 | Command | |
 |---|---|
 | `head x y z pitch yaw roll` | head pose (jump) |
-| `aim left\|right x y z pitch yaw roll` | controller aim pose (jump); the grip pose follows (`FAKEXR_GRIP_PITCH`) |
+| `aim left\|right x y z pitch yaw roll` | controller aim pose (jump); the grip pose follows with the Sense's aim→grip offset |
 | `grip left\|right x y z pitch yaw roll` | set the grip pose explicitly |
 | `look pitch yaw roll [left\|right]` | turn the head about that eye (the eye stays put: no parallax) |
 | `fov left\|right\|both l r u d` | field of view handed out (degrees, left/down negative) |
