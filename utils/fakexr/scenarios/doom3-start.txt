@@ -1,0 +1,12 @@
+# Doom 3 BFG VR (Fully Possessed, native Linux build) through xrizer: past the title screen into the map given
+# with +map on the command line, intro cutscene skipped. Run:
+# FAKEXR_OPENVR=<xrizer target/release> fakexr-run --app ~/Games/doom3vr <scenario> Doom3BFGVR +set fs_basepath ~/Games/doom3vr +map game/mars_city1
+# (the title waits for a keyboard key: VR buttons and +map/stdin commands do nothing there)
+wait-log "Skipping Intro Videos" 90
+sleep 3
+key Return
+mark
+wait-log "EndLevelLoad" 120
+sleep 8
+key Escape
+sleep 6

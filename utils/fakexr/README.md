@@ -6,8 +6,24 @@ movements and buttons come from a control FIFO; on request the runtime composite
 projection layer plus every quad: menu/HUD panel, hand panels, weapon grid, beams, cinema screen) like a compositor
 and writes a PNG plus a JSON description of every layer.
 
-Not simulated: reprojection, lens distortion, SteamVR's own binding remaps (the Sense → Touch emulation).
-Haptic pulses are logged, not felt.
+**Emulates this PC's PS VR2 through SteamVR 2.18 + Ignition** (`FAKEXR_PRESET=psvr2`, the default): per-eye
+tangents out 1.826 / in 0.947 / up-down 1.330 (as SteamVR reports them; Black Mesa VR helper log), recommended image
+2884×2940 per eye (SteamVR's `GetRecommendedRenderTargetSize` with this PC's supersampling), 119.88 Hz, OpenXR 1.0
+only (SteamVR 2.18 refuses 1.1), the Touch interaction profile SteamVR presents for the Sense controllers, a STAGE
+floor 1.65 m below the start. `FAKEXR_PRESET=square` = the older square eye.
+
+Not simulated: reprojection, lens distortion, SteamVR's own binding UI/remaps for OpenVR games. Haptic pulses are
+logged, not felt.
+
+**OpenVR games** (native Linux, e.g. Doom 3 BFG VR) run through **xrizer** (OpenVR → OpenXR) into fakexr:
+`FAKEXR_OPENVR=<xrizer target/release> fakexr-run --app <dir> <scenario> <program> [args]`. The runner sets
+`VR_OVERRIDE` + an `openvrpaths.vrpath` in the program's fake `$HOME` only (SteamVR's real setup is untouched),
+allows OpenXR 1.1 and offers `XR_FB_display_refresh_rate` for that run (xrizer reads the refresh rate there).
+xrizer build used here: `~/Downloads/xrizer/src` + local patches (OpenVR 1.9.16 interfaces `IVRCompositor_024` /
+`IVROverlay_022`, refresh-rate fallback returned the period instead of Hz → Doom divided by 0); patch copy in
+`~/Projects/steam/xrizer-patches/`. What it cannot show: SteamVR's own OpenVR input bindings (legacy binding for
+the Sense), so button *mapping* issues in OpenVR games still need the headset; rendering, projection, frames,
+HUD, hands, sticks and buttons through the legacy API are testable.
 
 ## Build
 
@@ -40,7 +56,7 @@ runner links those in (`cstrike/custom/extras.pk3` holds the CS VR models and th
 `-game` is taken from the arguments (`fakexr-run live s.txt -game cstrike`), else `$FAKEXR_GAME`, else `valve`.
 Output (PNGs, JSON, `game.log`) goes to `$FAKEXR_OUT` (default `./fakexr-out`).
 
-Rendering: with VirtualGL installed the game's GL runs on the GPU at ~90 fps and 2048 px per eye; without it
+Rendering: with VirtualGL installed the game's GL runs on the GPU at ~120 fps and 2884×2940 per eye; without it
 llvmpipe manages 7–17 fps at 960 px, too slow for anything that depends on motion over time. `FAKEXR_GPU=0/1`
 forces either. VirtualGL uses its GLX back end through the desktop's X server (`$DISPLAY`, hidden pbuffers: the
 game window stays in Xvfb and nothing appears on the monitors); without a reachable X server the runner falls back
@@ -68,6 +84,9 @@ One per line, `#` comments, `$OUT` = the output directory:
 | `status` | print poses, held inputs, session state, measured fps, projection check counters |
 | `check-projection [left\|right] [degrees]` | rotation consistency test: 3D-only shots before and after turning the head about that eye (pitch, yaw, roll; default 12°), fitted by `fakexr-projcheck.py`; fails unless the image uses the declared field of view (scale 1.000 ± 2 %). Needs a still scene (not paused: the paused game fades the world to black) |
 | `include <file>` | run another scenario (relative to this one, or `scenarios/`) |
+| `press <sense button> [s]` / `hold` / `release` | PS VR2 Sense buttons as SteamVR + Sony's driver deliver them to OpenXR apps (Touch): cross/circle = right a/b, square/triangle = left x/y, l2/r2 = trigger, l1/r1 = grip, l3/r3 = stick click, menu = left menu; **options/create/ps reach no app** on the real setup (Options feeds a path SteamVR's generated Touch binding does not listen to) — logged, nothing sent |
+| `stick left\|right x y` | thumbstick deflection (analog; `0 0` = centre) |
+| `key <keysym...>` | real key presses into the game window on the hidden display (xdotool), e.g. `key Return` |
 
 Ready-made includes in `scenarios/`: `hl-start.txt` (c1a0, cheats, god, all weapons) and `cs-spawn.txt` (de_dust2
 with bots, spawned as CT; sets `maxplayers 16` first — a console `map` keeps 1 slot, so bots cannot join and the
@@ -124,7 +143,16 @@ space (`local`/`view`/`stage` or `<hand> aim|grip <action>`), `tracked`, `eye`, 
 `pose` (LOCAL), `from_head` (pose in the head's frame) and `png_left`/`png_right` = the panel's pixel box in this
 PNG (may reach outside it; `null` when behind the eye). Poses are `{"pos": [x, y, z], "ang": [pitch, yaw, roll]}`.
 
-Other environment variables: `FAKEXR_EYE_SIZE` (960, 2048 on the GPU), `FAKEXR_FPS` (90; 0 = unthrottled),
+Desktop isolation: test programs get no D-Bus session (`FAKEXR_DBUS=1` keeps it), so they cannot inhibit or wake
+the screensaver; verified with `dbus-monitor` (2026-10-12). A **locked/blanked desktop does not stall GPU tests**
+(VirtualGL renders into pbuffers on `:0`): projection check with the screen locked and monitors off gave the same
+result; the runner logs the desktop state at start. Game logs over 200 MB stop the run (`FAKEXR_LOG_MAX_MB`).
+The compositor uses its own small GLSL 1.40 shader and saves/restores the state it touches, so it works in
+core-profile contexts too (the fixed-function version drew nothing there). Array swapchains (one layer per eye, as
+xrizer creates) are supported; shots skip frames that carry no layers (xrizer ends every other frame empty for
+Doom 3, which calls WaitGetPoses twice per rendered frame).
+
+Other environment variables: `FAKEXR_EYE_SIZE` (image width: 960, 2884 on the GPU; height follows the preset), `FAKEXR_FPS` (119.88 for psvr2; 0 = unthrottled),
 `FAKEXR_IPD` (0.064), `FAKEXR_VERBOSE`, `FAKEXR_DISPLAY`, `FAKEXR_SCREEN`, `FAKEXR_CACHE`.
 
 Example (a grenade throw by swinging the arm):

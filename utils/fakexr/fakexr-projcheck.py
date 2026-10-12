@@ -36,7 +36,8 @@ def load(png):
         sys.exit(f"{png}: shoot one eye (left or right)")
     if not meta.get("world_only"):
         sys.exit(f"{png}: shoot with 'world' (panels would not follow the rotation)")
-    if meta["rect"] != [0.0, 0.0, float(meta["eye_size"]), float(meta["eye_size"])]:
+    size = meta["eye_size"] if isinstance(meta["eye_size"], list) else [meta["eye_size"]] * 2
+    if meta["rect"] != [0.0, 0.0, float(size[0]), float(size[1])]:
         sys.exit(f"{png}: shoot the whole eye (no rect)")
     eye = meta["eye_" + meta["eyes"]]
     img = Image.open(png).convert("L")

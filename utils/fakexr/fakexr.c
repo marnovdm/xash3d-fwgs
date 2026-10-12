@@ -40,14 +40,20 @@ Control commands, one per line (angles in degrees, positions in metres, OpenXR L
                                                       world = projection layers only (no panels)
   exit                                                ask the application to end the session
 Haptic pulses are logged ("fakexr: haptic ..."). Every submitted frame is checked against what LocateViews handed
-out: each projection view's fov and eye pose, and whether its image's pixel aspect fits that fov; a difference is
-logged as "fakexr: projection mismatch ..." (an app rendering one aspect/fov while declaring another).
-Environment: FAKEXR_CONTROL (FIFO path), FAKEXR_EYE_SIZE (default 960), FAKEXR_FPS (default 90, 0 = unthrottled),
+out: each projection view's fov and eye pose (the image's pixel aspect is recorded, but is no error on its own);
+a difference is logged as "fakexr: projection mismatch ...".
+Environment: FAKEXR_PRESET (psvr2 = this PC's PS VR2 via SteamVR + Ignition, the default: its per-eye fov, image shape
+and 119.88 Hz; square = the old square eye), FAKEXR_EYE_SIZE (image width, default 960; the height follows the
+preset), FAKEXR_FPS (default 119.88 for psvr2, 90 for square; 0 = unthrottled), FAKEXR_API_MAX (OpenXR versions accepted:
+1.0 like SteamVR 2.18, or 1.1), FAKEXR_FLOOR (STAGE floor below the start, 1.65 m),
 FAKEXR_PROFILE (default /interaction_profiles/oculus/touch_controller), FAKEXR_GRIP_PITCH (aim -> grip pitch, default 0),
 FAKEXR_IPD (default 0.064), FAKEXR_VERBOSE (1 = log every call that fails).
 */
 
 #define XR_USE_GRAPHICS_API_OPENGL
+#define XR_USE_GRAPHICS_API_VULKAN
+#include <vulkan/vulkan.h>
+#include <dlfcn.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
@@ -90,6 +96,22 @@ FAKEXR_IPD (default 0.064), FAKEXR_VERBOSE (1 = log every call that fails).
 #define GL_PIXEL_UNPACK_BUFFER 0x88EC
 #define GL_PIXEL_UNPACK_BUFFER_BINDING 0x88EF
 #define GL_CLAMP_TO_EDGE 0x812F
+#define GL_TEXTURE_2D_ARRAY 0x8C1A
+#define GL_VERTEX_SHADER 0x8B31
+#define GL_FRAGMENT_SHADER 0x8B30
+#define GL_COMPILE_STATUS 0x8B81
+#define GL_LINK_STATUS 0x8B82
+#define GL_ARRAY_BUFFER 0x8892
+#define GL_ARRAY_BUFFER_BINDING 0x8894
+#define GL_STATIC_DRAW 0x88E4
+#define GL_VERTEX_ARRAY_BINDING 0x85B5
+#define GL_SAMPLER_BINDING 0x8919
+#define GL_BLEND_SRC_RGB 0x80C9
+#define GL_BLEND_DST_RGB 0x80C8
+#define GL_BLEND_SRC_ALPHA 0x80CB
+#define GL_BLEND_DST_ALPHA 0x80CA
+#define GL_CONTEXT_PROFILE_MASK 0x9126
+#define GL_TEXTURE_BINDING_2D_ARRAY 0x8C1D
 
 static struct
 {
@@ -101,6 +123,32 @@ static struct
 	void ( *ActiveTexture )( GLenum );
 	void ( *UseProgram )( GLuint );
 	void ( *BindBuffer )( GLenum, GLuint );
+	void ( *TexImage3D )( GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void * );
+	/* the compositor's shader path (works in core and compatibility contexts) */
+	GLuint ( *CreateShader )( GLenum );
+	void ( *ShaderSource )( GLuint, GLsizei, const char *const *, const GLint * );
+	void ( *CompileShader )( GLuint );
+	void ( *GetShaderiv )( GLuint, GLenum, GLint * );
+	void ( *GetShaderInfoLog )( GLuint, GLsizei, GLsizei *, char * );
+	GLuint ( *CreateProgram )( void );
+	void ( *AttachShader )( GLuint, GLuint );
+	void ( *BindAttribLocation )( GLuint, GLuint, const char * );
+	void ( *LinkProgram )( GLuint );
+	void ( *GetProgramiv )( GLuint, GLenum, GLint * );
+	GLint ( *GetUniformLocation )( GLuint, const char * );
+	void ( *Uniform1i )( GLint, GLint );
+	void ( *Uniform2f )( GLint, GLfloat, GLfloat );
+	void ( *Uniform4f )( GLint, GLfloat, GLfloat, GLfloat, GLfloat );
+	void ( *UniformMatrix4fv )( GLint, GLsizei, GLboolean, const GLfloat * );
+	void ( *GenVertexArrays )( GLsizei, GLuint * );
+	void ( *BindVertexArray )( GLuint );
+	void ( *GenBuffers )( GLsizei, GLuint * );
+	void ( *BufferData )( GLenum, ptrdiff_t, const void *, GLenum );
+	void ( *VertexAttribPointer )( GLuint, GLint, GLenum, GLboolean, GLsizei, const void * );
+	void ( *EnableVertexAttribArray )( GLuint );
+	void ( *BindSampler )( GLuint, GLuint ); /* optional (GL 3.3) */
+	void ( *BlendFuncSeparate )( GLenum, GLenum, GLenum, GLenum );
+	void ( *FramebufferTextureLayer )( GLenum, GLenum, GLuint, GLint, GLint );
 	int loaded;
 } gl;
 
@@ -290,6 +338,8 @@ typedef struct
 	uint32_t width, height;
 	GLuint textures[MAX_SWAPCHAIN_IMAGES];
 	uint32_t next, acquired;
+	uint32_t array_size; /* > 1: GL_TEXTURE_2D_ARRAY images, one layer per view (OpenVR bridges use 2) */
+	GLuint scratch, scratch_fbo; /* a 2D copy of one layer for compositing (fixed-function GL cannot sample arrays) */
 } swapchain_t;
 
 typedef struct
@@ -324,6 +374,7 @@ static struct
 	uint32_t event_head, event_count;
 
 	int session_alive, session_running, attached;
+	int session_vulkan; /* a Vulkan session: frame loop only, no swapchains, nothing composited */
 	XrPath profile;
 	XrPath hand_path[2];
 
@@ -333,9 +384,10 @@ static struct
 	motion_t motion[3]; /* left, right, head */
 	float frame_interval; /* measured, smoothed, seconds */
 	float ipd;
-	uint32_t eye_size;
+	uint32_t eye_w, eye_h; /* recommended per-eye image */
 	float fps;
 	float grip_pitch;
+	float floor; /* LOCAL origin height above the STAGE floor */
 	XrFovf fov[2];
 
 	int control_fd;
@@ -355,6 +407,7 @@ static struct
 	GLuint compose_fbo, compose_texture;
 	uint32_t compose_width, compose_height;
 	uint64_t haptic_count;
+	uint64_t empty_frames; /* xrEndFrame with no layers */
 
 	/* projection check: what LocateViews gave (LOCAL eye poses + fov) vs what each frame says it rendered */
 	XrPosef given_pose[2];
@@ -669,8 +722,9 @@ static void ControlCommand( char *line )
 	}
 	else if( !strcmp( word, "status" ))
 	{
-		Log( "status: frame %llu, %.1f fps measured, session %s, %llu haptic pulses",
-			(unsigned long long)rt.frame_index, rt.frame_interval > 0 ? 1.0f / rt.frame_interval : 0.0f,
+		Log( "status: frame %llu (%llu without layers), %.1f fps measured, session %s, %llu haptic pulses",
+			(unsigned long long)rt.frame_index, (unsigned long long)rt.empty_frames,
+			rt.frame_interval > 0 ? 1.0f / rt.frame_interval : 0.0f,
 			SessionStateName( rt.session_state ), (unsigned long long)rt.haptic_count );
 		Log( "  projection: %llu of %llu frames off; worst fov %.2f deg, pose %.1f mm %.2f deg, pixel aspect %.3f",
 			(unsigned long long)rt.projection_bad_frames, (unsigned long long)rt.projection_frames,
@@ -753,15 +807,15 @@ static void ControlCommand( char *line )
 			else if( sscanf( token, "rect=%f,%f,%f,%f", &r[0], &r[1], &r[2], &r[3] ) == 4 && r[2] > r[0] && r[3] > r[1] )
 			{
 				for( int k = 0; k < 4; ++k )
-					rt.shot_rect[k] = r[k] / rt.eye_size;
+					rt.shot_rect[k] = r[k] / ( k & 1 ? rt.eye_h : rt.eye_w );
 			}
 			else if( sscanf( token, "px=%f", &px ) == 1 ) {}
 			else Log( "shot: ignoring '%s'", token );
 		}
 		{
-			/* px = the longer side of the output (per eye); the other follows the rect's aspect */
-			float aspect = ( rt.shot_rect[2] - rt.shot_rect[0] ) / ( rt.shot_rect[3] - rt.shot_rect[1] );
-			uint32_t longer = px >= 16 && px <= 8192 ? (uint32_t)px : rt.eye_size;
+			/* px = the longer side of the output (per eye); the other follows the rect's aspect in pixels */
+			float aspect = ( rt.shot_rect[2] - rt.shot_rect[0] ) * rt.eye_w / (( rt.shot_rect[3] - rt.shot_rect[1] ) * rt.eye_h );
+			uint32_t longer = px >= 16 && px <= 8192 ? (uint32_t)px : ( rt.eye_w > rt.eye_h ? rt.eye_w : rt.eye_h );
 			rt.shot_width = aspect >= 1.0f ? longer : (uint32_t)( longer * aspect + 0.5f );
 			rt.shot_height = aspect >= 1.0f ? (uint32_t)( longer / aspect + 0.5f ) : longer;
 			if( rt.shot_width < 1 ) rt.shot_width = 1;
@@ -926,6 +980,9 @@ static int SpacePose( const space_t *space, XrPosef *out )
 	if( space->kind == SPACE_REFERENCE )
 	{
 		base = space->reference == XR_REFERENCE_SPACE_TYPE_VIEW ? rt.head : PoseIdentity();
+		/* STAGE: the floor, below where the head started (FAKEXR_FLOOR metres, default 1.65) */
+		if( space->reference == XR_REFERENCE_SPACE_TYPE_STAGE )
+			base.position.y = -rt.floor;
 	}
 	else
 	{
@@ -970,23 +1027,162 @@ static int LoadGL( void )
 	gl.ActiveTexture = GLProc( "glActiveTexture" );
 	gl.UseProgram = GLProc( "glUseProgram" );
 	gl.BindBuffer = GLProc( "glBindBuffer" );
+	gl.TexImage3D = GLProc( "glTexImage3D" );
+	gl.CreateShader = GLProc( "glCreateShader" );
+	gl.ShaderSource = GLProc( "glShaderSource" );
+	gl.CompileShader = GLProc( "glCompileShader" );
+	gl.GetShaderiv = GLProc( "glGetShaderiv" );
+	gl.GetShaderInfoLog = GLProc( "glGetShaderInfoLog" );
+	gl.CreateProgram = GLProc( "glCreateProgram" );
+	gl.AttachShader = GLProc( "glAttachShader" );
+	gl.BindAttribLocation = GLProc( "glBindAttribLocation" );
+	gl.LinkProgram = GLProc( "glLinkProgram" );
+	gl.GetProgramiv = GLProc( "glGetProgramiv" );
+	gl.GetUniformLocation = GLProc( "glGetUniformLocation" );
+	gl.Uniform1i = GLProc( "glUniform1i" );
+	gl.Uniform2f = GLProc( "glUniform2f" );
+	gl.Uniform4f = GLProc( "glUniform4f" );
+	gl.UniformMatrix4fv = GLProc( "glUniformMatrix4fv" );
+	gl.GenVertexArrays = GLProc( "glGenVertexArrays" );
+	gl.BindVertexArray = GLProc( "glBindVertexArray" );
+	gl.GenBuffers = GLProc( "glGenBuffers" );
+	gl.BufferData = GLProc( "glBufferData" );
+	gl.VertexAttribPointer = GLProc( "glVertexAttribPointer" );
+	gl.EnableVertexAttribArray = GLProc( "glEnableVertexAttribArray" );
+	gl.BindSampler = GLProc( "glBindSampler" );
+	gl.BlendFuncSeparate = GLProc( "glBlendFuncSeparate" );
+	gl.FramebufferTextureLayer = GLProc( "glFramebufferTextureLayer" );
 	gl.loaded = ( gl.GenFramebuffers && gl.BindFramebuffer && gl.FramebufferTexture2D && gl.CheckFramebufferStatus &&
-		gl.ActiveTexture && gl.UseProgram && gl.BindBuffer ) ? 1 : -1;
+		gl.ActiveTexture && gl.UseProgram && gl.BindBuffer && gl.CreateShader && gl.ShaderSource && gl.CompileShader &&
+		gl.GetShaderiv && gl.GetShaderInfoLog && gl.CreateProgram && gl.AttachShader && gl.BindAttribLocation &&
+		gl.LinkProgram && gl.GetProgramiv && gl.GetUniformLocation && gl.Uniform1i && gl.Uniform2f && gl.Uniform4f &&
+		gl.UniformMatrix4fv && gl.GenVertexArrays && gl.BindVertexArray && gl.GenBuffers && gl.BufferData &&
+		gl.VertexAttribPointer && gl.EnableVertexAttribArray && gl.BlendFuncSeparate ) ? 1 : -1;
 	if( gl.loaded < 0 )
 		Log( "missing GL framebuffer functions, screenshots disabled" );
 	return gl.loaded > 0;
 }
 
-static void ProjectionForFov( XrFovf fov, float near_z, float far_z )
+static mat4 Mat4Mul( mat4 a, mat4 b ) /* column-major a * b */
 {
-	float l = tanf( fov.angleLeft ) * near_z, r = tanf( fov.angleRight ) * near_z;
-	float b = tanf( fov.angleDown ) * near_z, t = tanf( fov.angleUp ) * near_z;
-	glMatrixMode( GL_PROJECTION );
-	glLoadIdentity();
-	glFrustum( l, r, b, t, near_z, far_z );
+	mat4 r;
+	for( int c = 0; c < 4; ++c )
+	{
+		for( int row = 0; row < 4; ++row )
+		{
+			float v = 0;
+			for( int k = 0; k < 4; ++k )
+				v += a.m[k * 4 + row] * b.m[c * 4 + k];
+			r.m[c * 4 + row] = v;
+		}
+	}
+	return r;
 }
 
-/* the eye's field of view narrowed to the shot rectangle */
+static mat4 Mat4Frustum( XrFovf fov, float n, float f )
+{
+	float l = tanf( fov.angleLeft ) * n, r = tanf( fov.angleRight ) * n;
+	float b = tanf( fov.angleDown ) * n, t = tanf( fov.angleUp ) * n;
+	mat4 m;
+	memset( &m, 0, sizeof( m ));
+	m.m[0] = 2 * n / ( r - l );
+	m.m[5] = 2 * n / ( t - b );
+	m.m[8] = ( r + l ) / ( r - l );
+	m.m[9] = ( t + b ) / ( t - b );
+	m.m[10] = -( f + n ) / ( f - n );
+	m.m[11] = -1;
+	m.m[14] = -2 * f * n / ( f - n );
+	return m;
+}
+
+/* one textured quad: corners (-1..1)^2 scaled by half_size, through mvp; uv_rect maps the corners to texels */
+static const char *compose_vs =
+	"#version 140\n"
+	"in vec2 corner;\n"
+	"uniform mat4 mvp;\n"
+	"uniform vec2 half_size;\n"
+	"uniform vec4 uv_rect;\n"
+	"out vec2 uv;\n"
+	"void main() {\n"
+	"	uv = mix( uv_rect.xy, uv_rect.zw, corner * 0.5 + 0.5 );\n"
+	"	gl_Position = mvp * vec4( corner * half_size, 0.0, 1.0 );\n"
+	"}\n";
+static const char *compose_fs =
+	"#version 140\n"
+	"in vec2 uv;\n"
+	"uniform sampler2D image;\n"
+	"out vec4 color;\n"
+	"void main() { color = texture( image, uv ); }\n";
+
+static struct { GLuint program, vao, vbo; GLint mvp, half_size, uv_rect, image; int failed; } cs;
+
+static int ComposeProgram( void )
+{
+	static const float corners[8] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+	GLuint vs, fs;
+	GLint ok = 0;
+	char info[512];
+
+	if( cs.program || cs.failed )
+		return cs.program != 0;
+	vs = gl.CreateShader( GL_VERTEX_SHADER );
+	gl.ShaderSource( vs, 1, &compose_vs, NULL );
+	gl.CompileShader( vs );
+	gl.GetShaderiv( vs, GL_COMPILE_STATUS, &ok );
+	if( !ok )
+	{
+		gl.GetShaderInfoLog( vs, sizeof( info ), NULL, info );
+		Log( "compose vertex shader: %s", info );
+		cs.failed = 1;
+		return 0;
+	}
+	fs = gl.CreateShader( GL_FRAGMENT_SHADER );
+	gl.ShaderSource( fs, 1, &compose_fs, NULL );
+	gl.CompileShader( fs );
+	gl.GetShaderiv( fs, GL_COMPILE_STATUS, &ok );
+	if( !ok )
+	{
+		gl.GetShaderInfoLog( fs, sizeof( info ), NULL, info );
+		Log( "compose fragment shader: %s", info );
+		cs.failed = 1;
+		return 0;
+	}
+	cs.program = gl.CreateProgram();
+	gl.AttachShader( cs.program, vs );
+	gl.AttachShader( cs.program, fs );
+	gl.BindAttribLocation( cs.program, 0, "corner" );
+	gl.LinkProgram( cs.program );
+	gl.GetProgramiv( cs.program, GL_LINK_STATUS, &ok );
+	if( !ok )
+	{
+		Log( "compose program does not link" );
+		cs.program = 0;
+		cs.failed = 1;
+		return 0;
+	}
+	cs.mvp = gl.GetUniformLocation( cs.program, "mvp" );
+	cs.half_size = gl.GetUniformLocation( cs.program, "half_size" );
+	cs.uv_rect = gl.GetUniformLocation( cs.program, "uv_rect" );
+	cs.image = gl.GetUniformLocation( cs.program, "image" );
+	/* the VAO is ours alone, so binding the buffer into it here leaves the app's state alone (restored by Compose) */
+	gl.GenVertexArrays( 1, &cs.vao );
+	gl.BindVertexArray( cs.vao );
+	gl.GenBuffers( 1, &cs.vbo );
+	gl.BindBuffer( GL_ARRAY_BUFFER, cs.vbo );
+	gl.BufferData( GL_ARRAY_BUFFER, sizeof( corners ), corners, GL_STATIC_DRAW );
+	gl.VertexAttribPointer( 0, 2, GL_FLOAT, GL_FALSE, 0, NULL );
+	gl.EnableVertexAttribArray( 0 );
+	return 1;
+}
+
+static void DrawQuad( mat4 mvp, float half_w, float half_h, const float uv[4] )
+{
+	gl.UniformMatrix4fv( cs.mvp, 1, GL_FALSE, mvp.m );
+	gl.Uniform2f( cs.half_size, half_w, half_h );
+	gl.Uniform4f( cs.uv_rect, uv[0], uv[1], uv[2], uv[3] );
+	glDrawArrays( GL_TRIANGLE_STRIP, 0, 4 );
+}
+
 static XrFovf ShotFov( int eye )
 {
 	XrFovf fov = rt.fov[eye], out;
@@ -1005,10 +1201,39 @@ static const space_t *SpaceFromHandle( XrSpace space )
 
 static void BindSubImage( const XrSwapchainSubImage *sub, float uv[4] )
 {
-	const swapchain_t *chain = FROM_HANDLE( const swapchain_t, sub->swapchain );
+	swapchain_t *chain = FROM_HANDLE( swapchain_t, sub->swapchain );
 	uint32_t index = chain->acquired; /* last released image */
 
-	glBindTexture( GL_TEXTURE_2D, chain->textures[index] );
+	if( chain->array_size > 1 && gl.FramebufferTextureLayer )
+	{
+		/* copy the requested layer into a 2D scratch texture: the compose framebuffer stays the draw target */
+		GLint read_fbo = 0;
+		if( !chain->scratch )
+		{
+			glGenTextures( 1, &chain->scratch );
+			glBindTexture( GL_TEXTURE_2D, chain->scratch );
+			glTexImage2D( GL_TEXTURE_2D, 0, (GLint)chain->format, chain->width, chain->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL );
+			gl.GenFramebuffers( 1, &chain->scratch_fbo );
+		}
+		glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
+		gl.BindFramebuffer( GL_READ_FRAMEBUFFER, chain->scratch_fbo );
+		gl.FramebufferTextureLayer( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, chain->textures[index], 0, (GLint)sub->imageArrayIndex );
+		glBindTexture( GL_TEXTURE_2D, chain->scratch );
+		glCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, 0, 0, chain->width, chain->height );
+		if( verbose )
+		{
+			static int logged;
+			uint8_t px[4] = { 0 };
+			GLenum status = gl.CheckFramebufferStatus( GL_READ_FRAMEBUFFER ), error = glGetError();
+			glReadPixels( chain->width / 2, chain->height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px );
+			if( logged++ < 4 )
+				Log( "array layer %u of image %u (texture %u): fbo status 0x%x, GL error 0x%x, centre pixel %u %u %u %u",
+					sub->imageArrayIndex, index, chain->textures[index], status, error, px[0], px[1], px[2], px[3] );
+		}
+		gl.BindFramebuffer( GL_READ_FRAMEBUFFER, (GLuint)read_fbo );
+	}
+	else
+		glBindTexture( GL_TEXTURE_2D, chain->textures[index] );
 	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
 	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
 	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
@@ -1035,8 +1260,8 @@ static void SetLayerBlend( XrCompositionLayerFlags flags )
 
 static void ComposeEye( int eye, const XrFrameEndInfo *info, int x_offset )
 {
-	XrPosef eye_pose = EyePose( eye );
-	XrPosef view = PoseInv( eye_pose );
+	XrPosef view = PoseInv( EyePose( eye ));
+	mat4 view_m = Mat4FromPose( view ), proj = Mat4Frustum( ShotFov( eye ), 0.02f, 100.0f );
 
 	glViewport( x_offset, 0, rt.shot_width, rt.shot_height );
 	for( uint32_t i = 0; i < info->layerCount; ++i )
@@ -1047,33 +1272,28 @@ static void ComposeEye( int eye, const XrFrameEndInfo *info, int x_offset )
 		if( base->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION )
 		{
 			const XrCompositionLayerProjection *projection = (const XrCompositionLayerProjection *)base;
-			const XrCompositionLayerProjectionView *pv;
+			float r0 = rt.shot_rect[0], r1 = rt.shot_rect[1], r2 = rt.shot_rect[2], r3 = rt.shot_rect[3];
+			mat4 m;
 
 			if( projection->viewCount <= (uint32_t)eye )
 				continue;
-			pv = &projection->views[eye];
-			/* the poses do not move between the app's render and here, so no reprojection: draw it full-eye */
-			BindSubImage( &pv->subImage, uv );
+			/* the poses do not move between the app's render and here, so no reprojection: the whole eye, of which
+			 * the shot shows rect (top-left origin; GL rows run bottom-up) */
+			memset( &m, 0, sizeof( m ));
+			m.m[0] = 1.0f / ( r2 - r0 );
+			m.m[5] = 1.0f / ( r3 - r1 );
+			m.m[10] = 1.0f;
+			m.m[12] = ( 1.0f - 2.0f * r0 ) / ( r2 - r0 ) - 1.0f;
+			m.m[13] = ( 2.0f * r3 - 1.0f ) / ( r3 - r1 ) - 1.0f;
+			m.m[15] = 1.0f;
+			BindSubImage( &projection->views[eye].subImage, uv );
 			SetLayerBlend( projection->layerFlags );
-			glMatrixMode( GL_PROJECTION );
-			glLoadIdentity();
-			/* GL texture rows run bottom-up: the rect's top (v0) is the high end */
-			glOrtho( rt.shot_rect[0], rt.shot_rect[2], 1.0f - rt.shot_rect[3], 1.0f - rt.shot_rect[1], -1, 1 );
-			glMatrixMode( GL_MODELVIEW );
-			glLoadIdentity();
-			glBegin( GL_QUADS );
-			glTexCoord2f( uv[0], uv[1] ); glVertex2f( 0, 0 );
-			glTexCoord2f( uv[2], uv[1] ); glVertex2f( 1, 0 );
-			glTexCoord2f( uv[2], uv[3] ); glVertex2f( 1, 1 );
-			glTexCoord2f( uv[0], uv[3] ); glVertex2f( 0, 1 );
-			glEnd();
+			DrawQuad( m, 1.0f, 1.0f, uv );
 		}
 		else if( base->type == XR_TYPE_COMPOSITION_LAYER_QUAD && !rt.shot_world )
 		{
 			const XrCompositionLayerQuad *quad = (const XrCompositionLayerQuad *)base;
-			XrPosef space_pose, quad_pose;
-			mat4 model, view_m;
-			float w = quad->size.width * 0.5f, h = quad->size.height * 0.5f;
+			XrPosef space_pose;
 
 			if( quad->eyeVisibility == XR_EYE_VISIBILITY_LEFT && eye != 0 )
 				continue;
@@ -1081,29 +1301,20 @@ static void ComposeEye( int eye, const XrFrameEndInfo *info, int x_offset )
 				continue;
 			if( !SpacePose( SpaceFromHandle( quad->space ), &space_pose ))
 				continue;
-			quad_pose = PoseMul( space_pose, quad->pose );
 			BindSubImage( &quad->subImage, uv );
 			SetLayerBlend( quad->layerFlags );
-			ProjectionForFov( ShotFov( eye ), 0.02f, 100.0f );
-			glMatrixMode( GL_MODELVIEW );
-			view_m = Mat4FromPose( view );
-			model = Mat4FromPose( quad_pose );
-			glLoadMatrixf( view_m.m );
-			glMultMatrixf( model.m );
-			glBegin( GL_QUADS );
-			glTexCoord2f( uv[0], uv[1] ); glVertex3f( -w, -h, 0 );
-			glTexCoord2f( uv[2], uv[1] ); glVertex3f( w, -h, 0 );
-			glTexCoord2f( uv[2], uv[3] ); glVertex3f( w, h, 0 );
-			glTexCoord2f( uv[0], uv[3] ); glVertex3f( -w, h, 0 );
-			glEnd();
+			DrawQuad( Mat4Mul( proj, Mat4Mul( view_m, Mat4FromPose( PoseMul( space_pose, quad->pose )))),
+				quad->size.width * 0.5f, quad->size.height * 0.5f, uv );
 		}
 	}
 }
 
 static void Compose( const XrFrameEndInfo *info )
 {
-	GLint draw_fbo = 0, read_fbo = 0, program = 0, active = 0, pack_buffer = 0, viewport[4];
-	GLboolean srgb;
+	GLint draw_fbo = 0, read_fbo = 0, program = 0, active = 0, pack_buffer = 0, viewport[4], vao = 0, array_buffer = 0;
+	GLint texture = 0, sampler = 0, pack_alignment = 4, blend_func[4], profile = 0;
+	GLfloat clear[4];
+	GLboolean srgb, blend, depth, cull, scissor, stencil, alpha_test = GL_FALSE, mask[4];
 	uint32_t width = rt.shot_width * (( rt.shot_eyes == 3 ) ? 2 : 1), height = rt.shot_height;
 	uint8_t *pixels;
 	int x = 0;
@@ -1111,18 +1322,36 @@ static void Compose( const XrFrameEndInfo *info )
 	if( !LoadGL( ))
 		return;
 
+	/* save exactly the state this changes (no glPushAttrib: it does not exist in core-profile contexts) */
+	glGetIntegerv( GL_CONTEXT_PROFILE_MASK, &profile );
 	glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo );
 	glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
 	glGetIntegerv( GL_CURRENT_PROGRAM, &program );
 	glGetIntegerv( GL_ACTIVE_TEXTURE, &active );
 	glGetIntegerv( GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer );
 	glGetIntegerv( GL_VIEWPORT, viewport );
+	glGetIntegerv( GL_VERTEX_ARRAY_BINDING, &vao );
+	glGetIntegerv( GL_ARRAY_BUFFER_BINDING, &array_buffer );
+	glGetIntegerv( GL_PACK_ALIGNMENT, &pack_alignment );
+	glGetIntegerv( GL_BLEND_SRC_RGB, &blend_func[0] );
+	glGetIntegerv( GL_BLEND_DST_RGB, &blend_func[1] );
+	glGetIntegerv( GL_BLEND_SRC_ALPHA, &blend_func[2] );
+	glGetIntegerv( GL_BLEND_DST_ALPHA, &blend_func[3] );
+	glGetFloatv( GL_COLOR_CLEAR_VALUE, clear );
+	glGetBooleanv( GL_COLOR_WRITEMASK, mask );
 	srgb = glIsEnabled( GL_FRAMEBUFFER_SRGB );
-	glPushAttrib( GL_ALL_ATTRIB_BITS );
-	glPushClientAttrib( GL_CLIENT_ALL_ATTRIB_BITS );
-	glMatrixMode( GL_TEXTURE ); glPushMatrix(); glLoadIdentity();
-	glMatrixMode( GL_PROJECTION ); glPushMatrix();
-	glMatrixMode( GL_MODELVIEW ); glPushMatrix();
+	blend = glIsEnabled( GL_BLEND );
+	depth = glIsEnabled( GL_DEPTH_TEST );
+	cull = glIsEnabled( GL_CULL_FACE );
+	scissor = glIsEnabled( GL_SCISSOR_TEST );
+	stencil = glIsEnabled( GL_STENCIL_TEST );
+	if( profile & GL_CONTEXT_COMPATIBILITY_PROFILE_BIT || !profile )
+		alpha_test = glIsEnabled( GL_ALPHA_TEST ); /* still applies to shaders in a compatibility context */
+	gl.ActiveTexture( GL_TEXTURE0 );
+	glGetIntegerv( GL_TEXTURE_BINDING_2D, &texture );
+	if( gl.BindSampler )
+		glGetIntegerv( GL_SAMPLER_BINDING, &sampler );
+	while( glGetError() != GL_NO_ERROR ) {}
 
 	if( !rt.compose_fbo || rt.compose_width != width || rt.compose_height != height )
 	{
@@ -1143,27 +1372,21 @@ static void Compose( const XrFrameEndInfo *info )
 		rt.compose_height = height;
 	}
 
-	gl.UseProgram( 0 );
+	if( !ComposeProgram( ))
+		goto restore;
+	gl.UseProgram( cs.program );
+	gl.Uniform1i( cs.image, 0 );
+	gl.BindVertexArray( cs.vao );
 	gl.BindBuffer( GL_PIXEL_PACK_BUFFER, 0 );
-	for( int unit = 3; unit >= 0; --unit )
-	{
-		gl.ActiveTexture( GL_TEXTURE0 + unit );
-		glDisable( GL_TEXTURE_2D );
-		glMatrixMode( GL_TEXTURE );
-		glLoadIdentity();
-	}
-	glEnable( GL_TEXTURE_2D );
-	glTexEnvi( GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE );
+	if( gl.BindSampler )
+		gl.BindSampler( 0, 0 );
 	glDisable( GL_DEPTH_TEST );
 	glDisable( GL_CULL_FACE );
-	glDisable( GL_ALPHA_TEST );
 	glDisable( GL_SCISSOR_TEST );
 	glDisable( GL_STENCIL_TEST );
-	glDisable( GL_FOG );
-	glDisable( GL_LIGHTING );
+	if( alpha_test )
+		glDisable( GL_ALPHA_TEST );
 	glColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
-	glColor4f( 1, 1, 1, 1 );
-	glPolygonMode( GL_FRONT_AND_BACK, GL_FILL );
 
 	/* sRGB target + sRGB swapchains: blending happens in linear space like a real compositor */
 	gl.BindFramebuffer( GL_FRAMEBUFFER, rt.compose_fbo );
@@ -1203,6 +1426,8 @@ static void Compose( const XrFrameEndInfo *info )
 		if( quad->type != XR_TYPE_COMPOSITION_LAYER_QUAD )
 			continue;
 		chain = FROM_HANDLE( const swapchain_t, quad->subImage.swapchain );
+		if( chain->array_size > 1 )
+			continue; /* layer dumps of array swapchains: not needed so far */
 		texels = malloc( (size_t)chain->width * chain->height * 4 );
 		if( !texels )
 			continue;
@@ -1215,15 +1440,30 @@ static void Compose( const XrFrameEndInfo *info )
 		free( texels );
 	}
 
-	glMatrixMode( GL_MODELVIEW ); glPopMatrix();
-	glMatrixMode( GL_PROJECTION ); glPopMatrix();
-	glMatrixMode( GL_TEXTURE ); glPopMatrix();
-	glPopClientAttrib();
-	glPopAttrib();
-	if( srgb ) glEnable( GL_FRAMEBUFFER_SRGB ); else glDisable( GL_FRAMEBUFFER_SRGB );
+restore:
+#define SET_CAP( cap, on ) do { if( on ) glEnable( cap ); else glDisable( cap ); } while( 0 )
+	SET_CAP( GL_FRAMEBUFFER_SRGB, srgb );
+	SET_CAP( GL_BLEND, blend );
+	SET_CAP( GL_DEPTH_TEST, depth );
+	SET_CAP( GL_CULL_FACE, cull );
+	SET_CAP( GL_SCISSOR_TEST, scissor );
+	SET_CAP( GL_STENCIL_TEST, stencil );
+	if( alpha_test )
+		glEnable( GL_ALPHA_TEST );
+#undef SET_CAP
+	gl.BlendFuncSeparate( (GLenum)blend_func[0], (GLenum)blend_func[1], (GLenum)blend_func[2], (GLenum)blend_func[3] );
+	glColorMask( mask[0], mask[1], mask[2], mask[3] );
+	glClearColor( clear[0], clear[1], clear[2], clear[3] );
+	glPixelStorei( GL_PACK_ALIGNMENT, pack_alignment );
 	gl.BindFramebuffer( GL_DRAW_FRAMEBUFFER, (GLuint)draw_fbo );
 	gl.BindFramebuffer( GL_READ_FRAMEBUFFER, (GLuint)read_fbo );
 	gl.BindBuffer( GL_PIXEL_PACK_BUFFER, (GLuint)pack_buffer );
+	gl.BindVertexArray( (GLuint)vao );
+	gl.BindBuffer( GL_ARRAY_BUFFER, (GLuint)array_buffer );
+	gl.ActiveTexture( GL_TEXTURE0 );
+	glBindTexture( GL_TEXTURE_2D, (GLuint)texture );
+	if( gl.BindSampler )
+		gl.BindSampler( 0, (GLuint)sampler );
 	gl.ActiveTexture( (GLenum)active );
 	gl.UseProgram( (GLuint)program );
 	glViewport( viewport[0], viewport[1], viewport[2], viewport[3] );
@@ -1283,7 +1523,10 @@ static void CheckProjection( const XrFrameEndInfo *info )
 			if( fabsf( aspect - 1.0f ) > fabsf( rt.worst_aspect - 1.0f ))
 				rt.worst_aspect = aspect;
 
-			if( !problem[0] && ( fov_deg > 0.05f || pos_mm > 0.5f || rot_deg > 0.05f || fabsf( aspect - 1.0f ) > 0.01f ))
+			/* the pixel aspect is recorded but is no error on its own: an image of any shape is fine as long as it was
+			 * rendered with the fov it declares (SteamVR's own recommendation for the PS VR2 has 0.94); a wrong
+			 * declaration shows up as a fov mismatch here or in check-projection */
+			if( !problem[0] && ( fov_deg > 0.05f || pos_mm > 0.5f || rot_deg > 0.05f ))
 			{
 				snprintf( problem, sizeof( problem ),
 					"%s eye: fov given %.1f/%.1f/%.1f/%.1f submitted %.1f/%.1f/%.1f/%.1f deg (l/r/u/d), pose off %.1f mm %.2f deg, "
@@ -1384,11 +1627,11 @@ static void WriteShotJSON( const XrFrameEndInfo *info )
 	snprintf( temp, sizeof( temp ), "%s.tmp", path );
 	if( !( f = fopen( temp, "w" )))
 		return;
-	fprintf( f, "{\n\"frame\": %llu, \"session\": \"%s\", \"eye_size\": %u, \"eyes\": \"%s\",\n",
-		(unsigned long long)rt.frame_index, SessionStateName( rt.session_state ), rt.eye_size,
+	fprintf( f, "{\n\"frame\": %llu, \"session\": \"%s\", \"eye_size\": [%u, %u], \"eyes\": \"%s\",\n",
+		(unsigned long long)rt.frame_index, SessionStateName( rt.session_state ), rt.eye_w, rt.eye_h,
 		rt.shot_eyes == 3 ? "both" : rt.shot_eyes == 2 ? "right" : "left" );
 	fprintf( f, "\"shot_size\": [%u, %u], \"rect\": [%.1f, %.1f, %.1f, %.1f],\n", rt.shot_width, rt.shot_height,
-		rt.shot_rect[0] * rt.eye_size, rt.shot_rect[1] * rt.eye_size, rt.shot_rect[2] * rt.eye_size, rt.shot_rect[3] * rt.eye_size );
+		rt.shot_rect[0] * rt.eye_w, rt.shot_rect[1] * rt.eye_h, rt.shot_rect[2] * rt.eye_w, rt.shot_rect[3] * rt.eye_h );
 	fprintf( f, "\"world_only\": %s,\n", rt.shot_world ? "true" : "false" );
 	for( int eye = 0; eye < 2; ++eye )
 	{
@@ -1479,33 +1722,55 @@ static XrResult XRAPI_CALL EnumerateInstanceExtensionProperties( const char *lay
 	XrExtensionProperties *props )
 {
 	(void)layer;
-	*count = 1;
+	/* Vulkan only so far as OpenVR bridges need it (xrizer opens a temporary Vulkan session before it knows the
+	 * game's API): such a session runs but cannot create swapchains */
+	/* XR_FB_display_refresh_rate only for OpenVR bridges (FAKEXR_REFRESH_EXT=1, set by fakexr-run with
+	 * FAKEXR_OPENVR): xrizer gets the refresh rate an OpenVR game asks for from it, which SteamVR's own OpenVR
+	 * answers directly (119.88 here); OpenXR apps keep seeing SteamVR's extension set */
+	int refresh = getenv( "FAKEXR_REFRESH_EXT" ) && atoi( getenv( "FAKEXR_REFRESH_EXT" ));
+	*count = refresh ? 3 : 2;
 	if( !capacity )
 		return XR_SUCCESS;
-	if( capacity < 1 )
+	if( capacity < *count )
 		return XR_ERROR_SIZE_INSUFFICIENT;
 	strcpy( props[0].extensionName, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME );
 	props[0].extensionVersion = XR_KHR_opengl_enable_SPEC_VERSION;
+	strcpy( props[1].extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME );
+	props[1].extensionVersion = XR_KHR_vulkan_enable_SPEC_VERSION;
+	if( refresh )
+	{
+		strcpy( props[2].extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME );
+		props[2].extensionVersion = XR_FB_display_refresh_rate_SPEC_VERSION;
+	}
 	return XR_SUCCESS;
 }
 
 static void InitDefaults( void )
 {
 	const char *env;
-	float l = DEG2RAD( 52.0f ), r = DEG2RAD( 44.0f ), u = DEG2RAD( 48.0f ), d;
-
-	/* the down angle makes the vertical extent equal the horizontal one: the recommended image is square, so
-	 * pixels stay square (it was 52 deg, which made every image 6 % taller per pixel than wide) */
-	d = atanf( tanf( l ) + tanf( r ) - tanf( u ));
+	const char *preset = ( env = getenv( "FAKEXR_PRESET" )) && *env ? env : "psvr2";
+	int psvr2 = strcmp( preset, "square" ) != 0;
+	/* psvr2 (default): this PC's PS VR2 through SteamVR 2.18 + Ignition, as SteamVR reports it to apps: per eye
+	 * tangents out 1.826 / in 0.947 / up and down 1.330 (OpenXR view fov from the Black Mesa VR helper log, the
+	 * same numbers the CS:S harness uses), recommended image 2884x2940 (SteamVR's GetRecommendedRenderTargetSize
+	 * with this PC's supersampling, vrserver.txt), 119.88 Hz. Pixels are not square there (image 0.981 wide per
+	 * tall, fov 1.043): that is SteamVR's choice, not an app error.
+	 * square: a symmetric-ish fov with a square image and square pixels (52/44/48/48.6 deg). */
+	float l = psvr2 ? atanf( 1.826f ) : DEG2RAD( 52.0f ), r = psvr2 ? atanf( 0.947f ) : DEG2RAD( 44.0f );
+	float u = psvr2 ? atanf( 1.330f ) : DEG2RAD( 48.0f ), d = psvr2 ? atanf( 1.330f ) : atanf( tanf( l ) + tanf( r ) - tanf( u ));
 
 	memset( &rt, 0, sizeof( rt ));
 	rt.control_fd = -1;
+	rt.worst_aspect = 1.0f;
 	rt.ipd = ( env = getenv( "FAKEXR_IPD" )) ? (float)atof( env ) : 0.064f;
-	rt.eye_size = ( env = getenv( "FAKEXR_EYE_SIZE" )) ? (uint32_t)atoi( env ) : 960;
-	if( rt.eye_size < 64 || rt.eye_size > 4096 )
-		rt.eye_size = 960;
-	rt.fps = ( env = getenv( "FAKEXR_FPS" )) ? (float)atof( env ) : 90.0f;
+	/* FAKEXR_EYE_SIZE = the image width; the height follows the preset's shape (psvr2: SteamVR's 2884x2940) */
+	rt.eye_w = ( env = getenv( "FAKEXR_EYE_SIZE" )) ? (uint32_t)atoi( env ) : 960;
+	if( rt.eye_w < 64 || rt.eye_w > 4096 )
+		rt.eye_w = 960;
+	rt.eye_h = psvr2 ? (uint32_t)( rt.eye_w * 2940.0f / 2884.0f + 0.5f ) : rt.eye_w;
+	rt.fps = ( env = getenv( "FAKEXR_FPS" )) ? (float)atof( env ) : psvr2 ? 119.88f : 90.0f;
 	rt.grip_pitch = ( env = getenv( "FAKEXR_GRIP_PITCH" )) ? (float)atof( env ) : 0.0f;
+	rt.floor = ( env = getenv( "FAKEXR_FLOOR" )) ? (float)atof( env ) : 1.65f;
 	verbose = ( env = getenv( "FAKEXR_VERBOSE" )) && atoi( env );
 
 	/* asymmetric like a real headset: each eye sees further outwards */
@@ -1534,8 +1799,24 @@ static XrResult XRAPI_CALL CreateInstance( const XrInstanceCreateInfo *info, XrI
 	CHECK_TYPE( info, XR_TYPE_INSTANCE_CREATE_INFO );
 	for( uint32_t i = 0; i < info->enabledExtensionCount; ++i )
 	{
-		if( strcmp( info->enabledExtensionNames[i], XR_KHR_OPENGL_ENABLE_EXTENSION_NAME ))
+		if( strcmp( info->enabledExtensionNames[i], XR_KHR_OPENGL_ENABLE_EXTENSION_NAME ) &&
+			strcmp( info->enabledExtensionNames[i], XR_KHR_VULKAN_ENABLE_EXTENSION_NAME ) &&
+			strcmp( info->enabledExtensionNames[i], XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME ))
 			return XR_ERROR_EXTENSION_NOT_PRESENT;
+	}
+	{
+		/* like SteamVR 2.18, which only accepts OpenXR 1.0 (an engine built against SDK 1.1 asks for 1.1 and is
+		 * refused there); FAKEXR_API_MAX=1.1 allows 1.1 */
+		const char *env = getenv( "FAKEXR_API_MAX" );
+		XrVersion max = ( env && !strcmp( env, "1.1" )) ? XR_MAKE_VERSION( 1, 1, 0 ) : XR_MAKE_VERSION( 1, 0, 0 );
+		XrVersion asked = info->applicationInfo.apiVersion;
+		if( XR_VERSION_MAJOR( asked ) != 1 || XR_VERSION_MINOR( asked ) > XR_VERSION_MINOR( max ))
+		{
+			Log( "instance refused: the application asks for OpenXR %u.%u.%u, this runtime (like SteamVR 2.18) "
+				"accepts 1.%u (FAKEXR_API_MAX)", XR_VERSION_MAJOR( asked ), XR_VERSION_MINOR( asked ),
+				XR_VERSION_PATCH( asked ), XR_VERSION_MINOR( max ));
+			return XR_ERROR_API_VERSION_UNSUPPORTED;
+		}
 	}
 	if( rt.instance_alive )
 		return XR_ERROR_LIMIT_REACHED;
@@ -1546,8 +1827,8 @@ static XrResult XRAPI_CALL CreateInstance( const XrInstanceCreateInfo *info, XrI
 	rt.hand_path[0] = PathIntern( "/user/hand/left" );
 	rt.hand_path[1] = PathIntern( "/user/hand/right" );
 	*instance = TO_HANDLE( XrInstance, &rt.instance_alive );
-	Log( "instance created for \"%s\" (eye %ux%u, %.0f fps, profile %s, control %s)", info->applicationInfo.applicationName,
-		rt.eye_size, rt.eye_size, rt.fps, PathString( rt.profile ), rt.control_fd >= 0 ? "on" : "off" );
+	Log( "instance created for \"%s\" (eye %ux%u, %.2f fps, profile %s, control %s)", info->applicationInfo.applicationName,
+		rt.eye_w, rt.eye_h, rt.fps, PathString( rt.profile ), rt.control_fd >= 0 ? "on" : "off" );
 	return XR_SUCCESS;
 }
 
@@ -1683,7 +1964,8 @@ static XrResult XRAPI_CALL EnumerateViewConfigurationViews( XrInstance instance,
 		return XR_ERROR_SIZE_INSUFFICIENT;
 	for( int i = 0; i < 2; ++i )
 	{
-		views[i].recommendedImageRectWidth = views[i].recommendedImageRectHeight = rt.eye_size;
+		views[i].recommendedImageRectWidth = rt.eye_w;
+		views[i].recommendedImageRectHeight = rt.eye_h;
 		views[i].maxImageRectWidth = views[i].maxImageRectHeight = 8192;
 		views[i].recommendedSwapchainSampleCount = views[i].maxSwapchainSampleCount = 1;
 	}
@@ -1720,6 +2002,9 @@ static XrResult XRAPI_CALL CreateSession( XrInstance instance, const XrSessionCr
 		return XR_ERROR_LIMIT_REACHED;
 	if( !info->next )
 		return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+	rt.session_vulkan = ((const XrBaseInStructure *)info->next)->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR;
+	if( rt.session_vulkan )
+		Log( "Vulkan session: runs, but no swapchains (only for OpenVR bridges' start-up session)" );
 	rt.session_alive = 1;
 	rt.session_running = 0;
 	rt.attached = 0;
@@ -1787,13 +2072,14 @@ static XrResult XRAPI_CALL RequestExitSession( XrSession session )
 static XrResult XRAPI_CALL EnumerateReferenceSpaces( XrSession session, uint32_t capacity, uint32_t *count, XrReferenceSpaceType *spaces )
 {
 	(void)session;
-	*count = 2;
+	*count = 3;
 	if( !capacity )
 		return XR_SUCCESS;
-	if( capacity < 2 )
+	if( capacity < 3 )
 		return XR_ERROR_SIZE_INSUFFICIENT;
 	spaces[0] = XR_REFERENCE_SPACE_TYPE_VIEW;
 	spaces[1] = XR_REFERENCE_SPACE_TYPE_LOCAL;
+	spaces[2] = XR_REFERENCE_SPACE_TYPE_STAGE;
 	return XR_SUCCESS;
 }
 
@@ -1802,7 +2088,8 @@ static XrResult XRAPI_CALL CreateReferenceSpace( XrSession session, const XrRefe
 	space_t *s;
 	(void)session;
 	CHECK_TYPE( info, XR_TYPE_REFERENCE_SPACE_CREATE_INFO );
-	if( info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW && info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL )
+	if( info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW && info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL &&
+		info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE )
 		return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
 	s = calloc( 1, sizeof( *s ));
 	if( !s )
@@ -1935,6 +2222,11 @@ static XrResult XRAPI_CALL EnumerateSwapchainFormats( XrSession session, uint32_
 
 static XrResult XRAPI_CALL CreateSwapchain( XrSession session, const XrSwapchainCreateInfo *info, XrSwapchain *swapchain )
 {
+	if( rt.session_vulkan )
+	{
+		Log( "CreateSwapchain: not supported in a Vulkan session" );
+		return XR_ERROR_FEATURE_UNSUPPORTED;
+	}
 	swapchain_t *chain;
 	GLint previous = 0;
 	(void)session;
@@ -1948,16 +2240,29 @@ static XrResult XRAPI_CALL CreateSwapchain( XrSession session, const XrSwapchain
 	chain->format = info->format;
 	chain->width = info->width;
 	chain->height = info->height;
-	glGetIntegerv( GL_TEXTURE_BINDING_2D, &previous );
+	chain->array_size = info->arraySize ? info->arraySize : 1;
+	if( chain->array_size > 1 && ( !LoadGL( ) || !gl.TexImage3D || !gl.FramebufferTextureLayer ))
+	{
+		free( chain );
+		return XR_ERROR_FEATURE_UNSUPPORTED;
+	}
+	glGetIntegerv( chain->array_size > 1 ? GL_TEXTURE_BINDING_2D_ARRAY : GL_TEXTURE_BINDING_2D, &previous );
 	glGenTextures( MAX_SWAPCHAIN_IMAGES, chain->textures );
 	for( int i = 0; i < MAX_SWAPCHAIN_IMAGES; ++i )
 	{
-		glBindTexture( GL_TEXTURE_2D, chain->textures[i] );
-		glTexImage2D( GL_TEXTURE_2D, 0, (GLint)info->format, info->width, info->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL );
-		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
-		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		GLenum target = chain->array_size > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+		glBindTexture( target, chain->textures[i] );
+		if( chain->array_size > 1 )
+			gl.TexImage3D( target, 0, (GLint)info->format, info->width, info->height, chain->array_size, 0, GL_RGBA,
+				GL_UNSIGNED_BYTE, NULL );
+		else
+			glTexImage2D( target, 0, (GLint)info->format, info->width, info->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL );
+		glTexParameteri( target, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+		glTexParameteri( target, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
 	}
-	glBindTexture( GL_TEXTURE_2D, (GLuint)previous );
+	glBindTexture( chain->array_size > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D, (GLuint)previous );
+	if( verbose )
+		Log( "swapchain %ux%u x%u, format 0x%llx", chain->width, chain->height, chain->array_size, (long long)chain->format );
 	*swapchain = TO_HANDLE( XrSwapchain, chain );
 	return XR_SUCCESS;
 }
@@ -1966,6 +2271,10 @@ static XrResult XRAPI_CALL DestroySwapchain( XrSwapchain swapchain )
 {
 	swapchain_t *chain = FROM_HANDLE( swapchain_t, swapchain );
 	glDeleteTextures( MAX_SWAPCHAIN_IMAGES, chain->textures );
+	if( chain->scratch )
+		glDeleteTextures( 1, &chain->scratch );
+	if( chain->scratch_fbo && gl.DeleteFramebuffers )
+		gl.DeleteFramebuffers( 1, &chain->scratch_fbo );
 	free( chain );
 	return XR_SUCCESS;
 }
@@ -2007,6 +2316,29 @@ static XrResult XRAPI_CALL ReleaseSwapchainImage( XrSwapchain swapchain, const X
 	(void)info;
 	/* the image the compositor shows is the last one released */
 	chain->acquired = ( chain->next + MAX_SWAPCHAIN_IMAGES - 1 ) % MAX_SWAPCHAIN_IMAGES;
+	if( verbose && chain->array_size > 1 && LoadGL( ) && gl.FramebufferTextureLayer )
+	{
+		static int logged;
+		if( logged++ < 3 )
+		{
+			GLint read_fbo = 0;
+			GLuint fbo;
+			uint8_t px[2][4] = { { 0 } };
+			GLenum error = glGetError();
+			glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
+			gl.GenFramebuffers( 1, &fbo );
+			gl.BindFramebuffer( GL_READ_FRAMEBUFFER, fbo );
+			for( int layer = 0; layer < 2; ++layer )
+			{
+				gl.FramebufferTextureLayer( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, chain->textures[chain->acquired], 0, layer );
+				glReadPixels( chain->width / 2, chain->height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px[layer] );
+			}
+			gl.BindFramebuffer( GL_READ_FRAMEBUFFER, (GLuint)read_fbo );
+			gl.DeleteFramebuffers( 1, &fbo );
+			Log( "release image %u: GL error before 0x%x, centre pixels layer0 %u %u %u layer1 %u %u %u", chain->acquired,
+				error, px[0][0], px[0][1], px[0][2], px[1][0], px[1][1], px[1][2] );
+		}
+	}
 	return XR_SUCCESS;
 }
 
@@ -2062,8 +2394,14 @@ static XrResult XRAPI_CALL EndFrame( XrSession session, const XrFrameEndInfo *in
 	(void)session;
 	CHECK_TYPE( info, XR_TYPE_FRAME_END_INFO );
 	rt.frame_index++;
+	if( !info->layerCount )
+		rt.empty_frames++;
+	if( rt.session_vulkan )
+		return XR_SUCCESS;
 	CheckProjection( info );
-	if( rt.shot_path[0] )
+	/* a shot waits for a frame that shows something: an app driven through an OpenVR bridge can end every other
+	 * frame empty (Doom 3 BFG VR calls WaitGetPoses twice per rendered frame; xrizer starts a frame on each) */
+	if( rt.shot_path[0] && info->layerCount )
 	{
 		WriteShotJSON( info ); /* before the PNG: the runner waits for the PNG */
 		Compose( info );
@@ -2140,6 +2478,16 @@ static XrResult XRAPI_CALL AttachSessionActionSets( XrSession session, const XrS
 	if( rt.attached )
 		return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
 	rt.attached = 1;
+	/* the controllers' profile becomes current now: announce it, as a real runtime does, also when the app attaches
+	 * after xrBeginSession (xrizer does; BeginSession only announces it for apps that attached before) */
+	if( rt.session_running )
+	{
+		XrEventDataInteractionProfileChanged changed;
+		memset( &changed, 0, sizeof( changed ));
+		changed.type = XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED;
+		changed.session = TO_HANDLE( XrSession, &rt.session_alive );
+		PushEvent( &changed, sizeof( changed ));
+	}
 	return XR_SUCCESS;
 }
 
@@ -2275,6 +2623,173 @@ static XrResult XRAPI_CALL StopHapticFeedback( XrSession session, const XrHaptic
 	return XR_SUCCESS;
 }
 
+
+/* ---------- the rest of core OpenXR 1.0/1.1 (OpenVR bridges such as xrizer load every core function) ---------- */
+
+static XrResult XRAPI_CALL GetReferenceSpaceBoundsRect( XrSession session, XrReferenceSpaceType type, XrExtent2Df *bounds )
+{
+	(void)session;
+	if( type == XR_REFERENCE_SPACE_TYPE_STAGE )
+	{
+		/* a 2 x 2 m play area around the LOCAL origin */
+		bounds->width = bounds->height = 2.0f;
+		return XR_SUCCESS;
+	}
+	bounds->width = bounds->height = 0.0f;
+	return XR_SPACE_BOUNDS_UNAVAILABLE;
+}
+
+static XrResult XRAPI_CALL EnumerateBoundSourcesForAction( XrSession session, const XrBoundSourcesForActionEnumerateInfo *info,
+	uint32_t capacity, uint32_t *count, XrPath *sources )
+{
+	uint32_t n = 0;
+	(void)session;
+	CHECK_TYPE( info, XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO );
+	if( !rt.attached )
+		return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+	for( uint32_t i = 0; i < rt.binding_count; ++i )
+	{
+		const binding_t *b = &rt.bindings[i];
+		if( b->profile != rt.profile || b->action != FROM_HANDLE( action_t, info->action ))
+			continue;
+		if( capacity && n < capacity )
+			sources[n] = b->path;
+		n++;
+	}
+	*count = n;
+	return ( capacity && capacity < n ) ? XR_ERROR_SIZE_INSUFFICIENT : XR_SUCCESS;
+}
+
+static XrResult XRAPI_CALL GetInputSourceLocalizedName( XrSession session, const XrInputSourceLocalizedNameGetInfo *info,
+	uint32_t capacity, uint32_t *count, char *buffer )
+{
+	const char *name;
+	(void)session;
+	CHECK_TYPE( info, XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO );
+	name = PathString( info->sourcePath );
+	*count = (uint32_t)strlen( name ) + 1;
+	if( !capacity )
+		return XR_SUCCESS;
+	if( capacity < *count )
+		return XR_ERROR_SIZE_INSUFFICIENT;
+	memcpy( buffer, name, *count );
+	return XR_SUCCESS;
+}
+
+static XrResult XRAPI_CALL LocateSpaces( XrSession session, const XrSpacesLocateInfo *info, XrSpaceLocations *locations )
+{
+	XrSpaceVelocities *velocities = NULL;
+	(void)session;
+	CHECK_TYPE( info, XR_TYPE_SPACES_LOCATE_INFO );
+	CHECK_TYPE( locations, XR_TYPE_SPACE_LOCATIONS );
+	if( locations->locationCount != info->spaceCount )
+		return XR_ERROR_VALIDATION_FAILURE;
+	for( XrBaseOutStructure *next = (XrBaseOutStructure *)locations->next; next; next = next->next )
+	{
+		if( next->type == XR_TYPE_SPACE_VELOCITIES )
+			velocities = (XrSpaceVelocities *)next;
+	}
+	for( uint32_t i = 0; i < info->spaceCount; ++i )
+	{
+		XrSpaceVelocity velocity;
+		XrSpaceLocation location;
+
+		memset( &velocity, 0, sizeof( velocity ));
+		memset( &location, 0, sizeof( location ));
+		velocity.type = XR_TYPE_SPACE_VELOCITY;
+		location.type = XR_TYPE_SPACE_LOCATION;
+
+		if( velocities && i < velocities->velocityCount )
+			location.next = &velocity;
+		LocateSpace( info->spaces[i], info->baseSpace, info->time, &location );
+		locations->locations[i].locationFlags = location.locationFlags;
+		locations->locations[i].pose = location.pose;
+		if( velocities && i < velocities->velocityCount )
+		{
+			velocities->velocities[i].velocityFlags = velocity.velocityFlags;
+			velocities->velocities[i].linearVelocity = velocity.linearVelocity;
+			velocities->velocities[i].angularVelocity = velocity.angularVelocity;
+		}
+	}
+	return XR_SUCCESS;
+}
+
+
+/* ---------- XR_KHR_vulkan_enable (enough for a session that never draws) ---------- */
+
+static XrResult XRAPI_CALL GetVulkanExtensionsKHR( XrInstance instance, XrSystemId system, uint32_t capacity, uint32_t *count,
+	char *buffer )
+{
+	(void)instance; (void)system;
+	*count = 1; /* "" */
+	if( capacity )
+		buffer[0] = '\0';
+	return XR_SUCCESS;
+}
+
+static XrResult XRAPI_CALL GetVulkanGraphicsDeviceKHR( XrInstance instance, XrSystemId system, VkInstance vk_instance,
+	VkPhysicalDevice *device )
+{
+	static void *lib;
+	PFN_vkGetInstanceProcAddr gipa;
+	PFN_vkEnumeratePhysicalDevices enumerate;
+	VkPhysicalDevice devices[8];
+	uint32_t n = 8;
+	(void)instance; (void)system;
+
+	if( !lib )
+		lib = dlopen( "libvulkan.so.1", RTLD_NOW | RTLD_LOCAL );
+	gipa = lib ? (PFN_vkGetInstanceProcAddr)dlsym( lib, "vkGetInstanceProcAddr" ) : NULL;
+	enumerate = gipa ? (PFN_vkEnumeratePhysicalDevices)gipa( vk_instance, "vkEnumeratePhysicalDevices" ) : NULL;
+	if( !enumerate || enumerate( vk_instance, &n, devices ) < 0 || !n )
+	{
+		Log( "GetVulkanGraphicsDeviceKHR: no Vulkan physical device" );
+		return XR_ERROR_RUNTIME_FAILURE;
+	}
+	*device = devices[0];
+	return XR_SUCCESS;
+}
+
+static XrResult XRAPI_CALL GetVulkanGraphicsRequirementsKHR( XrInstance instance, XrSystemId system,
+	XrGraphicsRequirementsVulkanKHR *requirements )
+{
+	(void)instance; (void)system;
+	CHECK_TYPE( requirements, XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR );
+	requirements->minApiVersionSupported = XR_MAKE_VERSION( 1, 0, 0 );
+	requirements->maxApiVersionSupported = XR_MAKE_VERSION( 1, 4, 0 );
+	return XR_SUCCESS;
+}
+
+
+/* ---------- XR_FB_display_refresh_rate (OpenVR bridges only, see EnumerateInstanceExtensionProperties) ---------- */
+
+static XrResult XRAPI_CALL EnumerateDisplayRefreshRatesFB( XrSession session, uint32_t capacity, uint32_t *count, float *rates )
+{
+	(void)session;
+	*count = 2; /* the PS VR2's modes in SteamVR */
+	if( !capacity )
+		return XR_SUCCESS;
+	if( capacity < 2 )
+		return XR_ERROR_SIZE_INSUFFICIENT;
+	rates[0] = 90.0f;
+	rates[1] = 119.88f;
+	return XR_SUCCESS;
+}
+
+static XrResult XRAPI_CALL GetDisplayRefreshRateFB( XrSession session, float *rate )
+{
+	(void)session;
+	*rate = rt.fps > 0 ? rt.fps : 119.88f;
+	return XR_SUCCESS;
+}
+
+static XrResult XRAPI_CALL RequestDisplayRefreshRateFB( XrSession session, float rate )
+{
+	(void)session;
+	Log( "display refresh rate %.2f requested (kept at %.2f, like a fixed SteamVR setting)", rate, rt.fps );
+	return XR_SUCCESS;
+}
+
 /* ---------- dispatch ---------- */
 
 static XrResult XRAPI_CALL GetInstanceProcAddr( XrInstance instance, const char *name, PFN_xrVoidFunction *function );
@@ -2293,7 +2808,11 @@ static const struct { const char *name; PFN_xrVoidFunction function; } functions
 	F( DestroyActionSet ), F( CreateAction ), F( DestroyAction ), F( SuggestInteractionProfileBindings ),
 	F( AttachSessionActionSets ), F( GetCurrentInteractionProfile ), F( SyncActions ), F( GetActionStateBoolean ),
 	F( GetActionStateFloat ), F( GetActionStateVector2f ), F( GetActionStatePose ), F( ApplyHapticFeedback ),
-	F( StopHapticFeedback ),
+	F( StopHapticFeedback ), F( GetReferenceSpaceBoundsRect ), F( EnumerateBoundSourcesForAction ),
+	F( GetInputSourceLocalizedName ), F( LocateSpaces ), F( GetVulkanGraphicsDeviceKHR ), F( GetVulkanGraphicsRequirementsKHR ),
+	{ "xrGetVulkanInstanceExtensionsKHR", (PFN_xrVoidFunction)GetVulkanExtensionsKHR },
+	F( EnumerateDisplayRefreshRatesFB ), F( GetDisplayRefreshRateFB ), F( RequestDisplayRefreshRateFB ),
+	{ "xrGetVulkanDeviceExtensionsKHR", (PFN_xrVoidFunction)GetVulkanExtensionsKHR },
 #undef F
 };
 
@@ -2322,7 +2841,8 @@ EXPORT XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInterface( const XrNegotiateL
 		loader->maxInterfaceVersion < XR_CURRENT_LOADER_RUNTIME_VERSION )
 		return XR_ERROR_INITIALIZATION_FAILED;
 	request->runtimeInterfaceVersion = XR_CURRENT_LOADER_RUNTIME_VERSION;
-	request->runtimeApiVersion = XR_MAKE_VERSION( 1, 0, 34 );
+	request->runtimeApiVersion = ( getenv( "FAKEXR_API_MAX" ) && !strcmp( getenv( "FAKEXR_API_MAX" ), "1.1" )) ?
+		XR_MAKE_VERSION( 1, 1, 0 ) : XR_MAKE_VERSION( 1, 0, 34 );
 	request->getInstanceProcAddr = GetInstanceProcAddr;
 	return XR_SUCCESS;
 }

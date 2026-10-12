@@ -3,6 +3,11 @@
 #
 # Usage: fakexr-run <game-root|live> <scenario> [xash args...]     play a scenario file, then quit
 #        fakexr-run --serve <game-root|live> [xash args...]        keep the game up; send directives with fakexr-ctl
+#        fakexr-run [--serve] --app <dir> [<scenario>] <program> [args...]
+#                   any other OpenXR (or, with FAKEXR_OPENVR, OpenVR) program, started in <dir> with its own $HOME
+#                   in $OUT/home (configs/saves land there); "con" lines go to its stdin. FAKEXR_OPENVR=<OpenVR
+#                   runtime dir, e.g. xrizer's target/release> = OpenVR -> OpenXR bridge for this process only
+#                   (VR_OVERRIDE + an openvrpaths.vrpath in the fake home; the real SteamVR setup is not touched).
 #   game-root  live = the installed game (~/Games/lambda1vr-pc, or $FAKEXR_LIVE), used READ-ONLY: a thin root of
 #              symlinked binaries in $FAKEXR_OUT/root takes all writes (configs, saves) and the engine reads the
 #              game data from the install through -rodir. Or a COPY of the game tree (the real install itself is
@@ -34,13 +39,23 @@
 #                                   and check that the images line up under the declared projection (catches an app
 #                                   that renders with another field of view or aspect ratio than it declares)
 #     include <file>                run another scenario file (relative to this one, or utils/fakexr/scenarios/)
+#     press <sense button> [seconds]  PS VR2 Sense button as SteamVR + Sony's driver deliver it to OpenXR apps (Touch
+#                                   profile): cross/circle = right a/b, square/triangle = left x/y, l2/r2 = trigger,
+#                                   l1/r1 = grip, l3/r3 = stick click, menu = left menu. options/create/ps reach no app
+#                                   (Options feeds a path the generated Touch binding does not listen to; Create =
+#                                   SteamVR screenshot; PS = system): logged, nothing sent. Default 0.2 s.
+#     hold <sense button> / release <sense button>
+#     stick left|right <x> <y>      thumbstick deflection (0 0 = centre)
+#     key <keysym...>               real key presses into the game's window on the hidden display (xdotool), e.g.
+#                                   key Return; key ctrl+alt+grave
 #
 # Environment: FAKEXR_OUT (default ./fakexr-out), FAKEXR_GAME (default: -game from the args, else valve),
 # FAKEXR_DISPLAY (use this X display instead of starting Xvfb), FAKEXR_SCREEN (Xvfb screen, default 1280x720x24),
 # FAKEXR_GPU (1 = render on the GPU through VirtualGL, 0 = llvmpipe; default: GPU when vglrun is installed and
 # the desktop X server in $DISPLAY is reachable; FAKEXR_VGL_DEVICE overrides the 3D X server; on the GPU
-# FAKEXR_EYE_SIZE defaults to 2048 instead of 960),
-# FAKEXR_AUDIO (1 = real audio output; default silent SDL dummy driver), FAKEXR_OVERLAY (directory copied over
+# FAKEXR_EYE_SIZE defaults to 2884, SteamVR's real width here, instead of 960),
+# FAKEXR_AUDIO (1 = real audio output; default silent SDL dummy driver), FAKEXR_DBUS (1 = give the program the desktop's
+# D-Bus session; default none, so it cannot inhibit/wake the screensaver), FAKEXR_OVERLAY (directory copied over
 # the thin root, e.g. freshly built libxash.so or valve/cl_dlls/client.so to test without installing),
 # FAKEXR_CACHE (shader/font cache, default ~/.cache/fakexr), plus the runtime's own FAKEXR_*.
 # The game's output goes to $OUT/game.log.
@@ -49,23 +64,29 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 json=$here/build/fakexr32/fakexr.json
 live=$(realpath -m "${FAKEXR_LIVE:-$HOME/Games/lambda1vr-pc}")
-usage() { sed -n '2,36p' "$0"; exit 2; }
+usage() { sed -n '2,41p' "$0"; exit 2; }
 
-serve=0
-if [[ ${1:-} == --serve ]]; then
-	serve=1
+serve=0 app=
+while [[ ${1:-} == --* ]]; do
+	case $1 in
+	--serve) serve=1; shift ;;
+	--app) [[ $# -ge 2 ]] || usage; app=$(cd "$2" && pwd); shift 2 ;;
+	*) usage ;;
+	esac
+done
+root_arg=
+if [[ -z $app ]]; then
+	[[ $# -ge $((serve ? 1 : 2)) ]] || usage
+	root_arg=$1
 	shift
-	[[ $# -ge 1 ]] || usage
-else
-	[[ $# -ge 2 ]] || usage
 fi
-root_arg=$1
-shift
 scenario=
 if ((!serve)); then
+	[[ $# -ge 1 ]] || usage
 	scenario=$(realpath "$1")
 	shift
 fi
+[[ -z $app || $# -ge 1 ]] || usage
 
 [[ -f $json ]] || { echo "fakexr-run: build the runtime first (make -C $here)" >&2; exit 1; }
 command -v bwrap >/dev/null || { echo "fakexr-run: bubblewrap (bwrap) is required for the write guard" >&2; exit 1; }
@@ -77,7 +98,16 @@ mkdir -p "$cache"
 
 # ---- game root ----
 rodir=
-if [[ $root_arg == live ]]; then
+if [[ -n $app ]]; then
+	root=$app
+	program=$1
+	shift
+	[[ $program == */* ]] || program=./$program
+	( cd "$root" && [[ -x $program ]] ) || { echo "fakexr-run: no executable $program in $root" >&2; exit 1; }
+	# the runtime must match the program's word size
+	if file -L "$root/$program" 2>/dev/null | grep -q 'ELF 64-bit'; then json=$here/build/fakexr64/fakexr.json; fi
+	[[ -f $json ]] || { echo "fakexr-run: build the runtime first (make -C $here)" >&2; exit 1; }
+elif [[ $root_arg == live ]]; then
 	[[ -x $live/xash3d ]] || { echo "fakexr-run: no game at $live" >&2; exit 1; }
 	root=$out/root
 	mkdir -p "$root"
@@ -112,7 +142,7 @@ else
 		exit 1
 	fi
 fi
-if [[ -n ${FAKEXR_OVERLAY:-} ]]; then
+if [[ -n ${FAKEXR_OVERLAY:-} && -z $app ]]; then
 	cp -rT --remove-destination "$FAKEXR_OVERLAY" "$root"
 	echo "fakexr-run: overlay $FAKEXR_OVERLAY copied into $root"
 fi
@@ -128,6 +158,23 @@ for ((i = 0; i < ${#args[@]}; i++)); do
 	fi
 done
 game=${game:-valve}
+[[ -n $app ]] && game=${program##*/}
+
+# ---- a fake $HOME for --app programs (their configs and saves), and the optional OpenVR bridge ----
+app_env=()
+if [[ -n $app ]]; then
+	home=$out/home
+	mkdir -p "$home/.config" "$home/.local/share"
+	app_env=(HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_DATA_HOME="$home/.local/share")
+	if [[ -n ${FAKEXR_OPENVR:-} ]]; then
+		openvr=$(cd "$FAKEXR_OPENVR" && pwd)
+		mkdir -p "$home/.config/openvr"
+		printf '{\n\t"jsonid": "vrpathreg",\n\t"runtime": [ "%s" ],\n\t"config": [ "%s" ],\n\t"log": [ "%s" ],\n\t"version": 1\n}\n' \
+			"$openvr" "$home/.config/openvr" "$out" >"$home/.config/openvr/openvrpaths.vrpath"
+		# an OpenVR bridge talks OpenXR 1.1 and asks the refresh rate through XR_FB_display_refresh_rate
+		app_env+=(VR_OVERRIDE="$openvr" FAKEXR_API_MAX="${FAKEXR_API_MAX:-1.1}" FAKEXR_REFRESH_EXT=1)
+	fi
+fi
 
 log=$out/game.log
 : >"$log"
@@ -193,36 +240,65 @@ fi
 if [[ $gpu != 0 ]]; then
 	gpu=1
 	vgl=(vglrun -d "$vgl_device")
-	# the GPU keeps up with a headset-like resolution (PS VR2: 2000x2040 per eye), llvmpipe does not
-	export FAKEXR_EYE_SIZE=${FAKEXR_EYE_SIZE:-2048}
+	# VirtualGL renders through the desktop's X server: note whether it is blanked or locked (Source games under
+	# Proton stalled on the real desktop while the screensaver was up; whether GLX pbuffers do is being checked)
+	desk_state=$(xset -display "$vgl_device" q 2>/dev/null | sed -n 's/^ *Monitor is //p')
+	if [[ $(dbus-send --session --print-reply --dest=org.freedesktop.DBus /org/freedesktop/DBus \
+		org.freedesktop.DBus.NameHasOwner string:org.cinnamon.ScreenSaver 2>/dev/null | awk '/boolean/ { print $2 }') == true ]]; then
+		# only ask a running screensaver (GetActive would D-Bus-activate it otherwise)
+		[[ $(dbus-send --session --print-reply --dest=org.cinnamon.ScreenSaver /org/cinnamon/ScreenSaver \
+			org.cinnamon.ScreenSaver.GetActive 2>/dev/null | awk '/boolean/ { print $2 }') == true ]] && desk_state+=", screensaver/lock active"
+	fi
+	echo "fakexr-run: desktop $vgl_device for VirtualGL: monitor ${desk_state:-unknown}" >&2
+	# the GPU keeps up with the real thing: SteamVR asks for 2884x2940 per eye on this PC (llvmpipe does not)
+	export FAKEXR_EYE_SIZE=${FAKEXR_EYE_SIZE:-2884}
 fi
 
 # ---- sandbox: $HOME read-only except what this run may write ----
 sandbox=(bwrap --dev-bind / / --ro-bind "$HOME" "$HOME" --bind "$out" "$out" --bind "$cache" "$cache" --die-with-parent)
 [[ -n $rodir ]] && sandbox+=(--ro-bind "$rodir" "$rodir")
-[[ $root != "$out"/* ]] && sandbox+=(--bind "$root" "$root")
+# a copied game root is writable; an --app folder stays read-only (the program writes to its fake $HOME)
+[[ $root != "$out"/* && -z $app ]] && sandbox+=(--bind "$root" "$root")
 
 # Both FIFOs opened read-write so neither side blocks or sees EOF.
 exec 3<>"$xr_fifo" 4<>"$con_fifo"
-xash=(./xash3d -game "$game" +set vr_enable 1 +set gl_vsync 0 +set fps_max 0 -console -log -stdincmd
-	-width 1280 -height 720 -windowed)
-[[ -n $rodir ]] && xash+=(-rodir "$rodir")
+if [[ -n $app ]]; then
+	xash=("$program")
+	# programs that only print through stdio buffer fully into a pipe: line-buffer them so the log is live
+	command -v stdbuf >/dev/null && xash=(stdbuf -oL -eL "$program")
+else
+	xash=(./xash3d -game "$game" +set vr_enable 1 +set gl_vsync 0 +set fps_max 0 -console -log -stdincmd
+		-width 1280 -height 720 -windowed)
+	[[ -n $rodir ]] && xash+=(-rodir "$rodir")
+fi
 (
 	cd "$root"
 	# SDL otherwise tickles org.freedesktop.ScreenSaver on the desktop's session bus (SimulateUserActivity),
 	# which wakes the real, blanked monitors although the game draws into Xvfb
 	audio=()
 	[[ ${FAKEXR_AUDIO:-0} == 1 ]] || audio=(SDL_AUDIODRIVER=dummy)
-	exec "${sandbox[@]}" env DISPLAY="$display" SDL_VIDEO_ALLOW_SCREENSAVER=1 "${audio[@]}" \
+	# no D-Bus session for the test program: it cannot inhibit or wake the desktop's screensaver, post notifications
+	# or start services; an unreachable address also stops libdbus from auto-launching a bus (FAKEXR_DBUS=1 keeps it)
+	[[ ${FAKEXR_DBUS:-0} == 1 ]] || audio+=(DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/fakexr-no-session-bus)
+	exec "${sandbox[@]}" env DISPLAY="$display" SDL_VIDEO_ALLOW_SCREENSAVER=1 "${audio[@]}" "${app_env[@]}" \
 		XASH3D_BASEDIR="$root" XDG_CACHE_HOME="$cache" \
 		LD_LIBRARY_PATH="$root${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 		XR_RUNTIME_JSON="$json" FAKEXR_CONTROL="$xr_fifo" \
 		"${vgl[@]}" "${xash[@]}" "${args[@]}" <"$con_fifo" >>"$log" 2>&1
 ) &
 game_pid=$!
-echo "fakexr-run: game pid $game_pid on $display ($game, $([[ $gpu == 1 ]] && echo GPU || echo llvmpipe)$([[ -n $rodir ]] && echo ", live install read-only")), output in $out"
+echo "fakexr-run: game pid $game_pid on $display ($game, $([[ $gpu == 1 ]] && echo GPU || echo llvmpipe)$([[ -n $rodir ]] && echo ", live install read-only")$([[ -n ${openvr:-} ]] && echo ", OpenVR via $openvr")), output in $out"
 
-alive() { kill -0 "$game_pid" 2>/dev/null; }
+alive() {
+	kill -0 "$game_pid" 2>/dev/null || return 1
+	# a game stuck printing in a loop must not fill /tmp (Doom 3's SIGFPE handler wrote 420 MB in a minute)
+	if (($(stat -c %s "$log" 2>/dev/null || echo 0) > ${FAKEXR_LOG_MAX_MB:-200} * 1048576)); then
+		echo "fakexr-run: game log over ${FAKEXR_LOG_MAX_MB:-200} MB, stopping the game (looping output?)" >&2
+		kill "$game_pid" 2>/dev/null
+		truncate -s "${FAKEXR_LOG_MAX_MB:-200}M" "$log"
+		return 1
+	fi
+}
 mark=0
 log_since_mark() { tail -c +$((mark + 1)) "$log"; }
 
@@ -263,6 +339,20 @@ take_shot() {
 	printf 'shot %s %s\n' "$file" "$opts" >&3
 	for _ in $(seq 1 300); do [[ -f $file ]] && break; alive || break; sleep 0.1; done
 	if [[ -f $file ]]; then echo "fakexr-run: $file"; else echo "fakexr-run: shot $name timed out" >&2; return 1; fi
+}
+
+# Sense button -> Touch input path (hand component), as the real setup delivers it
+sense_input() {
+	case $1 in
+	cross) echo "right a/click" ;; circle) echo "right b/click" ;;
+	square) echo "left x/click" ;; triangle) echo "left y/click" ;;
+	l2) echo "left trigger/value" ;; r2) echo "right trigger/value" ;;
+	l1) echo "left squeeze/value" ;; r1) echo "right squeeze/value" ;;
+	l3) echo "left thumbstick/click" ;; r3) echo "right thumbstick/click" ;;
+	menu) echo "left menu/click" ;;
+	options|create|ps) echo "none" ;;
+	*) return 1 ;;
+	esac
 }
 
 # runs one directive; returns non-zero on failure
@@ -334,6 +424,29 @@ PY
 		done
 		printf 'look 0 0 0 %s\n' "$eye" >&3
 		python3 -I "$here/fakexr-projcheck.py" "${shots[@]}"
+		;;
+	press | hold | release)
+		local button secs path
+		read -r button secs <<<"$rest"
+		path=$(sense_input "$button") || { echo "fakexr-run: unknown Sense button '$button'" >&2; return 1; }
+		if [[ $path == none ]]; then
+			echo "fakexr-run: $button does not reach the app on the real setup (see the directive help); nothing sent"
+			return 0
+		fi
+		[[ $cmd != release ]] && printf 'input %s 1\n' "$path" >&3
+		if [[ $cmd == press ]]; then sleep "${secs:-0.2}"; fi
+		[[ $cmd != hold ]] && printf 'input %s 0\n' "$path" >&3
+		;;
+	key)
+		local win
+		win=$(DISPLAY=$display xdotool search --onlyvisible --name '.' 2>/dev/null | head -1)
+		[[ -n $win ]] || { echo "fakexr-run: no window on $display for key" >&2; return 1; }
+		DISPLAY=$display xdotool windowfocus --sync "$win" key --clearmodifiers $rest
+		;;
+	stick)
+		local hand x y
+		read -r hand x y <<<"$rest"
+		printf 'input %s thumbstick %s %s\n' "$hand" "${x:-0}" "${y:-0}" >&3
 		;;
 	mark) mark=$(stat -c %s "$log") ;;
 	wait-log | expect-log)
