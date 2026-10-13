@@ -49,6 +49,9 @@ extern XVisualInfo *glXGetVisualFromFBConfig( Display *display, GLXFBConfig conf
 #ifndef GL_FRAMEBUFFER
 #define GL_FRAMEBUFFER 0x8D40
 #endif
+#ifndef GL_MAX_SAMPLES
+#define GL_MAX_SAMPLES 0x8D57
+#endif
 #ifndef GL_READ_FRAMEBUFFER
 #define GL_READ_FRAMEBUFFER 0x8CA8
 #endif
@@ -119,6 +122,12 @@ typedef struct gl_openxr_eye_s
 	XrSwapchainImageOpenGLKHR *images;
 	GLuint *framebuffers;
 	GLuint depth_stencil; /* eyes render straight into the swapchain at full size, so they need their own depth */
+	/* vr_msaa: the two eye views render into these multisampled buffers and are resolved into the
+	 * swapchain image in GL_OpenXREndEye (0 = off, render straight into the swapchain) */
+	GLuint msaa_fbo;
+	GLuint msaa_color;
+	GLuint msaa_depth;
+	int msaa_samples;
 	qboolean acquired;
 	qboolean waited;
 	qboolean ready;
@@ -250,6 +259,7 @@ typedef struct gl_openxr_state_s
 static gl_openxr_state_t xr;
 static cvar_t *vr_enable;
 static cvar_t *vr_supersampling;
+static cvar_t *vr_msaa;
 static cvar_t *vr_worldscale;
 static cvar_t *vr_ui_distance;
 static cvar_t *vr_ui_offset_x;
@@ -287,6 +297,7 @@ void GL_OpenXRInit( void )
 {
 	vr_enable = gEngfuncs.Cvar_Get( "vr_enable", "0", FCVAR_ARCHIVE, "enable desktop OpenXR rendering" );
 	vr_supersampling = gEngfuncs.Cvar_Get( "vr_supersampling", "1.0", FCVAR_ARCHIVE, "OpenXR eye resolution scale" );
+	vr_msaa = gEngfuncs.Cvar_Get( "vr_msaa", "4", FCVAR_ARCHIVE, "multisample anti-aliasing for the VR eye views: 0, 2, 4 or 8 (applied when VR starts)" );
 	vr_mirror_eye = gEngfuncs.Cvar_Get( "vr_mirror_eye", "0", 0, "eye shown in the desktop window (0 left, 1 right)" );
 	vr_worldscale = gEngfuncs.Cvar_Get( "vr_worldscale", "40", FCVAR_ARCHIVE, "game units per physical metre" );
 	vr_ui_distance = gEngfuncs.Cvar_Get( "vr_ui_distance", "2.2", FCVAR_ARCHIVE, "head-relative VR UI distance in metres" );
@@ -963,6 +974,12 @@ static void GL_OpenXRDestroyEye( gl_openxr_eye_t *eye )
 		pglDeleteFramebuffers( eye->image_count, eye->framebuffers );
 	if( eye->depth_stencil )
 		pglDeleteRenderbuffers( 1, &eye->depth_stencil );
+	if( eye->msaa_fbo )
+		pglDeleteFramebuffers( 1, &eye->msaa_fbo );
+	if( eye->msaa_color )
+		pglDeleteRenderbuffers( 1, &eye->msaa_color );
+	if( eye->msaa_depth )
+		pglDeleteRenderbuffers( 1, &eye->msaa_depth );
 	if( eye->swapchain != XR_NULL_HANDLE )
 		GL_OpenXRCheck( xrDestroySwapchain( eye->swapchain ), "xrDestroySwapchain" );
 
@@ -1040,6 +1057,54 @@ void GL_OpenXRShutdown( void )
 
 	memset( &xr, 0, sizeof( xr ));
 	xr.current_eye = -1;
+}
+
+/* vr_msaa: multisampled colour + depth for an eye view; on any failure the eye renders without MSAA. */
+static void GL_OpenXRCreateEyeMSAA( gl_openxr_eye_t *eye, int64_t format )
+{
+	GLint max_samples = 0;
+	int samples = (int)vr_msaa->value;
+
+	if( samples < 2 )
+		return;
+	if( !pglRenderbufferStorageMultisample )
+		pglRenderbufferStorageMultisample = gEngfuncs.GL_GetProcAddress( "glRenderbufferStorageMultisample" );
+	if( !pglRenderbufferStorageMultisample )
+	{
+		gEngfuncs.Con_Printf( S_WARN "OpenXR: vr_msaa needs glRenderbufferStorageMultisample, eyes render without MSAA\n" );
+		return;
+	}
+	pglGetIntegerv( GL_MAX_SAMPLES, &max_samples );
+	if( samples > max_samples )
+		samples = max_samples;
+	if( samples < 2 )
+		return;
+
+	pglGenRenderbuffers( 1, &eye->msaa_color );
+	pglBindRenderbuffer( GL_RENDERBUFFER, eye->msaa_color );
+	pglRenderbufferStorageMultisample( GL_RENDERBUFFER, samples, (GLenum)format, eye->width, eye->height );
+	pglGenRenderbuffers( 1, &eye->msaa_depth );
+	pglBindRenderbuffer( GL_RENDERBUFFER, eye->msaa_depth );
+	pglRenderbufferStorageMultisample( GL_RENDERBUFFER, samples, GL_DEPTH24_STENCIL8, eye->width, eye->height );
+	pglBindRenderbuffer( GL_RENDERBUFFER, 0 );
+
+	pglGenFramebuffers( 1, &eye->msaa_fbo );
+	pglBindFramebuffer( GL_FRAMEBUFFER, eye->msaa_fbo );
+	pglFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, eye->msaa_color );
+	pglFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, eye->msaa_depth );
+	if( pglCheckFramebufferStatus( GL_FRAMEBUFFER ) != GL_FRAMEBUFFER_COMPLETE )
+	{
+		gEngfuncs.Con_Printf( S_WARN "OpenXR: %dx MSAA eye framebuffer incomplete, eyes render without MSAA\n", samples );
+		pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
+		pglDeleteFramebuffers( 1, &eye->msaa_fbo );
+		pglDeleteRenderbuffers( 1, &eye->msaa_color );
+		pglDeleteRenderbuffers( 1, &eye->msaa_depth );
+		eye->msaa_fbo = eye->msaa_color = eye->msaa_depth = 0;
+		return;
+	}
+	pglBindFramebuffer( GL_FRAMEBUFFER, 0 );
+	eye->msaa_samples = samples;
+	gEngfuncs.Con_Printf( "OpenXR: eye %ux%u with %dx MSAA\n", eye->width, eye->height, samples );
 }
 
 static qboolean GL_OpenXRCreateEye( gl_openxr_eye_t *eye, const XrViewConfigurationView *view, int64_t format )
@@ -1247,6 +1312,7 @@ static qboolean GL_OpenXRInitialize( void )
 		xr.views[i].type = XR_TYPE_VIEW;
 		if( !GL_OpenXRCreateEye( &xr.eyes[i], &view_configs[i], selected_format ))
 			goto cleanup;
+		GL_OpenXRCreateEyeMSAA( &xr.eyes[i], selected_format );
 	}
 	{
 		XrViewConfigurationView ui_config = { XR_TYPE_VIEW_CONFIGURATION_VIEW };
@@ -1600,7 +1666,7 @@ qboolean GL_OpenXRBeginEye( int eye )
 	}
 	target->waited = true;
 
-	pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	pglBindFramebuffer( GL_FRAMEBUFFER, target->msaa_fbo ? target->msaa_fbo : target->framebuffers[target->image_index] );
 	pglViewport( 0, 0, target->width, target->height );
 	{
 		/* Swapchain images are reused: a view that does not cover every pixel (no sky, the CS spectator
@@ -1701,6 +1767,16 @@ qboolean GL_OpenXREndEye( int eye, int source_width, int source_height )
 
 	if( !target->acquired || !target->waited || source_width <= 0 || source_height <= 0 )
 		return false;
+
+	if( target->msaa_fbo )
+	{
+		/* resolve the multisampled eye into the swapchain image; everything below works on that */
+		pglBindFramebuffer( GL_READ_FRAMEBUFFER, target->msaa_fbo );
+		pglBindFramebuffer( GL_DRAW_FRAMEBUFFER, target->framebuffers[target->image_index] );
+		pglBlitFramebuffer( 0, 0, target->width, target->height, 0, 0, target->width, target->height,
+			GL_COLOR_BUFFER_BIT, GL_NEAREST );
+		pglBindFramebuffer( GL_FRAMEBUFFER, target->framebuffers[target->image_index] );
+	}
 
 	if( eye == ( vr_mirror_eye->value ? 1 : 0 ))
 	{
