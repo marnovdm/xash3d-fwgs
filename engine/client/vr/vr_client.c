@@ -1514,6 +1514,25 @@ qboolean CL_VRGetFlashlightPose( vec3_t origin, vec3_t forward )
 	local_origin[1] = relative.position[0] * sine + relative.position[1] * cosine;
 	local_origin[2] = relative.position[2];
 	VectorMA( vr_body_view_origin, vr_worldscale.value, local_origin, origin );
+
+	// Two-handed aim: the off hand holding the torch is steadying the gun, so its own aim ray points
+	// up and to the side of the target. Light along the gun instead (the client's stabilised aim is
+	// the line from the gun hand to the support hand).
+	if( vr_headtorch.value == 0.0f && Cvar_VariableValue( "vr_weapon_stabilised" ) != 0.0f )
+	{
+		int dominant = vr_control_scheme.value >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT;
+		ref_vr_pose_t gun;
+		vec3_t line;
+
+		if( FBitSet( vr_frame.hands[dominant].flags, REF_VR_HAND_AIM_VALID ))
+		{
+			CL_VRRelativePose( &vr_frame.hands[dominant].aim, &vr_center, &gun );
+			VectorSubtract( relative.position, gun.position, line );
+			if( VectorLength( line ) > 0.05f )
+				VectorCopy( line, relative.forward );
+		}
+	}
+
 	forward[0] = relative.forward[0] * cosine - relative.forward[1] * sine;
 	forward[1] = relative.forward[0] * sine + relative.forward[1] * cosine;
 	forward[2] = relative.forward[2];
