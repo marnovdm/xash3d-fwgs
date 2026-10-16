@@ -1104,35 +1104,104 @@ qboolean CL_VREndEye( int eye )
 	return ref.dllFuncs.R_VREndEye && ref.dllFuncs.R_VREndEye( eye, refState.width, refState.height );
 }
 
+/* The near plane (4 units) reaches ~10 units out at its corners with the PS VR2's wide outer
+ * field of view, plus the eye's half IPD; nearer to a wall than this the view shows through it.
+ * The body's eye always has this much room (the player hull is 16 units wide each way). */
+#define VR_HEAD_WALL_MARGIN 12.0f
+
+static qboolean CL_VRHeadSegmentClear( const vec3_t from, const vec3_t to )
+{
+	vec3_t a, b;
+	pmtrace_t trace;
+
+	VectorCopy( from, a );
+	VectorCopy( to, b );
+	trace = CL_TraceLine( a, b, PM_STUDIO_IGNORE );
+	return trace.fraction >= 1.0f && !trace.startsolid && !trace.allsolid;
+}
+
+/* push a point out of walls so it keeps the margin horizontally in 8 directions; true when it has */
+static qboolean CL_VRHeadPushOut( vec3_t point, qboolean move )
+{
+	qboolean clear = true;
+	int i;
+
+	for( i = 0; i < 8; i++ )
+	{
+		float s, c;
+		vec3_t end;
+		pmtrace_t trace;
+
+		SinCos( i * ( M_PI_F / 4.0f ), &s, &c );
+		VectorSet( end, point[0] + c * VR_HEAD_WALL_MARGIN, point[1] + s * VR_HEAD_WALL_MARGIN, point[2] );
+		trace = CL_TraceLine( point, end, PM_STUDIO_IGNORE );
+		if( trace.fraction >= 1.0f && !trace.startsolid )
+			continue;
+		clear = false;
+		if( move && !trace.startsolid )
+		{
+			float back = VR_HEAD_WALL_MARGIN * ( 1.0f - trace.fraction );
+			point[0] -= c * back;
+			point[1] -= s * back;
+		}
+	}
+	return clear;
+}
+
 static void CL_VRClampHeadOffset( const vec3_t start, const vec3_t desired, vec3_t clamped )
 {
 	pmtrace_t trace;
-	vec3_t trace_start, trace_end;
+	vec3_t trace_start, trace_end, candidate, delta;
+	float length, keep, lo, hi;
+	int i;
 
 	VectorCopy( desired, clamped );
 	if( cls.spectator || !clgame.pmove )
 		return;
 
+	/* Match Lambda1VR's wall pushback: clip room-scale XY at the first obstruction while
+	 * preserving the physically requested head Z, stopping the margin short of it (never
+	 * behind the start). */
 	VectorCopy( start, trace_start );
 	VectorCopy( desired, trace_end );
 	trace = CL_TraceLine( trace_start, trace_end, PM_STUDIO_IGNORE );
+	VectorCopy( desired, candidate );
 	if( trace.fraction < 1.0f )
 	{
-		/* Match Lambda1VR's wall pushback: clip room-scale XY at the first
-		 * obstruction while preserving the physically requested head Z. Stop short of
-		 * the wall (never behind the start): the near plane (4 units) reaches ~10 units
-		 * out at its corners with the PS VR2's wide outer field of view, plus the eye's
-		 * half IPD, and nearer than that the view shows through the wall. */
-		const float margin = 12.0f;
-		vec3_t delta;
-		float length, keep;
-
 		VectorSubtract( trace.endpos, start, delta );
 		length = VectorLength( delta );
-		keep = length > margin ? ( length - margin ) / length : 0.0f;
-		clamped[0] = start[0] + delta[0] * keep;
-		clamped[1] = start[1] + delta[1] * keep;
+		keep = length > VR_HEAD_WALL_MARGIN ? ( length - VR_HEAD_WALL_MARGIN ) / length : 0.0f;
+		candidate[0] = start[0] + delta[0] * keep;
+		candidate[1] = start[1] + delta[1] * keep;
 	}
+
+	/* The lean direction alone misses walls at a slant to it or just past its end: keep the
+	 * margin all round (slides along the wall), then make sure the result is still reachable. */
+	for( i = 0; i < 2; i++ )
+		CL_VRHeadPushOut( candidate, true );
+	if( CL_VRHeadPushOut( candidate, false ) && CL_VRHeadSegmentClear( start, candidate ))
+	{
+		clamped[0] = candidate[0];
+		clamped[1] = candidate[1];
+		return;
+	}
+
+	/* corners/narrow gaps: the furthest point towards the candidate that has the room */
+	VectorSubtract( candidate, start, delta );
+	lo = 0.0f; hi = 1.0f;
+	for( i = 0; i < 6; i++ )
+	{
+		float mid = ( lo + hi ) * 0.5f;
+		vec3_t probe;
+
+		VectorMA( start, mid, delta, probe );
+		probe[2] = desired[2];
+		if( CL_VRHeadPushOut( probe, false ) && CL_VRHeadSegmentClear( start, probe ))
+			lo = mid;
+		else hi = mid;
+	}
+	clamped[0] = start[0] + delta[0] * lo;
+	clamped[1] = start[1] + delta[1] * lo;
 }
 
 void CL_VRApplyHeadPose( ref_viewpass_t *rvp )
