@@ -37,7 +37,10 @@ static CVAR_DEFINE_AUTO( vr_enable_crouching, "0", FCVAR_ARCHIVE,
 	"physical crouch standing-height multiplier; active from 0 to 0.98 (0 = off; 0.85 = crouch below 85% of your height)" );
 static CVAR_DEFINE_AUTO( vr_crouch_threshold, "0.32", FCVAR_ARCHIVE,
 	"deprecated; physical crouch uses vr_enable_crouching standing-height multiplier" );
-static CVAR_DEFINE_AUTO( vr_positional_factor, "1", FCVAR_ARCHIVE, "room-scale movement multiplier" );
+static CVAR_DEFINE_AUTO( vr_positional_factor, "1", FCVAR_ARCHIVE, "room-scale movement multiplier (vr_lean 0 only)" );
+static CVAR_DEFINE_AUTO( vr_lean, "1", FCVAR_ARCHIVE,
+	"1 = moving the head sideways moves the view (lean/peek), the body only moves with the stick; 0 = head motion walks the body (room-scale)" );
+static CVAR_DEFINE_AUTO( vr_lean_radius, "0.5", FCVAR_ARCHIVE, "vr_lean: metres the view may move from the body; beyond it the body point follows the head" );
 static CVAR_DEFINE_AUTO( vr_quick_crouchjump, "0", FCVAR_ARCHIVE, "double-tap jump to perform a crouch jump" );
 static CVAR_DEFINE_AUTO( vr_gesture_triggered_use, "1", FCVAR_ARCHIVE, "reach away from the body to use with either hand" );
 static CVAR_DEFINE_AUTO( vr_use_gesture_boundary, "0.25", FCVAR_ARCHIVE, "horizontal use-gesture boundary in metres" );
@@ -192,6 +195,8 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_enable_crouching );
 	Cvar_RegisterVariable( &vr_crouch_threshold );
 	Cvar_RegisterVariable( &vr_positional_factor );
+	Cvar_RegisterVariable( &vr_lean );
+	Cvar_RegisterVariable( &vr_lean_radius );
 	Cvar_RegisterVariable( &vr_quick_crouchjump );
 	Cvar_RegisterVariable( &vr_gesture_triggered_use );
 	Cvar_RegisterVariable( &vr_use_gesture_boundary );
@@ -282,6 +287,26 @@ static void CL_VRUpdatePhysicalCrouch( void )
 	vr_physical_crouched = CL_VRPhysicalCrouchState( vr_physical_crouched, vr_enable_crouching.value,
 		VR_ASSUMED_STANDING_HEIGHT,
 		VR_ASSUMED_STANDING_HEIGHT - ( vr_center.position[2] - vr_frame.head.position[2] ));
+}
+
+/* Lean: the head is free to move horizontally up to radius (metres) from the body point (the
+ * recentre position); further out the body point is pulled after the head by the excess only. */
+static void CL_VRLeanLeash( vec3_t center, const vec3_t head, float radius )
+{
+	float dx = head[0] - center[0], dy = head[1] - center[1];
+	float distance = sqrt( dx * dx + dy * dy );
+
+	if( radius < 0.0f ) radius = 0.0f;
+	if( distance <= radius )
+		return;
+	center[0] += dx * ( distance - radius ) / distance;
+	center[1] += dy * ( distance - radius ) / distance;
+}
+
+/* Counter-Strike places its hands from the camera and keeps the room-scale walk */
+static qboolean CL_VRLeanActive( void )
+{
+	return vr_lean.value != 0.0f && !CL_VRCSMode();
 }
 
 static qboolean CL_VRUseGesture( int hand )
@@ -659,10 +684,19 @@ void CL_VRFrameBegin( void )
 		if( vr_previous_head_valid )
 		{
 			VectorSubtract( vr_frame.head.position, vr_previous_head.position, vr_head_delta );
-			/* Prediction consumes horizontal room-scale motion this frame. Keep the
-			 * rendered offset for vertical crouching, but follow horizontal motion. */
-			vr_center.position[0] += vr_head_delta[0];
-			vr_center.position[1] += vr_head_delta[1];
+			if( CL_VRLeanActive( ))
+			{
+				/* the view shows the head's offset from the body (lean/peek); hands are measured
+				 * from the same point, so they stay on the real hands */
+				CL_VRLeanLeash( vr_center.position, vr_frame.head.position, vr_lean_radius.value );
+			}
+			else
+			{
+				/* Prediction consumes horizontal room-scale motion this frame. Keep the
+				 * rendered offset for vertical crouching, but follow horizontal motion. */
+				vr_center.position[0] += vr_head_delta[0];
+				vr_center.position[1] += vr_head_delta[1];
+			}
 		}
 		else VectorClear( vr_head_delta );
 		vr_previous_head = vr_frame.head;
@@ -1085,9 +1119,19 @@ static void CL_VRClampHeadOffset( const vec3_t start, const vec3_t desired, vec3
 	if( trace.fraction < 1.0f )
 	{
 		/* Match Lambda1VR's wall pushback: clip room-scale XY at the first
-		 * obstruction while preserving the physically requested head Z. */
-		clamped[0] = trace.endpos[0];
-		clamped[1] = trace.endpos[1];
+		 * obstruction while preserving the physically requested head Z. Stop short of
+		 * the wall (never behind the start): the near plane (4 units) reaches ~10 units
+		 * out at its corners with the PS VR2's wide outer field of view, plus the eye's
+		 * half IPD, and nearer than that the view shows through the wall. */
+		const float margin = 12.0f;
+		vec3_t delta;
+		float length, keep;
+
+		VectorSubtract( trace.endpos, start, delta );
+		length = VectorLength( delta );
+		keep = length > margin ? ( length - margin ) / length : 0.0f;
+		clamped[0] = start[0] + delta[0] * keep;
+		clamped[1] = start[1] + delta[1] * keep;
 	}
 }
 
@@ -1275,7 +1319,7 @@ void CL_VRAppendMove( float frametime, usercmd_t *cmd, qboolean active )
 	cmd->sidemove += ( x * cosine - y * sine ) * side_speed;
 	cmd->forwardmove += ( y * cosine + x * sine ) * forward_speed;
 
-	if( frametime > 0.0f )
+	if( frametime > 0.0f && !CL_VRLeanActive( ))
 	{
 		CL_VRTransformVector( vr_head_delta, &vr_center, head_delta );
 		cmd->forwardmove += bound( -forward_speed, head_delta[0] * vr_worldscale.value * vr_positional_factor.value / frametime, forward_speed );
@@ -1604,6 +1648,19 @@ void Test_RunVRInputPolicy( void )
 		VectorSet( pose.up, 1.0f, 0.0f, 0.0f );
 		CL_VRFlattenPose( &pose );
 		TASSERT( fabs( pose.forward[0] - 1.0f ) < 0.0001f && fabs( pose.forward[1] ) < 0.0001f );
+
+		/* Lean leash: free inside the radius, the body point follows by the excess only. */
+		{
+			vec3_t center = { 1.0f, 2.0f, 1.5f }, head = { 1.3f, 2.0f, 1.2f };
+			CL_VRLeanLeash( center, head, 0.5f );
+			TASSERT( center[0] == 1.0f && center[1] == 2.0f && center[2] == 1.5f );
+			VectorSet( head, 1.0f, 2.8f, 1.2f );
+			CL_VRLeanLeash( center, head, 0.5f );
+			TASSERT( fabs( center[0] - 1.0f ) < 0.0001f && fabs( center[1] - 2.3f ) < 0.0001f && center[2] == 1.5f );
+			VectorSet( head, 4.0f, 6.0f, 1.2f );
+			CL_VRLeanLeash( center, head, 0.0f );
+			TASSERT( fabs( center[0] - 4.0f ) < 0.0001f && fabs( center[1] - 6.0f ) < 0.0001f );
+		}
 
 		/* Physical crouch: relative to the recentre height, not LOCAL space's zero. */
 		float saved_crouching = vr_enable_crouching.value;
