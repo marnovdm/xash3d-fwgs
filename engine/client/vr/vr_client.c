@@ -274,6 +274,15 @@ static qboolean CL_VRIsAtHead( int hand )
 	return fabs( local[1] ) > fabs( local[0] );
 }
 
+/* Opposing Force has no crowbar in single player: its melee weapon is the pipe wrench. A setting still at the
+ * crowbar default grabs that instead. */
+static const char *CL_VRBackpackWeapon( void )
+{
+	if( !Q_stricmp( vr_backpack_weapon.string, "weapon_crowbar" ) && !Q_stricmp( GI->gamefolder, "gearbox" ))
+		return "weapon_pipewrench";
+	return vr_backpack_weapon.string;
+}
+
 static qboolean CL_VRFlashlightNeedsHead( void )
 {
 	if( vr_flashlight_head.value < 0.0f )
@@ -895,7 +904,7 @@ void CL_VRFrameBegin( void )
 	}
 	else if( vr_weapon_in_backpack && CL_VRHandSqueezePressed( &vr_frame.hands[dominant] ))
 	{
-		CL_VRCommand( vr_backpack_weapon.string );
+		CL_VRCommand( CL_VRBackpackWeapon( ));
 		CL_VRHaptic( dominant, 0.08f, 0.0f, 0.8f );
 		vr_backpack_weapon_active = true;
 		vr_squeeze_time = 0.0;

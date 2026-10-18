@@ -2262,16 +2262,28 @@ static void GL_OpenXRLayoutStrip( const qboolean box_valid[GL_OPENXR_HUD_BOX_COU
  * boxes into the hand HUD swapchain and erases them from the head-locked UI. */
 
 /* A dark backing behind a hand HUD box (vr_hud_backing = its opacity): the panels are composited over the eye
- * image with the HUD's own alpha, so on a bright scene (Opposing Force's night vision) the green numbers had
- * nothing to stand on. Adds the opacity to the box's alpha only: transparent pixels become black at that
- * opacity (unpremultiplied layer, RGB 0), the numbers keep their colour and get more opaque. */
+ * image with the HUD's own alpha, and the UI alpha fix stores the HUD's brightness in that alpha, so faded
+ * numbers were nearly transparent and vanished on a bright scene (Opposing Force's night vision). Writes the
+ * opacity into the box's alpha only: empty pixels (RGB 0) become black at that opacity, the numbers (RGB
+ * normalised to full brightness by the alpha fix) show at full colour on it. Additive blending of the alpha
+ * had no effect here, so the alpha is set, not added. */
 static void GL_OpenXRDrawHandHUDBacking( int x0, int y0, int x1, int y1 )
 {
 	const float alpha = vr_hud_backing ? bound( 0.0f, vr_hud_backing->value, 1.0f ) : 0.0f;
 
+	int old_tmu = glState.activeTMU;
+
 	if( alpha <= 0.0f || x1 <= x0 || y1 <= y0 )
 		return;
+	/* untextured on every unit: a texture left enabled (lightmap unit) would scale the backing away */
+	GL_SelectTexture( 0 );
 	pglPushAttrib( GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_VIEWPORT_BIT | GL_CURRENT_BIT | GL_TEXTURE_BIT );
+	for( int tmu = 1; tmu < glConfig.max_texture_units && tmu < 4; ++tmu )
+	{
+		GL_SelectTexture( tmu );
+		pglDisable( GL_TEXTURE_2D );
+	}
+	GL_SelectTexture( 0 );
 	pglViewport( x0, y0, x1 - x0, y1 - y0 );
 	pglMatrixMode( GL_PROJECTION );
 	pglPushMatrix();
@@ -2284,8 +2296,7 @@ static void GL_OpenXRDrawHandHUDBacking( int x0, int y0, int x1, int y1 )
 	pglDisable( GL_ALPHA_TEST );
 	pglDisable( GL_CULL_FACE );
 	pglDisable( GL_SCISSOR_TEST );
-	pglEnable( GL_BLEND );
-	pglBlendFunc( GL_ONE, GL_ONE );
+	pglDisable( GL_BLEND );
 	pglColorMask( GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE );
 	pglColor4f( 0.0f, 0.0f, 0.0f, alpha );
 	pglBegin( GL_QUADS );
@@ -2300,6 +2311,7 @@ static void GL_OpenXRDrawHandHUDBacking( int x0, int y0, int x1, int y1 )
 	pglPopMatrix();
 	pglPopAttrib();
 	pglColor4ub( 255, 255, 255, 255 );
+	GL_SelectTexture( old_tmu );
 }
 
 static void GL_OpenXRCaptureHandHUD( void )
