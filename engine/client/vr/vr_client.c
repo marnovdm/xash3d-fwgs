@@ -52,6 +52,7 @@ static CVAR_DEFINE_AUTO( vr_weapon_backface_culling, "0", FCVAR_ARCHIVE, "enable
 static CVAR_DEFINE_AUTO( vr_height_adjust, "0.1", FCVAR_ARCHIVE, "additional VR eye height in metres" );
 static CVAR_DEFINE_AUTO( vr_headtorch, "0", FCVAR_ARCHIVE, "attach the flashlight beam to the HMD" );
 static CVAR_DEFINE_AUTO( vr_reversetorch, "0", FCVAR_ARCHIVE, "reverse the tracked flashlight direction" );
+static CVAR_DEFINE_AUTO( vr_flashlight_head, "-1", FCVAR_ARCHIVE, "flashlight button only works with the hand next to the head (1), anywhere (0), or -1 = only in Opposing Force (night vision goggles)" );
 static CVAR_DEFINE_AUTO( vr_cinema, "1", FCVAR_ARCHIVE, "show scripted camera views (trigger_camera) on a flat screen in the room; 0 = all around you" );
 static CVAR_DEFINE_AUTO( vr_cinema_fade, "0.2", FCVAR_ARCHIVE, "seconds the cinema screen and the world take to fade in/out" );
 
@@ -217,6 +218,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_weapon_stick_threshold );
 	Cvar_RegisterVariable( &vr_headtorch );
 	Cvar_RegisterVariable( &vr_reversetorch );
+	Cvar_RegisterVariable( &vr_flashlight_head );
 	Cvar_RegisterVariable( &vr_cinema );
 	Cvar_RegisterVariable( &vr_cinema_fade );
 	CL_VRCSRegisterCvars();
@@ -255,6 +257,28 @@ static qboolean CL_VRIsBackpack( int hand )
 	CL_VRTransformVector( delta, &vr_frame.head, local );
 	horizontal = sqrt( local[0] * local[0] + local[1] * local[1] );
 	return horizontal > 0.001f && local[0] < -0.5f * horizontal;
+}
+
+/* Hand beside the head (at the ear, as when switching on head-worn goggles): within 25 cm of the head and
+ * more to the side than in front or behind, so it never overlaps the backpack zone behind the head. */
+static qboolean CL_VRIsAtHead( int hand )
+{
+	vec3_t position, delta, local;
+
+	if( !FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ) || !CL_VRHandPosition( hand, position ))
+		return false;
+	VectorSubtract( position, vr_frame.head.position, delta );
+	if( VectorLength( delta ) > 0.25f )
+		return false;
+	CL_VRTransformVector( delta, &vr_frame.head, local );
+	return fabs( local[1] ) > fabs( local[0] );
+}
+
+static qboolean CL_VRFlashlightNeedsHead( void )
+{
+	if( vr_flashlight_head.value < 0.0f )
+		return !Q_stricmp( GI->gamefolder, "gearbox" );
+	return vr_flashlight_head.value != 0.0f;
 }
 
 static qboolean CL_VRHandSqueezePressed( const ref_vr_hand_t *hand )
@@ -915,7 +939,15 @@ void CL_VRFrameBegin( void )
 		uint32_t old_flashlight = flashlight_hand == dominant ? old_dominant_buttons : old_offhand_buttons;
 		if(( old_flashlight & REF_VR_BUTTON_PRIMARY ) &&
 			!( vr_frame.hands[flashlight_hand].buttons & REF_VR_BUTTON_PRIMARY ))
-			Cbuf_AddText( "impulse 100\n" );
+		{
+			if( !CL_VRFlashlightNeedsHead( ))
+				Cbuf_AddText( "impulse 100\n" );
+			else if( CL_VRIsAtHead( flashlight_hand ))
+			{
+				Cbuf_AddText( "impulse 100\n" );
+				CL_VRHaptic( flashlight_hand, 0.06f, 0.0f, 0.6f );
+			}
+		}
 
 		if( variant == 0 || variant == 2 )
 		{
