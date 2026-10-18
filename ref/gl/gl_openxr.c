@@ -274,6 +274,7 @@ static cvar_t *vr_comfort_moving;
 static cvar_t *vr_scope_engaged;
 static cvar_t *vr_mirror_eye;
 static cvar_t *vr_hud_hands;
+static cvar_t *vr_hud_backing;
 static cvar_t *vr_hud_hand_scale;
 static cvar_t *vr_hud_hand_tilt;
 static cvar_t *vr_hud_hand_yaw;
@@ -315,6 +316,8 @@ void GL_OpenXRInit( void )
 		"internal VR movement state" );
 	vr_scope_engaged = gEngfuncs.Cvar_Get( "vr_scope_engaged", "0", 0,
 		"internal VR scope state" );
+	vr_hud_backing = gEngfuncs.Cvar_Get( "vr_hud_backing", "0", 0,
+		"opacity of a dark backing behind the hand HUD panels, 0-1 (set by the game, e.g. Opposing Force while night vision is on)" );
 	vr_hud_hands = gEngfuncs.Cvar_Get( "vr_hud_hands", "1", FCVAR_ARCHIVE,
 		"show health/suit on the off hand and ammo on the weapon hand instead of on the head-locked HUD" );
 	vr_hud_hand_scale = gEngfuncs.Cvar_Get( "vr_hud_hand_scale", "0.0005", FCVAR_ARCHIVE,
@@ -2257,6 +2260,48 @@ static void GL_OpenXRLayoutStrip( const qboolean box_valid[GL_OPENXR_HUD_BOX_COU
 
 /* Runs with the finished UI framebuffer bound (after the alpha fix-up): copies the status, ammo and weapon grid
  * boxes into the hand HUD swapchain and erases them from the head-locked UI. */
+
+/* A dark backing behind a hand HUD box (vr_hud_backing = its opacity): the panels are composited over the eye
+ * image with the HUD's own alpha, so on a bright scene (Opposing Force's night vision) the green numbers had
+ * nothing to stand on. Adds the opacity to the box's alpha only: transparent pixels become black at that
+ * opacity (unpremultiplied layer, RGB 0), the numbers keep their colour and get more opaque. */
+static void GL_OpenXRDrawHandHUDBacking( int x0, int y0, int x1, int y1 )
+{
+	const float alpha = vr_hud_backing ? bound( 0.0f, vr_hud_backing->value, 1.0f ) : 0.0f;
+
+	if( alpha <= 0.0f || x1 <= x0 || y1 <= y0 )
+		return;
+	pglPushAttrib( GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_VIEWPORT_BIT | GL_CURRENT_BIT | GL_TEXTURE_BIT );
+	pglViewport( x0, y0, x1 - x0, y1 - y0 );
+	pglMatrixMode( GL_PROJECTION );
+	pglPushMatrix();
+	pglLoadIdentity();
+	pglMatrixMode( GL_MODELVIEW );
+	pglPushMatrix();
+	pglLoadIdentity();
+	pglDisable( GL_TEXTURE_2D );
+	pglDisable( GL_DEPTH_TEST );
+	pglDisable( GL_ALPHA_TEST );
+	pglDisable( GL_CULL_FACE );
+	pglDisable( GL_SCISSOR_TEST );
+	pglEnable( GL_BLEND );
+	pglBlendFunc( GL_ONE, GL_ONE );
+	pglColorMask( GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE );
+	pglColor4f( 0.0f, 0.0f, 0.0f, alpha );
+	pglBegin( GL_QUADS );
+	pglVertex2f( -1.0f, -1.0f );
+	pglVertex2f( 1.0f, -1.0f );
+	pglVertex2f( 1.0f, 1.0f );
+	pglVertex2f( -1.0f, 1.0f );
+	pglEnd();
+	pglMatrixMode( GL_PROJECTION );
+	pglPopMatrix();
+	pglMatrixMode( GL_MODELVIEW );
+	pglPopMatrix();
+	pglPopAttrib();
+	pglColor4ub( 255, 255, 255, 255 );
+}
+
 static void GL_OpenXRCaptureHandHUD( void )
 {
 	XrSwapchainImageAcquireInfo acquire_info = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -2394,6 +2439,7 @@ static void GL_OpenXRCaptureHandHUD( void )
 			const int y0 = (int)( y1 - xr.hand_hud[p].box[j].h * scale[p] );
 			pglBlitFramebuffer( rects[b][0], rects[b][1], rects[b][2], rects[b][3],
 				x0, y0, x1, y1, GL_COLOR_BUFFER_BIT, GL_LINEAR );
+			GL_OpenXRDrawHandHUDBacking( x0, y0, x1, y1 );
 		}
 	}
 	GL_OpenXRDrawWeaponPointerDot();
