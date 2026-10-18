@@ -2261,56 +2261,138 @@ static void GL_OpenXRLayoutStrip( const qboolean box_valid[GL_OPENXR_HUD_BOX_COU
 /* Runs with the finished UI framebuffer bound (after the alpha fix-up): copies the status, ammo and weapon grid
  * boxes into the hand HUD swapchain and erases them from the head-locked UI. */
 
-/* A dark backing behind a hand HUD box (vr_hud_backing = its opacity): the panels are composited over the eye
- * image with the HUD's own alpha, and the UI alpha fix stores the HUD's brightness in that alpha, so faded
- * numbers were nearly transparent and vanished on a bright scene (Opposing Force's night vision). Writes the
- * opacity into the box's alpha only: empty pixels (RGB 0) become black at that opacity, the numbers (RGB
- * normalised to full brightness by the alpha fix) show at full colour on it. Additive blending of the alpha
- * had no effect here, so the alpha is set, not added. */
+/* A dark backing behind a hand HUD box (vr_hud_backing = its opacity). The panels are composited over the eye
+ * image with the HUD's own alpha, and the UI alpha fix stores the HUD's brightness in that alpha (RGB normalised
+ * to full), so faded numbers were nearly transparent and vanished on a bright scene (Opposing Force's night
+ * vision). The box is copied out and written back with the brightness moved into the colour and the alpha raised
+ * to at least the backing: dark behind the numbers, glyph edges and scanlines keep their shading (a flat alpha
+ * made every faint pixel full bright: blocky glyphs). */
+static struct
+{
+	qboolean tried, ok;
+	GLhandleARB program;
+	GLint backing_location, curve_location;
+	GLuint copy;
+	int copy_width, copy_height;
+} xr_backing;
+
+static qboolean GL_OpenXRInitHandHUDBacking( void )
+{
+	static const char *vs =
+		"void main() { gl_TexCoord[0] = gl_MultiTexCoord0; gl_Position = gl_Vertex; }\n";
+	static const char *fs =
+		"uniform sampler2D hud;\n"
+		"uniform float backing;\n"
+		"uniform float curve;\n"
+		"void main() {\n"
+		"	vec4 c = texture2D( hud, gl_TexCoord[0].xy );\n"
+		/* brightness the alpha fix encoded as m^curve; on the dark backing the HUD is shown at 3x (faded
+		 * numbers sit at ~40% and were too dim to read on it), the shading of glyph edges is kept */
+		"	float m = pow( c.a, 1.0 / curve );\n"
+		"	vec3 rgb = min( c.rgb * m * 3.0, vec3( 1.0 ));\n"
+		"	float a = max( backing, max( rgb.r, max( rgb.g, rgb.b )));\n"
+		"	gl_FragColor = vec4( rgb / a, a );\n"
+		"}\n";
+	GLhandleARB shaders[2];
+	GLint status = 0;
+
+	if( xr_backing.tried )
+		return xr_backing.ok;
+	xr_backing.tried = true;
+	if( !pglCreateShaderObjectARB || !pglCreateProgramObjectARB || !pglUseProgramObjectARB || !pglCopyTexSubImage2D )
+		return false;
+	shaders[0] = pglCreateShaderObjectARB( GL_VERTEX_SHADER_ARB );
+	shaders[1] = pglCreateShaderObjectARB( GL_FRAGMENT_SHADER_ARB );
+	pglShaderSourceARB( shaders[0], 1, &vs, NULL );
+	pglShaderSourceARB( shaders[1], 1, &fs, NULL );
+	xr_backing.program = pglCreateProgramObjectARB();
+	for( int i = 0; i < 2; ++i )
+	{
+		pglCompileShaderARB( shaders[i] );
+		pglGetObjectParameterivARB( shaders[i], GL_OBJECT_COMPILE_STATUS_ARB, &status );
+		if( !status )
+		{
+			char log[1024] = "";
+			pglGetInfoLogARB( shaders[i], sizeof( log ), NULL, log );
+			gEngfuncs.Con_Printf( S_ERROR "OpenXR: hand HUD backing shader: %s\n", log );
+			return false;
+		}
+		pglAttachObjectARB( xr_backing.program, shaders[i] );
+	}
+	pglLinkProgramARB( xr_backing.program );
+	pglGetObjectParameterivARB( xr_backing.program, GL_OBJECT_LINK_STATUS_ARB, &status );
+	if( !status )
+	{
+		gEngfuncs.Con_Printf( S_ERROR "OpenXR: hand HUD backing shader did not link\n" );
+		return false;
+	}
+	pglUseProgramObjectARB( xr_backing.program );
+	pglUniform1iARB( pglGetUniformLocationARB( xr_backing.program, "hud" ), 0 );
+	xr_backing.backing_location = pglGetUniformLocationARB( xr_backing.program, "backing" );
+	xr_backing.curve_location = pglGetUniformLocationARB( xr_backing.program, "curve" );
+	pglUseProgramObjectARB( 0 );
+	pglGenTextures( 1, &xr_backing.copy );
+	xr_backing.ok = true;
+	return true;
+}
+
+/* Runs inside the hand HUD build: draw framebuffer = the hand HUD image, read framebuffer = the UI image. */
 static void GL_OpenXRDrawHandHUDBacking( int x0, int y0, int x1, int y1 )
 {
 	const float alpha = vr_hud_backing ? bound( 0.0f, vr_hud_backing->value, 1.0f ) : 0.0f;
-
+	const int w = x1 - x0, h = y1 - y0;
+	GLint old_texture = 0;
 	int old_tmu = glState.activeTMU;
 
-	if( alpha <= 0.0f || x1 <= x0 || y1 <= y0 )
+	if( alpha <= 0.0f || w <= 0 || h <= 0 || !GL_OpenXRInitHandHUDBacking() )
 		return;
-	/* untextured on every unit: a texture left enabled (lightmap unit) would scale the backing away */
+
 	GL_SelectTexture( 0 );
+	pglGetIntegerv( GL_TEXTURE_BINDING_2D, &old_texture );
 	pglPushAttrib( GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_VIEWPORT_BIT | GL_CURRENT_BIT | GL_TEXTURE_BIT );
-	for( int tmu = 1; tmu < glConfig.max_texture_units && tmu < 4; ++tmu )
+	pglBindTexture( GL_TEXTURE_2D, xr_backing.copy );
+	if( xr_backing.copy_width < w || xr_backing.copy_height < h )
 	{
-		GL_SelectTexture( tmu );
-		pglDisable( GL_TEXTURE_2D );
+		xr_backing.copy_width = Q_max( xr_backing.copy_width, w );
+		xr_backing.copy_height = Q_max( xr_backing.copy_height, h );
+		pglTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA8, xr_backing.copy_width, xr_backing.copy_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL );
+		pglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST );
+		pglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST );
+		pglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+		pglTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
 	}
-	GL_SelectTexture( 0 );
-	pglViewport( x0, y0, x1 - x0, y1 - y0 );
-	pglMatrixMode( GL_PROJECTION );
-	pglPushMatrix();
-	pglLoadIdentity();
-	pglMatrixMode( GL_MODELVIEW );
-	pglPushMatrix();
-	pglLoadIdentity();
-	pglDisable( GL_TEXTURE_2D );
+	pglBindFramebuffer( GL_READ_FRAMEBUFFER, xr.hud.framebuffers[xr.hud.image_index] );
+	pglCopyTexSubImage2D( GL_TEXTURE_2D, 0, 0, 0, x0, y0, w, h );
+	pglBindFramebuffer( GL_READ_FRAMEBUFFER, xr.ui.framebuffers[xr.ui.image_index] );
+
+	pglViewport( x0, y0, w, h );
+	pglEnable( GL_TEXTURE_2D );
+	pglDisable( GL_BLEND );
 	pglDisable( GL_DEPTH_TEST );
 	pglDisable( GL_ALPHA_TEST );
 	pglDisable( GL_CULL_FACE );
 	pglDisable( GL_SCISSOR_TEST );
-	pglDisable( GL_BLEND );
-	pglColorMask( GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE );
-	pglColor4f( 0.0f, 0.0f, 0.0f, alpha );
-	pglBegin( GL_QUADS );
-	pglVertex2f( -1.0f, -1.0f );
-	pglVertex2f( 1.0f, -1.0f );
-	pglVertex2f( 1.0f, 1.0f );
-	pglVertex2f( -1.0f, 1.0f );
-	pglEnd();
-	pglMatrixMode( GL_PROJECTION );
-	pglPopMatrix();
-	pglMatrixMode( GL_MODELVIEW );
-	pglPopMatrix();
+	pglColorMask( GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE );
+	pglUseProgramObjectARB( xr_backing.program );
+	if( xr_backing.backing_location >= 0 && pglUniform1fARB )
+		pglUniform1fARB( xr_backing.backing_location, alpha );
+	if( xr_backing.curve_location >= 0 && pglUniform1fARB )
+	{
+		const float curve = vr_ui_glow_curve ? vr_ui_glow_curve->value : 1.6f;
+		pglUniform1fARB( xr_backing.curve_location, curve > 0.1f ? curve : 1.6f );
+	}
+	{
+		const float s = (float)w / xr_backing.copy_width, t = (float)h / xr_backing.copy_height;
+		pglBegin( GL_QUADS );
+		pglTexCoord2f( 0.0f, 0.0f ); pglVertex2f( -1.0f, -1.0f );
+		pglTexCoord2f( s, 0.0f ); pglVertex2f( 1.0f, -1.0f );
+		pglTexCoord2f( s, t ); pglVertex2f( 1.0f, 1.0f );
+		pglTexCoord2f( 0.0f, t ); pglVertex2f( -1.0f, 1.0f );
+		pglEnd();
+	}
+	pglUseProgramObjectARB( 0 );
 	pglPopAttrib();
-	pglColor4ub( 255, 255, 255, 255 );
+	pglBindTexture( GL_TEXTURE_2D, old_texture );
 	GL_SelectTexture( old_tmu );
 }
 
