@@ -3254,7 +3254,7 @@ static qboolean SV_ReadVRUsercmdSidecars( sizebuf_t *msg, vr_usercmd_sidecar_t *
 		if( version != VR_USERCMD_SIDECAR_VERSION || bytes != VR_USERCMD_SIDECAR_WIRE_BYTES )
 			continue;
 		samples[i].version = (uint8_t)version;
-		samples[i].flags = record[0] & ( VR_USERCMD_SIDECAR_LADDER_VALID | VR_USERCMD_SIDECAR_POSE_VALID | VR_USERCMD_SIDECAR_CLIMB );
+		samples[i].flags = record[0] & ( VR_USERCMD_SIDECAR_LADDER_VALID | VR_USERCMD_SIDECAR_POSE_VALID | VR_USERCMD_SIDECAR_GAME_FLAGS );
 		for( field = 0; field < 2; ++field ) samples[i].ladder_angles[field] = (int16_t)( record[1 + field * 2] | record[2 + field * 2] << 8 );
 		for( field = 0; field < 3; ++field ) samples[i].weapon_position[field] = (int16_t)( record[5 + field * 2] | record[6 + field * 2] << 8 );
 		for( field = 0; field < 3; ++field ) samples[i].weapon_angles[field] = (int16_t)( record[11 + field * 2] | record[12 + field * 2] << 8 );

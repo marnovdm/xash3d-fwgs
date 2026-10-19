@@ -16,6 +16,13 @@ vr_usercmd_sidecar.h - ABI-neutral VR usercmd extension
 #define VR_USERCMD_SIDECAR_CLIMB_WEAPON  ( 1u << 2 )
 #define VR_USERCMD_SIDECAR_CLIMB_OFFHAND ( 1u << 3 )
 #define VR_USERCMD_SIDECAR_CLIMB ( VR_USERCMD_SIDECAR_CLIMB_WEAPON | VR_USERCMD_SIDECAR_CLIMB_OFFHAND )
+/* no stock ladder hold this move (the body clings to a ladder while inside it): hands-only climbing
+ * (vr_hand_ladders 2), or the hands have let go of a ladder
+ * and the movement stick has not been used since, no hand grabbed again and the player has not landed
+ * (decided by the client DLL) */
+#define VR_USERCMD_SIDECAR_NO_LADDER_HOLD ( 1u << 4 )
+/* flags the client DLL owns, passed through by the engine */
+#define VR_USERCMD_SIDECAR_GAME_FLAGS ( VR_USERCMD_SIDECAR_CLIMB | VR_USERCMD_SIDECAR_NO_LADDER_HOLD )
 #define VR_USERCMD_SIDECAR_WIRE_BYTES 41u
 
 #ifdef _WIN32
@@ -79,7 +86,7 @@ static inline void VR_UsercmdSidecarApplyPose( vr_usercmd_sidecar_t *sample, con
 		sample->offhand_velocity[index] = pose->offhand_velocity[index];
 	}
 	sample->version = VR_USERCMD_SIDECAR_VERSION;
-	sample->flags |= VR_USERCMD_SIDECAR_POSE_VALID | ( pose->flags & VR_USERCMD_SIDECAR_CLIMB );
+	sample->flags |= VR_USERCMD_SIDECAR_POSE_VALID | ( pose->flags & VR_USERCMD_SIDECAR_GAME_FLAGS );
 }
 
 #define VR_USERCMD_SIDECAR_BEGIN_PM_EXPORT "VR_BeginPMUsercmdSidecar"
