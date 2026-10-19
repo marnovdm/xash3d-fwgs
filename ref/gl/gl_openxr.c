@@ -1706,6 +1706,14 @@ qboolean GL_OpenXRGetEyeSize( int *width, int *height )
 		*height = xr.cinema.image.height;
 		return true;
 	}
+	/* the scope pass rendered with the desktop window's viewport into the square lens image: stretched
+	 * ~1.8x sideways (circles became ovals) and its centre off the lens centre (not on the laser dot) */
+	if( xr.scope.rendering )
+	{
+		*width = xr.scope.image.width;
+		*height = xr.scope.image.height;
+		return true;
+	}
 	if( xr.current_eye < 0 || xr.current_eye >= REF_VR_MAX_EYES || !xr.eyes[xr.current_eye].acquired )
 		return false; /* only between BeginEye and EndEye (xr is zeroed, i.e. current_eye 0, before VR init) */
 	*width = xr.eyes[xr.current_eye].width;

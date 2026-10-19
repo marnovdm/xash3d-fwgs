@@ -1765,6 +1765,9 @@ void CL_VRScopeView( ref_viewpass_t *rvp )
 			for( i = 0; i < 3; i++ )
 				track[i] = body_center.position[i] + body_center.forward[i] * lx - body_center.right[i] * ly +
 					body_center.up[i] * ( rel[2] / vr_worldscale.value );
+			/* the game camera sits vr_height_adjust above the head, so the drawn gun appears that much lower
+			 * than the real hand: put the lens where the gun is seen (it hung 5-10 cm above the scope) */
+			track[2] -= vr_height_adjust.value;
 			VectorSubtract( track, vr_frame.head.position, head_delta );
 			dist = VectorLength( head_delta );
 			size = mount[3] / vr_worldscale.value;
