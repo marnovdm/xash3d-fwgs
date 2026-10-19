@@ -1644,17 +1644,21 @@ qboolean CL_VRIsActive( void )
 	return vr_frame_begun && FBitSet( vr_frame.flags, REF_VR_FRAME_SESSION_ACTIVE );
 }
 
-/* Physical crouch presses duck, and the duck lowers the game's eye (view_ofs 28 -> 12 units) while the
- * view and the hands also follow the real head down: the two added up to lying on the floor. While the
- * crouch is physical the reference point is lowered by the duck's drop (tracking it through the duck
- * transition), so the camera and hands follow the head only, as a button crouch moves them by the duck. */
+/* Physical crouch presses duck, and the duck lowers the game's eye while the view and the hands also
+ * follow the real head down: the two added up to lying on the floor. While the crouch is physical the
+ * reference point is lowered by the duck's drop, so the camera and hands follow the head only. The drop
+ * is measured as eye height above the feet (64 standing, 30 ducked): view_ofs alone (28 -> 12) missed
+ * the 18 units the origin moves down when the duck completes, a visible snap. */
 #define VR_STANDING_VIEWHEIGHT 28.0f /* VEC_VIEW / DEFAULT_VIEWHEIGHT */
 static void CL_VRBodyCenter( ref_vr_pose_t *center )
 {
 	*center = vr_center;
 	if( vr_physical_crouched && !CL_VRCSMode() && vr_worldscale.value > 0.0f )
 	{
-		float lift = bound( 0.0f, VR_STANDING_VIEWHEIGHT - cl.viewheight[2], VR_STANDING_VIEWHEIGHT );
+		const int hull = cl.local.usehull == 1 ? 1 : 0;
+		const float standing = VR_STANDING_VIEWHEIGHT - host.player_mins[0][2];
+		const float eye = cl.viewheight[2] - host.player_mins[hull][2];
+		float lift = bound( 0.0f, standing - eye, standing );
 		center->position[2] -= lift / vr_worldscale.value;
 	}
 }
