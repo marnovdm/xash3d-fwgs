@@ -19,6 +19,7 @@ GNU General Public License for more details.
 #include "con_nprint.h"
 #include "pm_local.h"
 #include "platform/platform.h"
+#include "vr/vr_client.h"
 
 // structure used for fading in and out client sound volume.
 struct
@@ -51,6 +52,8 @@ static CVAR_DEFINE_AUTO( s_show, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "show play
 CVAR_DEFINE_AUTO( s_lerping, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "apply interpolation to sound output" );
 static CVAR_DEFINE( s_ambient_level, "ambient_level", "0.3", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "volume of environment noises (water and wind)" );
 static CVAR_DEFINE( s_ambient_fade, "ambient_fade", "1000", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "rate of volume fading when client is moving" );
+static CVAR_DEFINE_AUTO( vr_sound_pan, "0.5", FCVAR_ARCHIVE|FCVAR_FILTERABLE,
+	"VR: stereo panning strength (1 = stock: a sound at the side is 2x in that ear and silent in the other)" );
 CVAR_DEFINE_AUTO( snd_mute_losefocus, "1", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "silence the audio when game window loses focus" );
 static CVAR_DEFINE_AUTO( snd_effects_scale, "0.75", FCVAR_ARCHIVE, "volume of everything except speech (CHAN_VOICE, sentences), so voices stand out; 1 = stock" );
 
@@ -543,6 +546,12 @@ S_SpatializeChannel
 static void S_SpatializeChannel( short *left_vol, short *right_vol, int master_vol, float dot, float dist )
 {
 	float scale;
+
+	// Stock panning is all-or-nothing at the sides. In a headset (headphones, the head turning all the
+	// time) near sources such as the lift underfoot swung hard from ear to ear, and the doubled near ear
+	// clipped. Soften it while VR runs.
+	if( CL_VRIsActive( ))
+		dot *= bound( 0.0f, vr_sound_pan.value, 1.0f );
 
 	// add in distance effect
 	scale = ( 1.0f - dist ) * ( 1.0f + dot );
@@ -1991,6 +2000,7 @@ qboolean S_Init( void )
 	Cvar_RegisterVariable( &s_musicvolume );
 	Cvar_RegisterVariable( &s_mixahead );
 	Cvar_RegisterVariable( &s_show );
+	Cvar_RegisterVariable( &vr_sound_pan );
 	Cvar_RegisterVariable( &s_lerping );
 	Cvar_RegisterVariable( &s_ambient_level );
 	Cvar_RegisterVariable( &s_ambient_fade );
