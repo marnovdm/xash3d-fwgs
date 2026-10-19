@@ -41,6 +41,8 @@ static CVAR_DEFINE_AUTO( vr_positional_factor, "1", FCVAR_ARCHIVE, "room-scale m
 static CVAR_DEFINE_AUTO( vr_lean, "1", FCVAR_ARCHIVE,
 	"1 = moving the head sideways moves the view (lean/peek), the body only moves with the stick; 0 = head motion walks the body (room-scale)" );
 static CVAR_DEFINE_AUTO( vr_lean_radius, "0.75", FCVAR_ARCHIVE, "vr_lean: metres the view may move from the body; beyond it the body point follows the head" );
+static CVAR_DEFINE_AUTO( vr_scope_mount, "", 0,
+	"scope lens on the weapon model's eyepiece: \"forward right up diameter\" in game units from the gun origin (set by the game DLL per weapon; empty = on the aim line)" );
 static CVAR_DEFINE_AUTO( vr_scope_lens, "1", FCVAR_ARCHIVE,
 	"zoomed weapons (crossbow, sniper rifle) show the zoom on a round lens in front of the gun; 0 = darkened view" );
 static CVAR_DEFINE_AUTO( vr_lean_resume_center, "1", FCVAR_ARCHIVE,
@@ -88,6 +90,7 @@ static qboolean vr_jump_held;
 static qboolean vr_quick_crouch;
 static qboolean vr_physical_crouched;
 static void CL_VRBodyCenter( ref_vr_pose_t *center ); /* vr_center, lowered during a physical crouch */
+static void CL_VRGunDirectionXR( const vec3_t viewangles, vec3_t out ); /* game view direction -> OpenXR axes */
 static double vr_last_jump_press;
 static qboolean vr_selecting_weapon;
 static qboolean vr_confirm_attack_release;
@@ -174,6 +177,15 @@ static void CL_VRPoseInfo_f( void )
 			-vr_last_pose.weapon_angles[0] / 128.0f, vr_last_pose.weapon_angles[1] / 128.0f,
 			vr_last_pose.weapon_angles[2] / 128.0f, vr_last_pose.weapon_position[0] / 8.0f,
 			vr_last_pose.weapon_position[1] / 8.0f, vr_last_pose.weapon_position[2] / 8.0f, CL_VRScopeLensActive( ));
+	{
+		const int dominant = vr_control_scheme.value >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT;
+		const float *aim = vr_frame.hands[dominant].aim.forward;
+		vec3_t gun_angles, xr_dir;
+		VectorSet( gun_angles, -vr_last_pose.weapon_angles[0] / 128.0f, vr_last_pose.weapon_angles[1] / 128.0f, 0.0f );
+		CL_VRGunDirectionXR( gun_angles, xr_dir );
+		Con_Printf( "gun dir (xr) %.2f %.2f %.2f; dominant aim (xr) %.2f %.2f %.2f\n", xr_dir[0], xr_dir[1], xr_dir[2],
+			-aim[1], aim[2], -aim[0] );
+	}
 }
 
 /* Debug: pulse both controllers so haptics can be tested without game events. */
@@ -213,6 +225,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_lean_radius );
 	Cvar_RegisterVariable( &vr_lean_resume_center );
 	Cvar_RegisterVariable( &vr_scope_lens );
+	Cvar_RegisterVariable( &vr_scope_mount );
 	Cvar_RegisterVariable( &vr_quick_crouchjump );
 	Cvar_RegisterVariable( &vr_gesture_triggered_use );
 	Cvar_RegisterVariable( &vr_use_gesture_boundary );
@@ -1658,12 +1671,32 @@ qboolean CL_VRScopeLensActive( void )
 	return vr_scope_lens.value != 0.0f && vr_last_pose_valid && Cvar_VariableValue( "vr_scope_engaged" ) != 0.0f;
 }
 
-/* The lens is a magnifier: it shows what lies behind it, from the eye through its centre, enlarged by the
- * weapon's zoom (scr_fov against default_fov) - so the world around it, its picture and the laser dot line
- * up, and with the gun at the cheek the dot sits mid-lens. (Looking along the gun put a picture of the aim
- * point wherever the lens hung, away from the dot, and at roughly the lens's own angular size: hardly any
- * zoom.) Counter-Strike keeps its own scope view (its client view already looks along the gun). The
- * renderer turns the lens to face the eye (vr_scope_magnifier). */
+/* The scope lens follows the gun: its view looks from the eye along the gun as the game DLL aims it (the
+ * two-handed line included), and the lens is placed on that line from the eye, facing it, upright - so its
+ * centre covers the aim point (the laser dot), the picture lines up with the world around it, and tilting
+ * the gun moves the lens and its view together. The distance is that of the lens spot on the gun hand
+ * (vr_scope_offset); FOV = the lens's angular size x scr_fov / default_fov, a real zoom. (A picture of the
+ * gun-axis view hung on the hand did not line up with the dot; a magnifier did, but ignored the gun's
+ * tilt.) Counter-Strike keeps its own scope view. The renderer places the lens from vr_scope_dir. */
+/* A game-world view direction back into tracking space (inverse of the torch's body -> world), in OpenXR
+ * axes (right, up, back) for the renderer */
+static void CL_VRGunDirectionXR( const vec3_t viewangles, vec3_t out )
+{
+	ref_vr_pose_t body_center;
+	vec3_t gun, track;
+	float sine, cosine, lx, ly;
+	int i;
+
+	CL_VRBodyCenter( &body_center );
+	SinCos( DEG2RAD( vr_body_view_yaw ), &sine, &cosine );
+	AngleVectors( viewangles, gun, NULL, NULL );
+	lx = gun[0] * cosine + gun[1] * sine;
+	ly = -gun[0] * sine + gun[1] * cosine;
+	for( i = 0; i < 3; i++ )
+		track[i] = body_center.forward[i] * lx - body_center.right[i] * ly + body_center.up[i] * gun[2];
+	VectorSet( out, -track[1], track[2], -track[0] );
+}
+
 void CL_VRScopeView( ref_viewpass_t *rvp )
 {
 	const int dominant = vr_control_scheme.value >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT;
@@ -1692,14 +1725,63 @@ void CL_VRScopeView( ref_viewpass_t *rvp )
 	dist = VectorLength( dir );
 	if( dist < 0.02f )
 		return;
-	rvp->viewangles[PITCH] = -RAD2DEG( atan2( dir[2], sqrt( dir[0] * dir[0] + dir[1] * dir[1] )));
-	rvp->viewangles[YAW] = RAD2DEG( atan2( dir[1], dir[0] ));
+	if( !vr_last_pose_valid )
+		return;
+	rvp->viewangles[PITCH] = -vr_last_pose.weapon_angles[0] * ( 1.0f / 128.0f );
+	rvp->viewangles[YAW] = vr_last_pose.weapon_angles[1] * ( 1.0f / 128.0f );
 	rvp->viewangles[ROLL] = 0.0f;
-
-	size = bound( 0.01f, Cvar_VariableValue( "vr_scope_size" ), 0.5f );
 	default_fov = Cvar_VariableValue( "default_fov" );
 	if( default_fov < 10.0f )
 		default_fov = 90.0f;
+	{
+		vec3_t xr_dir;
+		char value[96];
+
+		CL_VRGunDirectionXR( rvp->viewangles, xr_dir );
+		Q_snprintf( value, sizeof( value ), "%f %f %f %f", xr_dir[0], xr_dir[1], xr_dir[2], dist );
+		Cvar_Set( "vr_scope_dir", value );
+	}
+
+	/* On the weapon model's own scope: the eyepiece spot (vr_scope_mount) on the gun the game DLL draws,
+	 * back into tracking space; the lens is the eyepiece's size and moves with the gun. */
+	{
+		float mount[4];
+		char value[128];
+
+		if( vr_scope_mount.string[0] && sscanf( vr_scope_mount.string, "%f %f %f %f",
+			&mount[0], &mount[1], &mount[2], &mount[3] ) == 4 && mount[3] > 0.0f && vr_worldscale.value > 0.0f )
+		{
+			vec3_t gun_angles, f, r, u, rel, track, head_delta;
+			float lx, ly;
+
+			VectorSet( gun_angles, rvp->viewangles[PITCH], rvp->viewangles[YAW],
+				vr_last_pose.weapon_angles[2] * ( 1.0f / 128.0f ));
+			AngleVectors( gun_angles, f, r, u );
+			for( i = 0; i < 3; i++ )
+				rel[i] = vr_last_pose.weapon_position[i] * ( 1.0f / 8.0f ) + f[i] * mount[0] + r[i] * mount[1] + u[i] * mount[2];
+			/* relative to the body eye, world axes, game units -> tracking metres (inverse of the hands' path) */
+			lx = ( rel[0] * cosine + rel[1] * sine ) / vr_worldscale.value;
+			ly = ( -rel[0] * sine + rel[1] * cosine ) / vr_worldscale.value;
+			for( i = 0; i < 3; i++ )
+				track[i] = body_center.position[i] + body_center.forward[i] * lx - body_center.right[i] * ly +
+					body_center.up[i] * ( rel[2] / vr_worldscale.value );
+			VectorSubtract( track, vr_frame.head.position, head_delta );
+			dist = VectorLength( head_delta );
+			size = mount[3] / vr_worldscale.value;
+			if( dist > 0.02f )
+			{
+				Q_snprintf( value, sizeof( value ), "%f %f %f %f", -track[1], track[2], -track[0], size );
+				Cvar_Set( "vr_scope_pos", value );
+				lens_fov = RAD2DEG( 2.0f * atan( size * 0.5f / dist ));
+				rvp->fov_x = rvp->fov_y = bound( 0.5f, lens_fov * bound( 1.0f, cl.local.scr_fov, default_fov ) / default_fov, 150.0f );
+				return;
+			}
+		}
+		if( Cvar_VariableString( "vr_scope_pos" )[0] )
+			Cvar_Set( "vr_scope_pos", "" );
+	}
+
+	size = bound( 0.01f, Cvar_VariableValue( "vr_scope_size" ), 0.5f );
 	lens_fov = RAD2DEG( 2.0f * atan( size * 0.5f / dist ));
 	rvp->fov_x = rvp->fov_y = bound( 0.5f, lens_fov * bound( 1.0f, cl.local.scr_fov, default_fov ) / default_fov, 150.0f );
 }

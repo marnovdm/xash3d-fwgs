@@ -288,6 +288,8 @@ static cvar_t *vr_weapon_pointer_scale;
 static cvar_t *vr_scope_size;
 static cvar_t *vr_scope_offset;
 static cvar_t *vr_scope_magnifier;
+static cvar_t *vr_scope_dir;
+static cvar_t *vr_scope_pos;
 static cvar_t *vr_weapon_pointer_yaw;
 static cvar_t *vr_hud_radar_scale;
 static cvar_t *vr_hud_radar_tilt;
@@ -383,6 +385,10 @@ void GL_OpenXRInit( void )
 		"scope lens diameter in metres (Counter-Strike: the zoomed view on a lens in front of the weapon hand)" );
 	vr_scope_magnifier = gEngfuncs.Cvar_Get( "vr_scope_magnifier", "0", 0,
 		"internal: the scope lens shows what lies behind it (faces the eye, upright); set by the engine" );
+	vr_scope_pos = gEngfuncs.Cvar_Get( "vr_scope_pos", "", 0,
+		"internal: the lens on the weapon's eyepiece (OpenXR local position) and its diameter in metres; set by the engine" );
+	vr_scope_dir = gEngfuncs.Cvar_Get( "vr_scope_dir", "", 0,
+		"internal: the gun direction (OpenXR local axes) and lens distance in metres; set by the engine" );
 	vr_scope_offset = gEngfuncs.Cvar_Get( "vr_scope_offset", "0 0.06 -0.08", FCVAR_ARCHIVE,
 		"scope lens centre from the weapon-hand aim pose, metres along its axes: right up back (negative back = in front)" );
 	gEngfuncs.Cvar_Get( "vr_weapon_pointer_cursor", "", 0,
@@ -3225,9 +3231,26 @@ static qboolean GL_OpenXRBuildScopeLayer( XrCompositionLayerQuad *quad )
 	quad->pose.position.z = xr.hand_pose[xr.scope.hand].aim.position.z + rotated.z;
 	if( vr_scope_magnifier && vr_scope_magnifier->value )
 	{
-		/* a magnifier: faces the eye, upright, like the view the engine rendered into it */
-		XrVector3f xa, ya, za, up = { 0.0f, 1.0f, 0.0f };
-		float len;
+		/* on the gun's line from the head, facing the eye, upright, like the view the engine rendered into it */
+		XrVector3f xa, ya, za, up = { 0.0f, 1.0f, 0.0f }, dir;
+		float len, dist;
+
+		XrVector3f mount;
+		float diameter;
+
+		if( vr_scope_pos && sscanf( vr_scope_pos->string, "%f %f %f %f", &mount.x, &mount.y, &mount.z, &diameter ) == 4 &&
+			diameter > 0.0f )
+		{
+			quad->pose.position = mount;
+			size = diameter;
+		}
+		else if( vr_scope_dir && sscanf( vr_scope_dir->string, "%f %f %f %f", &dir.x, &dir.y, &dir.z, &dist ) == 4 &&
+			dist > 0.02f )
+		{
+			quad->pose.position.x = xr.head_pose.position.x + dir.x * dist;
+			quad->pose.position.y = xr.head_pose.position.y + dir.y * dist;
+			quad->pose.position.z = xr.head_pose.position.z + dir.z * dist;
+		}
 
 		za.x = xr.head_pose.position.x - quad->pose.position.x;
 		za.y = xr.head_pose.position.y - quad->pose.position.y;
