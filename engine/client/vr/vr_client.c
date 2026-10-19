@@ -83,6 +83,7 @@ static qboolean vr_offhand_use_active;
 static qboolean vr_jump_held;
 static qboolean vr_quick_crouch;
 static qboolean vr_physical_crouched;
+static void CL_VRBodyCenter( ref_vr_pose_t *center ); /* vr_center, lowered during a physical crouch */
 static double vr_last_jump_press;
 static qboolean vr_selecting_weapon;
 static qboolean vr_confirm_attack_release;
@@ -1274,7 +1275,11 @@ void CL_VRApplyHeadPose( ref_viewpass_t *rvp )
 		return;
 	}
 
-	CL_VRRelativePose( &vr_frame.head, &vr_center, &relative );
+	{
+		ref_vr_pose_t body_center;
+		CL_VRBodyCenter( &body_center );
+		CL_VRRelativePose( &vr_frame.head, &body_center, &relative );
+	}
 	VectorCopy( rvp->vieworigin, vr_body_view_origin );
 	/* Counter-Strike: the view angles are the weapon hand's, the body is under them */
 	vr_body_view_yaw = CL_VRCSMode() ? CL_VRCSBodyYaw() : rvp->viewangles[YAW];
@@ -1639,12 +1644,27 @@ qboolean CL_VRIsActive( void )
 	return vr_frame_begun && FBitSet( vr_frame.flags, REF_VR_FRAME_SESSION_ACTIVE );
 }
 
+/* Physical crouch presses duck, and the duck lowers the game's eye (view_ofs 28 -> 12 units) while the
+ * view and the hands also follow the real head down: the two added up to lying on the floor. While the
+ * crouch is physical the reference point is lowered by the duck's drop (tracking it through the duck
+ * transition), so the camera and hands follow the head only, as a button crouch moves them by the duck. */
+#define VR_STANDING_VIEWHEIGHT 28.0f /* VEC_VIEW / DEFAULT_VIEWHEIGHT */
+static void CL_VRBodyCenter( ref_vr_pose_t *center )
+{
+	*center = vr_center;
+	if( vr_physical_crouched && !CL_VRCSMode() && vr_worldscale.value > 0.0f )
+	{
+		float lift = bound( 0.0f, VR_STANDING_VIEWHEIGHT - cl.viewheight[2], VR_STANDING_VIEWHEIGHT );
+		center->position[2] -= lift / vr_worldscale.value;
+	}
+}
+
 qboolean CL_VRGetRecenter( ref_vr_pose_t *center )
 {
 	if( !center || !vr_center_valid )
 		return false;
 
-	*center = vr_center;
+	CL_VRBodyCenter( center );
 	return true;
 }
 
@@ -1678,7 +1698,11 @@ qboolean CL_VRGetFlashlightPose( vec3_t origin, vec3_t forward )
 		pose = &vr_frame.hands[offhand].aim;
 	}
 
-	CL_VRRelativePose( pose, &vr_center, &relative );
+	{
+		ref_vr_pose_t body_center;
+		CL_VRBodyCenter( &body_center );
+		CL_VRRelativePose( pose, &body_center, &relative );
+	}
 	SinCos( DEG2RAD( vr_body_view_yaw ), &sine, &cosine );
 	local_origin[0] = relative.position[0] * cosine - relative.position[1] * sine;
 	local_origin[1] = relative.position[0] * sine + relative.position[1] * cosine;
