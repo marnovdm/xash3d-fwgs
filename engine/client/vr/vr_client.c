@@ -41,6 +41,8 @@ static CVAR_DEFINE_AUTO( vr_positional_factor, "1", FCVAR_ARCHIVE, "room-scale m
 static CVAR_DEFINE_AUTO( vr_lean, "1", FCVAR_ARCHIVE,
 	"1 = moving the head sideways moves the view (lean/peek), the body only moves with the stick; 0 = head motion walks the body (room-scale)" );
 static CVAR_DEFINE_AUTO( vr_lean_radius, "0.75", FCVAR_ARCHIVE, "vr_lean: metres the view may move from the body; beyond it the body point follows the head" );
+static CVAR_DEFINE_AUTO( vr_lean_resume_center, "1", FCVAR_ARCHIVE,
+	"vr_lean: put the body point back under the head (position only) when the game resumes from the menu or a load" );
 static CVAR_DEFINE_AUTO( vr_quick_crouchjump, "0", FCVAR_ARCHIVE, "double-tap jump to perform a crouch jump" );
 static CVAR_DEFINE_AUTO( vr_gesture_triggered_use, "0", FCVAR_ARCHIVE, "reach away from the body to use with the off hand (fires mid-reach; touch use replaced it)" );
 static CVAR_DEFINE_AUTO( vr_use_gesture_boundary, "0.25", FCVAR_ARCHIVE, "horizontal use-gesture boundary in metres" );
@@ -63,6 +65,7 @@ static qboolean vr_ui_trigger_blocked;
 static qboolean vr_center_valid;
 static ref_vr_pose_t vr_previous_head;
 static qboolean vr_previous_head_valid;
+static qboolean vr_game_was_paused; /* menu/console/loading last frame, see vr_lean_resume_center */
 static vec3_t vr_head_delta;
 static uint32_t vr_previous_buttons[REF_VR_MAX_HANDS];
 static qboolean vr_turn_latched;
@@ -198,6 +201,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_positional_factor );
 	Cvar_RegisterVariable( &vr_lean );
 	Cvar_RegisterVariable( &vr_lean_radius );
+	Cvar_RegisterVariable( &vr_lean_resume_center );
 	Cvar_RegisterVariable( &vr_quick_crouchjump );
 	Cvar_RegisterVariable( &vr_gesture_triggered_use );
 	Cvar_RegisterVariable( &vr_use_gesture_boundary );
@@ -641,7 +645,7 @@ void CL_VRDrawCinemaWorldFade( void )
 
 void CL_VRFrameBegin( void )
 {
-	qboolean old_menu, menu;
+	qboolean old_menu, menu, paused;
 	uint32_t old_offhand_buttons, old_dominant_buttons;
 	int dominant, offhand, variant;
 
@@ -712,6 +716,7 @@ void CL_VRFrameBegin( void )
 		VectorClear( vr_head_delta );
 	}
 
+	paused = CL_VRUIActive() || cls.state != ca_active || cls.disable_screen != 0.0f;
 	if( FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ))
 	{
 		if( vr_previous_head_valid )
@@ -722,6 +727,14 @@ void CL_VRFrameBegin( void )
 				/* the view shows the head's offset from the body (lean/peek); hands are measured
 				 * from the same point, so they stay on the real hands */
 				CL_VRLeanLeash( vr_center.position, vr_frame.head.position, vr_lean_radius.value );
+				/* The leash leaves the body point up to the radius away from the head after a walk
+				 * around the room (to the desk and back), and every reach is then that much short or
+				 * long. Resuming play re-centres it; the heading stays, so the world does not turn. */
+				if( vr_game_was_paused && !paused && vr_lean_resume_center.value != 0.0f )
+				{
+					vr_center.position[0] = vr_frame.head.position[0];
+					vr_center.position[1] = vr_frame.head.position[1];
+				}
 			}
 			else
 			{
@@ -734,6 +747,7 @@ void CL_VRFrameBegin( void )
 		else VectorClear( vr_head_delta );
 		vr_previous_head = vr_frame.head;
 		vr_previous_head_valid = true;
+		vr_game_was_paused = paused;
 	}
 	CL_VRCinemaUpdate();
 
