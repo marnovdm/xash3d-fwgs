@@ -1650,14 +1650,33 @@ qboolean CL_VRIsActive( void )
  * is measured as eye height above the feet (64 standing, 30 ducked): view_ofs alone (28 -> 12) missed
  * the 18 units the origin moves down when the duck completes, a visible snap. */
 #define VR_STANDING_VIEWHEIGHT 28.0f /* VEC_VIEW / DEFAULT_VIEWHEIGHT */
+static qboolean vr_crouch_lift_active; /* a physical crouch, until the game has stood the player up again */
+static double vr_crouch_lift_end;      /* when the physical crouch ended (lift kept for the unduck) */
 static void CL_VRBodyCenter( ref_vr_pose_t *center )
 {
+	const int hull = cl.local.usehull == 1 ? 1 : 0;
+	const float standing = VR_STANDING_VIEWHEIGHT - host.player_mins[0][2];
+	const float eye = cl.viewheight[2] - host.player_mins[hull][2];
+
 	*center = vr_center;
-	if( vr_physical_crouched && !CL_VRCSMode() && vr_worldscale.value > 0.0f )
+	/* Standing up, the crouch ends at once but the game unducks a frame or more later (the cleared duck
+	 * button goes through prediction first); dropping the lift right away dipped the view by the whole
+	 * duck for those frames. Keep it until the eye is back at standing height - at most 0.25 s, for when
+	 * the game cannot stand up (a vent: the view must not rise into the ceiling) or the duck button holds. */
+	if( vr_physical_crouched )
 	{
-		const int hull = cl.local.usehull == 1 ? 1 : 0;
-		const float standing = VR_STANDING_VIEWHEIGHT - host.player_mins[0][2];
-		const float eye = cl.viewheight[2] - host.player_mins[hull][2];
+		vr_crouch_lift_active = true;
+		vr_crouch_lift_end = 0.0;
+	}
+	else if( vr_crouch_lift_active )
+	{
+		if( vr_crouch_lift_end == 0.0 )
+			vr_crouch_lift_end = host.realtime;
+		if( eye >= standing - 0.5f || host.realtime - vr_crouch_lift_end > 0.25 )
+			vr_crouch_lift_active = false;
+	}
+	if( vr_crouch_lift_active && !CL_VRCSMode() && vr_worldscale.value > 0.0f )
+	{
 		float lift = bound( 0.0f, standing - eye, standing );
 		center->position[2] -= lift / vr_worldscale.value;
 	}
