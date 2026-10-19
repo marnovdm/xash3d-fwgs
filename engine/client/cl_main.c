@@ -868,6 +868,7 @@ static void CL_WriteVRUsercmdSidecars( sizebuf_t *msg, int numcmds )
 		for( field = 0; field < 3; ++field ) MSG_WriteShort( msg, sample->weapon_velocity[field] );
 		for( field = 0; field < 3; ++field ) MSG_WriteShort( msg, sample->offhand_position[field] );
 		for( field = 0; field < 3; ++field ) MSG_WriteShort( msg, sample->offhand_angles[field] );
+		for( field = 0; field < 3; ++field ) MSG_WriteShort( msg, sample->offhand_velocity[field] );
 	}
 }
 

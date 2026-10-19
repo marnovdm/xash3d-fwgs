@@ -1017,7 +1017,7 @@ void SV_RunCmd( sv_client_t *cl, usercmd_t *ucmd, const vr_usercmd_sidecar_t *vr
 		vr_sidecar->version == VR_USERCMD_SIDECAR_VERSION && sv_vr_sidecar_begin_pm && sv_vr_sidecar_end_pm )
 	{
 		/* LADDER_VALID is the negotiated wire policy for prediction and authority. */
-		if( vr_sidecar->flags & VR_USERCMD_SIDECAR_LADDER_VALID )
+		if( vr_sidecar->flags & ( VR_USERCMD_SIDECAR_LADDER_VALID | VR_USERCMD_SIDECAR_CLIMB ))
 		{
 			sv_vr_sidecar_begin_pm( vr_sidecar );
 			vr_sidecar_active = true;

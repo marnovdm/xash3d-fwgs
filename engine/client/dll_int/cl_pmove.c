@@ -959,7 +959,7 @@ static void CL_RunUsercmd( local_state_t *from, local_state_t *to, usercmd_t *u,
 			vr_sidecar->version == VR_USERCMD_SIDECAR_VERSION && cl_vr_sidecar_begin_pm && cl_vr_sidecar_end_pm )
 		{
 			/* LADDER_VALID is the negotiated wire policy for prediction and authority. */
-			if( vr_sidecar->flags & VR_USERCMD_SIDECAR_LADDER_VALID )
+			if( vr_sidecar->flags & ( VR_USERCMD_SIDECAR_LADDER_VALID | VR_USERCMD_SIDECAR_CLIMB ))
 			{
 				cl_vr_sidecar_begin_pm( vr_sidecar );
 				vr_sidecar_active = true;

@@ -3254,13 +3254,14 @@ static qboolean SV_ReadVRUsercmdSidecars( sizebuf_t *msg, vr_usercmd_sidecar_t *
 		if( version != VR_USERCMD_SIDECAR_VERSION || bytes != VR_USERCMD_SIDECAR_WIRE_BYTES )
 			continue;
 		samples[i].version = (uint8_t)version;
-		samples[i].flags = record[0] & ( VR_USERCMD_SIDECAR_LADDER_VALID | VR_USERCMD_SIDECAR_POSE_VALID );
+		samples[i].flags = record[0] & ( VR_USERCMD_SIDECAR_LADDER_VALID | VR_USERCMD_SIDECAR_POSE_VALID | VR_USERCMD_SIDECAR_CLIMB );
 		for( field = 0; field < 2; ++field ) samples[i].ladder_angles[field] = (int16_t)( record[1 + field * 2] | record[2 + field * 2] << 8 );
 		for( field = 0; field < 3; ++field ) samples[i].weapon_position[field] = (int16_t)( record[5 + field * 2] | record[6 + field * 2] << 8 );
 		for( field = 0; field < 3; ++field ) samples[i].weapon_angles[field] = (int16_t)( record[11 + field * 2] | record[12 + field * 2] << 8 );
 		for( field = 0; field < 3; ++field ) samples[i].weapon_velocity[field] = (int16_t)( record[17 + field * 2] | record[18 + field * 2] << 8 );
 		for( field = 0; field < 3; ++field ) samples[i].offhand_position[field] = (int16_t)( record[23 + field * 2] | record[24 + field * 2] << 8 );
 		for( field = 0; field < 3; ++field ) samples[i].offhand_angles[field] = (int16_t)( record[29 + field * 2] | record[30 + field * 2] << 8 );
+		for( field = 0; field < 3; ++field ) samples[i].offhand_velocity[field] = (int16_t)( record[35 + field * 2] | record[36 + field * 2] << 8 );
 	}
 	return true;
 }
@@ -3286,6 +3287,7 @@ static void Test_WriteVRUsercmdSidecarRecord( sizebuf_t *msg, const vr_usercmd_s
 	for( field = 0; field < 3; ++field ) Test_WriteVRUsercmdSidecarValue( record, &offset, sample->weapon_velocity[field] );
 	for( field = 0; field < 3; ++field ) Test_WriteVRUsercmdSidecarValue( record, &offset, sample->offhand_position[field] );
 	for( field = 0; field < 3; ++field ) Test_WriteVRUsercmdSidecarValue( record, &offset, sample->offhand_angles[field] );
+	for( field = 0; field < 3; ++field ) Test_WriteVRUsercmdSidecarValue( record, &offset, sample->offhand_velocity[field] );
 	TASSERT_EQi( offset, VR_USERCMD_SIDECAR_WIRE_BYTES );
 	MSG_WriteBytes( msg, record, sizeof( record ));
 }
@@ -3320,6 +3322,12 @@ void Test_RunVRUsercmdSidecar( void )
 	VR_UsercmdSidecarApplyPose( &samples[0], &pose );
 	TASSERT_EQi( samples[0].flags, VR_USERCMD_SIDECAR_LADDER_VALID | VR_USERCMD_SIDECAR_POSE_VALID );
 	TASSERT_EQi( samples[0].weapon_position[0], 123 );
+	/* climb flags and the off-hand velocity come with the pose */
+	pose.flags = VR_USERCMD_SIDECAR_POSE_VALID | VR_USERCMD_SIDECAR_CLIMB_WEAPON;
+	pose.offhand_velocity[2] = -77;
+	VR_UsercmdSidecarApplyPose( &samples[0], &pose );
+	TASSERT_EQi( samples[0].flags, VR_USERCMD_SIDECAR_LADDER_VALID | VR_USERCMD_SIDECAR_POSE_VALID | VR_USERCMD_SIDECAR_CLIMB_WEAPON );
+	TASSERT_EQi( samples[0].offhand_velocity[2], -77 );
 
 	TASSERT_EQi( VR_UsercmdSidecarQuantize( FLT_MAX, 8.0f ), 32767 );
 	TASSERT_EQi( VR_UsercmdSidecarQuantize( -FLT_MAX, 8.0f ), -32768 );
@@ -3332,7 +3340,7 @@ void Test_RunVRUsercmdSidecar( void )
 	written[1].flags = VR_USERCMD_SIDECAR_LADDER_VALID;
 	written[1].ladder_angles[0] = 1024;
 	written[1].ladder_angles[1] = -2048;
-	written[0].flags = VR_USERCMD_SIDECAR_POSE_VALID | 0x80;
+	written[0].flags = VR_USERCMD_SIDECAR_POSE_VALID | VR_USERCMD_SIDECAR_CLIMB_OFFHAND | 0x80;
 	written[0].ladder_angles[0] = -512;
 	written[0].ladder_angles[1] = 768;
 	written[0].weapon_position[0] = 101;
@@ -3350,6 +3358,9 @@ void Test_RunVRUsercmdSidecar( void )
 	written[0].offhand_angles[0] = 1304;
 	written[0].offhand_angles[1] = -1405;
 	written[0].offhand_angles[2] = 1506;
+	written[0].offhand_velocity[0] = -1607;
+	written[0].offhand_velocity[1] = 1708;
+	written[0].offhand_velocity[2] = -1809;
 	Test_WriteVRUsercmdSidecarRecord( &msg, &written[1] );
 	Test_WriteVRUsercmdSidecarRecord( &msg, &written[0] );
 	MSG_StartReading( &msg, data, sizeof( data ), 0, MSG_GetNumBitsWritten( &msg ));
@@ -3357,7 +3368,7 @@ void Test_RunVRUsercmdSidecar( void )
 	TASSERT_EQi( samples[1].flags, VR_USERCMD_SIDECAR_LADDER_VALID );
 	TASSERT_EQi( samples[1].ladder_angles[0], 1024 );
 	TASSERT_EQi( samples[1].ladder_angles[1], -2048 );
-	TASSERT_EQi( samples[0].flags, VR_USERCMD_SIDECAR_POSE_VALID );
+	TASSERT_EQi( samples[0].flags, VR_USERCMD_SIDECAR_POSE_VALID | VR_USERCMD_SIDECAR_CLIMB_OFFHAND );
 	TASSERT_EQi( samples[0].ladder_angles[0], -512 );
 	TASSERT_EQi( samples[0].ladder_angles[1], 768 );
 	TASSERT_EQi( samples[0].weapon_position[0], 101 );
@@ -3375,6 +3386,9 @@ void Test_RunVRUsercmdSidecar( void )
 	TASSERT_EQi( samples[0].offhand_angles[0], 1304 );
 	TASSERT_EQi( samples[0].offhand_angles[1], -1405 );
 	TASSERT_EQi( samples[0].offhand_angles[2], 1506 );
+	TASSERT_EQi( samples[0].offhand_velocity[0], -1607 );
+	TASSERT_EQi( samples[0].offhand_velocity[1], 1708 );
+	TASSERT_EQi( samples[0].offhand_velocity[2], -1809 );
 
 	MSG_Init( &msg, __func__, data, sizeof( data ));
 	MSG_WriteByte( &msg, VR_USERCMD_SIDECAR_VERSION + 1 );

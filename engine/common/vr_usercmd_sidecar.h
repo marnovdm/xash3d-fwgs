@@ -7,11 +7,16 @@ vr_usercmd_sidecar.h - ABI-neutral VR usercmd extension
 #include <float.h>
 #include <stdint.h>
 
-#define VR_USERCMD_SIDECAR_VERSION 1u
+#define VR_USERCMD_SIDECAR_VERSION 2u
 
 #define VR_USERCMD_SIDECAR_LADDER_VALID ( 1u << 0 )
 #define VR_USERCMD_SIDECAR_POSE_VALID   ( 1u << 1 )
-#define VR_USERCMD_SIDECAR_WIRE_BYTES 35u
+/* the weapon / off hand holds a ladder: grip pressed with the hand on it, held since (decided by the
+ * client DLL, which keeps that state; player movement only follows the hands' velocities) */
+#define VR_USERCMD_SIDECAR_CLIMB_WEAPON  ( 1u << 2 )
+#define VR_USERCMD_SIDECAR_CLIMB_OFFHAND ( 1u << 3 )
+#define VR_USERCMD_SIDECAR_CLIMB ( VR_USERCMD_SIDECAR_CLIMB_WEAPON | VR_USERCMD_SIDECAR_CLIMB_OFFHAND )
+#define VR_USERCMD_SIDECAR_WIRE_BYTES 41u
 
 #ifdef _WIN32
 #define VR_USERCMD_SIDECAR_EXPORT __declspec( dllexport )
@@ -34,6 +39,7 @@ typedef struct vr_usercmd_sidecar_s
 	int16_t weapon_velocity[3];
 	int16_t offhand_position[3];
 	int16_t offhand_angles[3];
+	int16_t offhand_velocity[3];
 } vr_usercmd_sidecar_t;
 
 /* Clamp before the final conversion: converting an out-of-range float or
@@ -70,9 +76,10 @@ static inline void VR_UsercmdSidecarApplyPose( vr_usercmd_sidecar_t *sample, con
 		sample->weapon_velocity[index] = pose->weapon_velocity[index];
 		sample->offhand_position[index] = pose->offhand_position[index];
 		sample->offhand_angles[index] = pose->offhand_angles[index];
+		sample->offhand_velocity[index] = pose->offhand_velocity[index];
 	}
 	sample->version = VR_USERCMD_SIDECAR_VERSION;
-	sample->flags |= VR_USERCMD_SIDECAR_POSE_VALID;
+	sample->flags |= VR_USERCMD_SIDECAR_POSE_VALID | ( pose->flags & VR_USERCMD_SIDECAR_CLIMB );
 }
 
 #define VR_USERCMD_SIDECAR_BEGIN_PM_EXPORT "VR_BeginPMUsercmdSidecar"

@@ -915,7 +915,9 @@ void CL_VRFrameBegin( void )
 			vr_squeeze_time = host.realtime;
 		else if( !CL_VRHandSqueezePressed( &vr_frame.hands[dominant] ) && vr_squeeze_time != 0.0 )
 		{
-			if(( host.realtime - vr_squeeze_time ) * 1000.0 <= vr_reloadtimeoutms.value )
+			/* a short grip on a ladder rung is climbing (client DLL sets vr_climbing bit 1), not reload */
+			if(( host.realtime - vr_squeeze_time ) * 1000.0 <= vr_reloadtimeoutms.value &&
+				!( (int)Cvar_VariableValue( "vr_climbing" ) & 1 ))
 			{
 				vr_reload_pulse = true;
 				CL_VRHaptic( dominant, 0.04f, 0.0f, 0.5f );
