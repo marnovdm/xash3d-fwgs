@@ -287,6 +287,7 @@ static cvar_t *vr_hud_offset[GL_OPENXR_HAND_HUD_COUNT];
 static cvar_t *vr_weapon_pointer_scale;
 static cvar_t *vr_scope_size;
 static cvar_t *vr_scope_offset;
+static cvar_t *vr_scope_magnifier;
 static cvar_t *vr_weapon_pointer_yaw;
 static cvar_t *vr_hud_radar_scale;
 static cvar_t *vr_hud_radar_tilt;
@@ -380,6 +381,8 @@ void GL_OpenXRInit( void )
 		"pointer weapon grid turn in degrees, like vr_hud_hand_yaw (90 = facing your body like the health panel; less turns its far end inwards and its face towards you)" );
 	vr_scope_size = gEngfuncs.Cvar_Get( "vr_scope_size", "0.05", FCVAR_ARCHIVE,
 		"scope lens diameter in metres (Counter-Strike: the zoomed view on a lens in front of the weapon hand)" );
+	vr_scope_magnifier = gEngfuncs.Cvar_Get( "vr_scope_magnifier", "0", 0,
+		"internal: the scope lens shows what lies behind it (faces the eye, upright); set by the engine" );
 	vr_scope_offset = gEngfuncs.Cvar_Get( "vr_scope_offset", "0 0.06 -0.08", FCVAR_ARCHIVE,
 		"scope lens centre from the weapon-hand aim pose, metres along its axes: right up back (negative back = in front)" );
 	gEngfuncs.Cvar_Get( "vr_weapon_pointer_cursor", "", 0,
@@ -3220,6 +3223,33 @@ static qboolean GL_OpenXRBuildScopeLayer( XrCompositionLayerQuad *quad )
 	quad->pose.position.x = xr.hand_pose[xr.scope.hand].aim.position.x + rotated.x;
 	quad->pose.position.y = xr.hand_pose[xr.scope.hand].aim.position.y + rotated.y;
 	quad->pose.position.z = xr.hand_pose[xr.scope.hand].aim.position.z + rotated.z;
+	if( vr_scope_magnifier && vr_scope_magnifier->value )
+	{
+		/* a magnifier: faces the eye, upright, like the view the engine rendered into it */
+		XrVector3f xa, ya, za, up = { 0.0f, 1.0f, 0.0f };
+		float len;
+
+		za.x = xr.head_pose.position.x - quad->pose.position.x;
+		za.y = xr.head_pose.position.y - quad->pose.position.y;
+		za.z = xr.head_pose.position.z - quad->pose.position.z;
+		len = sqrtf( za.x * za.x + za.y * za.y + za.z * za.z );
+		if( len > 0.001f )
+		{
+			za.x /= len; za.y /= len; za.z /= len;
+			xa.x = up.y * za.z - up.z * za.y; /* x = up cross z */
+			xa.y = up.z * za.x - up.x * za.z;
+			xa.z = up.x * za.y - up.y * za.x;
+			len = sqrtf( xa.x * xa.x + xa.y * xa.y + xa.z * xa.z );
+			if( len > 0.001f )
+			{
+				xa.x /= len; xa.y /= len; xa.z /= len;
+				ya.x = za.y * xa.z - za.z * xa.y; /* y = z cross x */
+				ya.y = za.z * xa.x - za.x * xa.z;
+				ya.z = za.x * xa.y - za.y * xa.x;
+				quad->pose.orientation = GL_OpenXRQuatFromBasis( xa, ya, za );
+			}
+		}
+	}
 	quad->subImage.swapchain = xr.scope.image.swapchain;
 	quad->subImage.imageRect.extent.width = xr.scope.image.width;
 	quad->subImage.imageRect.extent.height = xr.scope.image.height;

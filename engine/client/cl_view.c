@@ -476,9 +476,9 @@ void V_RenderView( void )
 				if( CL_VRBeginScope( &width, &height ))
 				{
 					rvp = CL_VRCSMode() ? scope_rvp : base_rvp;
-					CL_VRScopeView( &rvp );
 					rvp.fov_x = bound( 1.0f, cl.local.scr_fov, 150.0f );
 					rvp.fov_y = V_CalcFov( &rvp.fov_x, width, height );
+					CL_VRScopeView( &rvp ); /* the magnifier sets its own view and FOV */
 					GL_RenderFrame( &rvp );
 					CL_VREndScope();
 				}

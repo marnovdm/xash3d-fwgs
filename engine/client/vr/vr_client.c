@@ -169,6 +169,11 @@ static void CL_VRPoseInfo_f( void )
 	CL_VRRelativePose( &vr_frame.head, &vr_center, &relative );
 	VectorsAngles( relative.forward, relative.right, relative.up, angles );
 	Con_Printf( "head rel. to centre %.1f %.1f %.1f\n", angles[PITCH], angles[YAW], angles[ROLL] );
+	if( vr_last_pose_valid )
+		Con_Printf( "sidecar gun (view angles) %.1f %.1f %.1f, offset %.1f %.1f %.1f; scope lens %d\n",
+			-vr_last_pose.weapon_angles[0] / 128.0f, vr_last_pose.weapon_angles[1] / 128.0f,
+			vr_last_pose.weapon_angles[2] / 128.0f, vr_last_pose.weapon_position[0] / 8.0f,
+			vr_last_pose.weapon_position[1] / 8.0f, vr_last_pose.weapon_position[2] / 8.0f, CL_VRScopeLensActive( ));
 }
 
 /* Debug: pulse both controllers so haptics can be tested without game events. */
@@ -806,7 +811,13 @@ void CL_VRFrameBegin( void )
 	if( menu != old_menu ) Key_Event( K_ESCAPE, menu );
 	vr_menu_active = menu;
 	if( !CL_VRCSMode( ))
+	{
 		CL_VRSetScope( CL_VRScopeLensActive(), vr_control_scheme.value >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT );
+		if( Cvar_VariableValue( "vr_scope_magnifier" ) == 0.0f )
+			Cvar_SetValue( "vr_scope_magnifier", 1.0f );
+	}
+	else if( Cvar_VariableValue( "vr_scope_magnifier" ) != 0.0f )
+		Cvar_SetValue( "vr_scope_magnifier", 0.0f );
 	if( CL_VRCSMode( ))
 	{
 		/* Counter-Strike (CSVR client): buttons, aim and hands are handled in vr_cs.c */
@@ -1647,15 +1658,50 @@ qboolean CL_VRScopeLensActive( void )
 	return vr_scope_lens.value != 0.0f && vr_last_pose_valid && Cvar_VariableValue( "vr_scope_engaged" ) != 0.0f;
 }
 
-/* The lens view: from the eye along the gun as the game DLL aims it (the sidecar's weapon angles are model
- * angles: pitch up = positive). Counter-Strike's client view already looks along the gun. */
+/* The lens is a magnifier: it shows what lies behind it, from the eye through its centre, enlarged by the
+ * weapon's zoom (scr_fov against default_fov) - so the world around it, its picture and the laser dot line
+ * up, and with the gun at the cheek the dot sits mid-lens. (Looking along the gun put a picture of the aim
+ * point wherever the lens hung, away from the dot, and at roughly the lens's own angular size: hardly any
+ * zoom.) Counter-Strike keeps its own scope view (its client view already looks along the gun). The
+ * renderer turns the lens to face the eye (vr_scope_magnifier). */
 void CL_VRScopeView( ref_viewpass_t *rvp )
 {
-	if( CL_VRCSMode( ) || !vr_last_pose_valid )
+	const int dominant = vr_control_scheme.value >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT;
+	const ref_vr_hand_t *hand = &vr_frame.hands[dominant];
+	ref_vr_pose_t lens, body_center, rel_lens, rel_head;
+	vec3_t offset = { 0.0f, 0.06f, -0.08f }, local, dir;
+	float sine, cosine, dist, size, lens_fov, default_fov;
+	int i;
+
+	if( CL_VRCSMode( ) || !FBitSet( hand->flags, REF_VR_HAND_AIM_VALID ) || !FBitSet( vr_frame.flags, REF_VR_FRAME_HEAD_VALID ))
 		return;
-	rvp->viewangles[PITCH] = -vr_last_pose.weapon_angles[0] * ( 1.0f / 128.0f );
-	rvp->viewangles[YAW] = vr_last_pose.weapon_angles[1] * ( 1.0f / 128.0f );
-	rvp->viewangles[ROLL] = vr_last_pose.weapon_angles[2] * ( 1.0f / 128.0f );
+	if( sscanf( Cvar_VariableString( "vr_scope_offset" ), "%f %f %f", &offset[0], &offset[1], &offset[2] ) != 3 )
+		VectorSet( offset, 0.0f, 0.06f, -0.08f );
+	/* the offset is in the controller's OpenXR axes: x right, y up, z back */
+	lens = hand->aim;
+	for( i = 0; i < 3; i++ )
+		lens.position[i] += hand->aim.right[i] * offset[0] + hand->aim.up[i] * offset[1] - hand->aim.forward[i] * offset[2];
+	CL_VRBodyCenter( &body_center );
+	CL_VRRelativePose( &lens, &body_center, &rel_lens );
+	CL_VRRelativePose( &vr_frame.head, &body_center, &rel_head );
+	VectorSubtract( rel_lens.position, rel_head.position, local );
+	SinCos( DEG2RAD( vr_body_view_yaw ), &sine, &cosine );
+	dir[0] = local[0] * cosine - local[1] * sine;
+	dir[1] = local[0] * sine + local[1] * cosine;
+	dir[2] = local[2];
+	dist = VectorLength( dir );
+	if( dist < 0.02f )
+		return;
+	rvp->viewangles[PITCH] = -RAD2DEG( atan2( dir[2], sqrt( dir[0] * dir[0] + dir[1] * dir[1] )));
+	rvp->viewangles[YAW] = RAD2DEG( atan2( dir[1], dir[0] ));
+	rvp->viewangles[ROLL] = 0.0f;
+
+	size = bound( 0.01f, Cvar_VariableValue( "vr_scope_size" ), 0.5f );
+	default_fov = Cvar_VariableValue( "default_fov" );
+	if( default_fov < 10.0f )
+		default_fov = 90.0f;
+	lens_fov = RAD2DEG( 2.0f * atan( size * 0.5f / dist ));
+	rvp->fov_x = rvp->fov_y = bound( 0.5f, lens_fov * bound( 1.0f, cl.local.scr_fov, default_fov ) / default_fov, 150.0f );
 }
 
 qboolean CL_VRHaptic( int hand, float duration, float frequency, float amplitude )
