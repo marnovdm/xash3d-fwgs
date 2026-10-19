@@ -1702,7 +1702,7 @@ void CL_VRScopeView( ref_viewpass_t *rvp )
 	const int dominant = vr_control_scheme.value >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT;
 	const ref_vr_hand_t *hand = &vr_frame.hands[dominant];
 	ref_vr_pose_t lens, body_center, rel_lens, rel_head;
-	vec3_t offset = { 0.0f, 0.06f, -0.08f }, local, dir;
+	vec3_t offset = { 0.0f, 0.06f, -0.08f }, local, dir, gun_offset, gun_angles;
 	float sine, cosine, dist, size, lens_fov, default_fov;
 	int i;
 
@@ -1725,10 +1725,30 @@ void CL_VRScopeView( ref_viewpass_t *rvp )
 	dist = VectorLength( dir );
 	if( dist < 0.02f )
 		return;
-	if( !vr_last_pose_valid )
-		return;
-	rvp->viewangles[PITCH] = -vr_last_pose.weapon_angles[0] * ( 1.0f / 128.0f );
-	rvp->viewangles[YAW] = vr_last_pose.weapon_angles[1] * ( 1.0f / 128.0f );
+	/* The gun as drawn this frame: the client places the view model right before rendering, every frame.
+	 * (The sidecar pose only updates with each movement command, at the command rate: the lens stepped
+	 * behind the gun, a stutter while its picture stayed smooth.) Model angles: pitch up = positive. */
+	{
+		const cl_entity_t *gun = &clgame.viewent;
+		qboolean drawn = gun->model != NULL && !VectorIsNull( gun->origin );
+
+		if( !drawn && !vr_last_pose_valid )
+			return;
+		if( drawn )
+		{
+			VectorSubtract( gun->origin, vr_body_view_origin, gun_offset );
+			VectorSet( gun_angles, -gun->angles[PITCH], gun->angles[YAW], gun->angles[ROLL] );
+		}
+		else
+		{
+			for( i = 0; i < 3; i++ )
+				gun_offset[i] = vr_last_pose.weapon_position[i] * ( 1.0f / 8.0f );
+			VectorSet( gun_angles, -vr_last_pose.weapon_angles[0] * ( 1.0f / 128.0f ),
+				vr_last_pose.weapon_angles[1] * ( 1.0f / 128.0f ), vr_last_pose.weapon_angles[2] * ( 1.0f / 128.0f ));
+		}
+	}
+	rvp->viewangles[PITCH] = gun_angles[PITCH];
+	rvp->viewangles[YAW] = gun_angles[YAW];
 	rvp->viewangles[ROLL] = 0.0f;
 	default_fov = Cvar_VariableValue( "default_fov" );
 	if( default_fov < 10.0f )
@@ -1751,14 +1771,12 @@ void CL_VRScopeView( ref_viewpass_t *rvp )
 		if( vr_scope_mount.string[0] && sscanf( vr_scope_mount.string, "%f %f %f %f",
 			&mount[0], &mount[1], &mount[2], &mount[3] ) == 4 && mount[3] > 0.0f && vr_worldscale.value > 0.0f )
 		{
-			vec3_t gun_angles, f, r, u, rel, track, head_delta;
+			vec3_t f, r, u, rel, track, head_delta;
 			float lx, ly;
 
-			VectorSet( gun_angles, rvp->viewangles[PITCH], rvp->viewangles[YAW],
-				vr_last_pose.weapon_angles[2] * ( 1.0f / 128.0f ));
 			AngleVectors( gun_angles, f, r, u );
 			for( i = 0; i < 3; i++ )
-				rel[i] = vr_last_pose.weapon_position[i] * ( 1.0f / 8.0f ) + f[i] * mount[0] + r[i] * mount[1] + u[i] * mount[2];
+				rel[i] = gun_offset[i] + f[i] * mount[0] + r[i] * mount[1] + u[i] * mount[2];
 			/* relative to the body eye, world axes, game units -> tracking metres (inverse of the hands' path) */
 			lx = ( rel[0] * cosine + rel[1] * sine ) / vr_worldscale.value;
 			ly = ( -rel[0] * sine + rel[1] * cosine ) / vr_worldscale.value;
