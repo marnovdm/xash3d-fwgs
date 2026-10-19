@@ -42,7 +42,7 @@ static CVAR_DEFINE_AUTO( vr_lean, "1", FCVAR_ARCHIVE,
 	"1 = moving the head sideways moves the view (lean/peek), the body only moves with the stick; 0 = head motion walks the body (room-scale)" );
 static CVAR_DEFINE_AUTO( vr_lean_radius, "0.75", FCVAR_ARCHIVE, "vr_lean: metres the view may move from the body; beyond it the body point follows the head" );
 static CVAR_DEFINE_AUTO( vr_quick_crouchjump, "0", FCVAR_ARCHIVE, "double-tap jump to perform a crouch jump" );
-static CVAR_DEFINE_AUTO( vr_gesture_triggered_use, "1", FCVAR_ARCHIVE, "reach away from the body to use with either hand" );
+static CVAR_DEFINE_AUTO( vr_gesture_triggered_use, "0", FCVAR_ARCHIVE, "reach away from the body to use with the off hand (fires mid-reach; touch use replaced it)" );
 static CVAR_DEFINE_AUTO( vr_use_gesture_boundary, "0.25", FCVAR_ARCHIVE, "horizontal use-gesture boundary in metres" );
 static CVAR_DEFINE_AUTO( vr_controller_tracking_haptic, "1", FCVAR_ARCHIVE, "haptic feedback for tracked interaction boundaries" );
 static CVAR_DEFINE_AUTO( vr_backpack_weapon, "weapon_crowbar", FCVAR_ARCHIVE, "weapon selected by the dominant-hand backpack gesture" );
