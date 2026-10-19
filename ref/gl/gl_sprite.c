@@ -359,6 +359,31 @@ static qboolean R_SpriteAllowLerping( cl_entity_t *e, msprite_t *psprite )
 
 /*
 =================
+R_VRSpriteAxes
+
+Camera-parallel sprites copy the view's right/up axes. In a headset that view is the head, so a
+sprite rolled with every head tilt and turned with the head instead of staying put in the room
+(Opposing Force's of4a2 light ball). In a VR eye pass they face the eye and stay upright instead.
+=================
+*/
+static qboolean R_VRSpriteAxes( const vec3_t origin, vec3_t v_right, vec3_t v_up )
+{
+	vec3_t forward;
+
+	if( !GL_OpenXRIsRenderingEye( ))
+		return false;
+	VectorSubtract( origin, RI.rvp.vieworigin, forward );
+	if( VectorNormalizeLength( forward ) < 0.001f || fabs( forward[2] ) > 0.999f )
+		return false; // straight above/below: keep the view axes
+	VectorSet( v_right, forward[1], -forward[0], 0.0f );
+	VectorNormalize( v_right );
+	CrossProduct( v_right, forward, v_up );
+	VectorNormalize( v_up );
+	return true;
+}
+
+/*
+=================
 R_DrawSpriteModel
 =================
 */
@@ -495,6 +520,14 @@ void R_DrawSpriteModel( cl_entity_t *e )
 	case SPR_FWD_PARALLEL_UPRIGHT:
 	{
 		float dot = RI.vforward[2];
+		if( GL_OpenXRIsRenderingEye( ))
+		{
+			// as SPR_FACING_UPRIGHT: turning the head must not turn the sprite
+			VectorSet( v_right, origin[1] - RI.rvp.vieworigin[1], -(origin[0] - RI.rvp.vieworigin[0]), 0.0f );
+			VectorSet( v_up, 0.0f, 0.0f, 1.0f );
+			VectorNormalize( v_right );
+			break;
+		}
 		if(( dot > 0.999848f ) || ( dot < -0.999848f ))	// cos(1 degree) = 0.999848
 			return; // invisible
 		VectorSet( v_up, 0.0f, 0.0f, 1.0f );
@@ -506,16 +539,24 @@ void R_DrawSpriteModel( cl_entity_t *e )
 	{
 		float angle = e->angles[ROLL] * (M_PI2 / 360.0f);
 		float sr, cr;
+		vec3_t right, up;
 		SinCos( angle, &sr, &cr );
+		if( !R_VRSpriteAxes( origin, right, up ))
+		{
+			VectorCopy( RI.vright, right );
+			VectorCopy( RI.vup, up );
+		}
 		for( int i = 0; i < 3; i++ )
 		{
-			v_right[i] = (RI.vright[i] * cr + RI.vup[i] * sr);
-			v_up[i] = RI.vright[i] * -sr + RI.vup[i] * cr;
+			v_right[i] = (right[i] * cr + up[i] * sr);
+			v_up[i] = right[i] * -sr + up[i] * cr;
 		}
 		break;
 	}
 	case SPR_FWD_PARALLEL: // normal sprite
 	default:
+		if( R_VRSpriteAxes( origin, v_right, v_up ))
+			break;
 		VectorCopy( RI.vright, v_right );
 		VectorCopy( RI.vup, v_up );
 		break;
