@@ -25,6 +25,7 @@ GNU General Public License for more details.
 #include "pm_local.h"
 #include "multi_emulator.h"
 #include "vr/vr_client.h"
+#include "vr/vr_game.h"
 
 #define CL_CONNECTION_TIMEOUT 15.0f
 #define CL_CONNECTION_RETRIES 5
@@ -828,6 +829,12 @@ static void CL_CreateCmd( void )
 
 	// predict all unacknowledged movements
 	CL_PredictMovement( false );
+
+	/* The VR poses went to the game DLL before this prediction (Host_InputFrame), with the physical
+	 * crouch lift for the eye height before it. When prediction stands the player up, the hands were
+	 * placed one frame from the new eye with the old lift - the laser flashed from up high. Hand them
+	 * over again for drawing. */
+	CL_VRGameFrame();
 }
 
 void CL_WriteUsercmd( connprotocol_t proto, sizebuf_t *msg, int from, int to )
