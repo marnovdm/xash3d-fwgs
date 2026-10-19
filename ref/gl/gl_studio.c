@@ -3304,7 +3304,7 @@ void R_RunViewmodelEvents( void )
 	if( r_drawviewmodel->value == 0 )
 		return;
 
-	if( GL_OpenXRIsRenderingEye() && gEngfuncs.pfnGetCvarFloat( "vr_scope_engaged" ) != 0.0f )
+	if( GL_OpenXRIsRenderingEye() && gEngfuncs.pfnGetCvarFloat( "vr_scope_engaged" ) != 0.0f && !GL_OpenXRScopeLensShown( ))
 		return;
 
 	if( ENGINE_GET_PARM( PARM_THIRDPERSON ))
@@ -3349,7 +3349,7 @@ void R_DrawViewModel( void )
 	if( r_drawviewmodel->value == 0 )
 		return;
 
-	if( GL_OpenXRIsRenderingEye() && gEngfuncs.pfnGetCvarFloat( "vr_scope_engaged" ) != 0.0f )
+	if( GL_OpenXRIsRenderingEye() && gEngfuncs.pfnGetCvarFloat( "vr_scope_engaged" ) != 0.0f && !GL_OpenXRScopeLensShown( ))
 		return;
 
 	/* the scope lens shows the world in front of the gun, not the gun */

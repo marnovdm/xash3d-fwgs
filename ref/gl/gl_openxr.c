@@ -1805,7 +1805,7 @@ qboolean GL_OpenXREndEye( int eye, int source_width, int source_height )
 		GLboolean scissor_enabled = pglIsEnabled( GL_SCISSOR_TEST );
 		GLint old_scissor[4];
 		GLfloat old_clear[4];
-		float target_level = vr_scope_engaged->value ? 0.75f :
+		float target_level = vr_scope_engaged->value && !GL_OpenXRScopeLensShown() ? 0.75f :
 			( vr_comfort_moving->value ? bound( 0.0f, vr_comfort_mask->value, 1.0f ) : 0.0f );
 		float step_source = vr_comfort_mask->value > 0.0f ?
 			bound( 0.0f, vr_comfort_mask->value, 1.0f ) : 0.75f;
@@ -3101,6 +3101,11 @@ qboolean GL_OpenXRBeginScope( int *width, int *height )
 	*width = target->width;
 	*height = target->height;
 	return true;
+}
+
+qboolean GL_OpenXRScopeLensShown( void )
+{
+	return xr.scope.show && xr.scope.image.swapchain != XR_NULL_HANDLE;
 }
 
 qboolean GL_OpenXRIsRenderingScope( void )

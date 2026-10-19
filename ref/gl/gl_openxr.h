@@ -34,6 +34,7 @@ void GL_OpenXRSetScope( qboolean show, int hand );
 qboolean GL_OpenXRBeginScope( int *width, int *height );
 void GL_OpenXREndScope( int source_width, int source_height );
 qboolean GL_OpenXRIsRenderingScope( void );
+qboolean GL_OpenXRScopeLensShown( void ); /* the zoom is on the lens: eyes stay normal, the gun stays drawn */
 #else
 static inline void GL_OpenXRInit( void ) {}
 static inline qboolean GL_OpenXRFrameBegin( ref_vr_frame_t *frame ) { (void)frame; return false; }
@@ -66,4 +67,5 @@ static inline void GL_OpenXRSetScope( qboolean show, int hand ) { (void)show; (v
 static inline qboolean GL_OpenXRBeginScope( int *width, int *height ) { (void)width; (void)height; return false; }
 static inline void GL_OpenXREndScope( int source_width, int source_height ) { (void)source_width; (void)source_height; }
 static inline qboolean GL_OpenXRIsRenderingScope( void ) { return false; }
+static inline qboolean GL_OpenXRScopeLensShown( void ) { return false; }
 #endif

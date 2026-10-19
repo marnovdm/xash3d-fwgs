@@ -470,12 +470,13 @@ void V_RenderView( void )
 				CL_VRDrawCinemaWorldFade();
 				CL_VREndEye( eye );
 			}
-			if( CL_VRCSScopeActive( ))
+			if( CL_VRScopeLensActive( ))
 			{
 				int width, height;
 				if( CL_VRBeginScope( &width, &height ))
 				{
-					rvp = scope_rvp;
+					rvp = CL_VRCSMode() ? scope_rvp : base_rvp;
+					CL_VRScopeView( &rvp );
 					rvp.fov_x = bound( 1.0f, cl.local.scr_fov, 150.0f );
 					rvp.fov_y = V_CalcFov( &rvp.fov_x, width, height );
 					GL_RenderFrame( &rvp );

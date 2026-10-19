@@ -41,6 +41,8 @@ static CVAR_DEFINE_AUTO( vr_positional_factor, "1", FCVAR_ARCHIVE, "room-scale m
 static CVAR_DEFINE_AUTO( vr_lean, "1", FCVAR_ARCHIVE,
 	"1 = moving the head sideways moves the view (lean/peek), the body only moves with the stick; 0 = head motion walks the body (room-scale)" );
 static CVAR_DEFINE_AUTO( vr_lean_radius, "0.75", FCVAR_ARCHIVE, "vr_lean: metres the view may move from the body; beyond it the body point follows the head" );
+static CVAR_DEFINE_AUTO( vr_scope_lens, "1", FCVAR_ARCHIVE,
+	"zoomed weapons (crossbow, sniper rifle) show the zoom on a round lens in front of the gun; 0 = darkened view" );
 static CVAR_DEFINE_AUTO( vr_lean_resume_center, "1", FCVAR_ARCHIVE,
 	"vr_lean: put the body point back under the head (position only) when the game resumes from the menu or a load" );
 static CVAR_DEFINE_AUTO( vr_quick_crouchjump, "0", FCVAR_ARCHIVE, "double-tap jump to perform a crouch jump" );
@@ -66,6 +68,8 @@ static qboolean vr_center_valid;
 static ref_vr_pose_t vr_previous_head;
 static qboolean vr_previous_head_valid;
 static qboolean vr_game_was_paused; /* menu/console/loading last frame, see vr_lean_resume_center */
+static vr_usercmd_sidecar_t vr_last_pose; /* the gun pose the game DLL sent last (two-handed aim included) */
+static qboolean vr_last_pose_valid;
 static vec3_t vr_head_delta;
 static uint32_t vr_previous_buttons[REF_VR_MAX_HANDS];
 static qboolean vr_turn_latched;
@@ -203,6 +207,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_lean );
 	Cvar_RegisterVariable( &vr_lean_radius );
 	Cvar_RegisterVariable( &vr_lean_resume_center );
+	Cvar_RegisterVariable( &vr_scope_lens );
 	Cvar_RegisterVariable( &vr_quick_crouchjump );
 	Cvar_RegisterVariable( &vr_gesture_triggered_use );
 	Cvar_RegisterVariable( &vr_use_gesture_boundary );
@@ -800,6 +805,8 @@ void CL_VRFrameBegin( void )
 		vr_offhand_stick_chord = true;
 	if( menu != old_menu ) Key_Event( K_ESCAPE, menu );
 	vr_menu_active = menu;
+	if( !CL_VRCSMode( ))
+		CL_VRSetScope( CL_VRScopeLensActive(), vr_control_scheme.value >= 10.0f ? REF_VR_HAND_LEFT : REF_VR_HAND_RIGHT );
 	if( CL_VRCSMode( ))
 	{
 		/* Counter-Strike (CSVR client): buttons, aim and hands are handled in vr_cs.c */
@@ -1626,6 +1633,29 @@ void CL_VRBuildUsercmdSidecar( const usercmd_t *cmd, vr_usercmd_sidecar_t *sampl
 	}
 
 	CL_VRGameBuildUsercmdSidecar( cmd, sample );
+	vr_last_pose_valid = sample->version == VR_USERCMD_SIDECAR_VERSION && FBitSet( sample->flags, VR_USERCMD_SIDECAR_POSE_VALID );
+	if( vr_last_pose_valid )
+		vr_last_pose = *sample;
+}
+
+/* Zoomed weapons: the zoomed view on a round lens in front of the gun (as Counter-Strike's scope), in
+ * place of Lambda1VR's darkened eyes with a square hole and no zoom. */
+qboolean CL_VRScopeLensActive( void )
+{
+	if( CL_VRCSMode( ))
+		return CL_VRCSScopeActive();
+	return vr_scope_lens.value != 0.0f && vr_last_pose_valid && Cvar_VariableValue( "vr_scope_engaged" ) != 0.0f;
+}
+
+/* The lens view: from the eye along the gun as the game DLL aims it (the sidecar's weapon angles are model
+ * angles: pitch up = positive). Counter-Strike's client view already looks along the gun. */
+void CL_VRScopeView( ref_viewpass_t *rvp )
+{
+	if( CL_VRCSMode( ) || !vr_last_pose_valid )
+		return;
+	rvp->viewangles[PITCH] = -vr_last_pose.weapon_angles[0] * ( 1.0f / 128.0f );
+	rvp->viewangles[YAW] = vr_last_pose.weapon_angles[1] * ( 1.0f / 128.0f );
+	rvp->viewangles[ROLL] = vr_last_pose.weapon_angles[2] * ( 1.0f / 128.0f );
 }
 
 qboolean CL_VRHaptic( int hand, float duration, float frequency, float amplitude )
