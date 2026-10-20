@@ -2504,6 +2504,9 @@ static qboolean SV_EntInfo_f( sv_client_t *cl )
 
 	SV_ClientPrintf( cl, "flags: 0x%x\n", ent->v.flags );
 	SV_ClientPrintf( cl, "spawnflags: 0x%x\n", ent->v.spawnflags );
+	SV_ClientPrintf( cl, "time: %f ltime: %f nextthink: %f\n", sv.time, ent->v.ltime, ent->v.nextthink );
+	SV_ClientPrintf( cl, "velocity: %f %f %f frame: %f framerate: %f effects: 0x%x\n",
+		ent->v.velocity[0], ent->v.velocity[1], ent->v.velocity[2], ent->v.frame, ent->v.framerate, ent->v.effects );
 	return true;
 }
 
