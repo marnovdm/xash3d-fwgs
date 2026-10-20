@@ -1178,7 +1178,10 @@ static void SV_Physics_Pusher( edict_t *ent )
 			ent->v.angles[i] = fmod( ent->v.angles[i], 3600.0f );
 	}
 
-	if( thinktime > oldtime && (( ent->v.flags & FL_ALWAYSTHINK ) || thinktime <= ent->v.ltime ))
+	// a think scheduled at or before the pusher's own clock (nextthink == ltime, e.g. both rounded to the same
+	// value when a save rebased them) would otherwise never run: movetime stays 0, so ltime never passes it
+	if(( thinktime > oldtime && (( ent->v.flags & FL_ALWAYSTHINK ) || thinktime <= ent->v.ltime )) ||
+		( thinktime > 0.0f && thinktime <= oldtime ))
 	{
 		ent->v.nextthink = 0.0f;
 		svgame.globals->time = sv.time;
