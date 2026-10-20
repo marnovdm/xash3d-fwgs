@@ -33,6 +33,7 @@ static CVAR_DEFINE_AUTO( vr_weapon_pointer, "1", FCVAR_ARCHIVE, "left Triangle (
 static CVAR_DEFINE_AUTO( vr_laser_doubleclick, "0.35", FCVAR_ARCHIVE, "max seconds between the two off-hand stick clicks that cycle the laser sight (or scope smoothing) with vr_laser_cycle 1; one click is use" );
 static CVAR_DEFINE_AUTO( vr_laser_cycle, "2", FCVAR_ARCHIVE, "how the off-hand stick click cycles the laser sight (or scope smoothing): 2 = hold it vr_laser_holdtime, 1 = double click, 0 = never" );
 static CVAR_DEFINE_AUTO( vr_laser_holdtime, "0.6", FCVAR_ARCHIVE, "seconds the off-hand stick click is held to cycle the laser sight with vr_laser_cycle 2" );
+static CVAR_DEFINE_AUTO( vr_use_hit, "0", 0, "set to 1 by the game DLL when a use reached something; a held off-hand click that used something does not cycle the laser" );
 static CVAR_DEFINE_AUTO( vr_notify, "0", FCVAR_ARCHIVE, "show console notify lines (top left) over the VR HUD" );
 static CVAR_DEFINE_AUTO( vr_reloadtimeoutms, "200", FCVAR_ARCHIVE, "maximum squeeze tap duration used for reload" );
 static CVAR_DEFINE_AUTO( vr_enable_crouching, "0", FCVAR_ARCHIVE,
@@ -249,6 +250,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_laser_doubleclick );
 	Cvar_RegisterVariable( &vr_laser_cycle );
 	Cvar_RegisterVariable( &vr_laser_holdtime );
+	Cvar_RegisterVariable( &vr_use_hit );
 	Cvar_RegisterVariable( &vr_weapon_pointer );
 	Cvar_RegisterVariable( &vr_notify );
 	Cvar_RegisterVariable( &vr_weapon_stick_threshold );
@@ -902,11 +904,12 @@ void CL_VRFrameBegin( void )
 		if( vr_offhand_stick_since == 0.0 )
 		{
 			vr_offhand_stick_since = host.realtime;
+			Cvar_DirectSet( &vr_use_hit, "0" );
 			vr_offhand_stick_second = vr_offhand_stick_last != 0.0 &&
 				host.realtime - vr_offhand_stick_last <= vr_laser_doubleclick.value;
 		}
 		else if( (int)vr_laser_cycle.value == 2 && !vr_offhand_stick_held && !vr_offhand_stick_chord &&
-			host.realtime - vr_offhand_stick_since >= vr_laser_holdtime.value )
+			vr_use_hit.value == 0.0f && host.realtime - vr_offhand_stick_since >= vr_laser_holdtime.value )
 		{
 			vr_offhand_stick_held = true;
 			CL_VRCycleLaser( );
