@@ -275,7 +275,13 @@ static qboolean CL_VRHandPosition( int hand, vec3_t position )
 	return false;
 }
 
-static qboolean CL_VRIsBackpack( int hand )
+/* Behind the head, within 40 cm: back of the hand at least `behind` times its sideways offset. The weapon
+ * hand's melee grab takes a wider zone (reaches the shoulder sooner); the off hand's quick save keeps the
+ * narrow one, clear of the night-vision gesture at the ear. */
+#define VR_BACKPACK_BEHIND 0.5f
+#define VR_BACKPACK_BEHIND_WEAPON 0.3f
+
+static qboolean CL_VRIsBackpack( int hand, float behind )
 {
 	vec3_t position, delta, local;
 	float horizontal;
@@ -287,7 +293,7 @@ static qboolean CL_VRIsBackpack( int hand )
 		return false;
 	CL_VRTransformVector( delta, &vr_frame.head, local );
 	horizontal = sqrt( local[0] * local[0] + local[1] * local[1] );
-	return horizontal > 0.001f && local[0] < -0.5f * horizontal;
+	return horizontal > 0.001f && local[0] < -behind * horizontal;
 }
 
 /* Hand beside the head (at the ear, as when switching on head-worn goggles): within 25 cm of the head and
@@ -496,7 +502,7 @@ static void CL_VROneControllerInput( int dominant, int offhand, uint32_t old_dom
 		if( squeeze )
 		{
 			vr_squeeze_time = 0.0;
-			if( !CL_VRIsBackpack( dominant )) vr_squeeze_time = host.realtime;
+			if( !CL_VRIsBackpack( dominant, VR_BACKPACK_BEHIND_WEAPON )) vr_squeeze_time = host.realtime;
 		}
 		else
 		{
@@ -932,8 +938,9 @@ void CL_VRFrameBegin( void )
 	else if( variant != 1 ) vr_selecting_weapon = false;
 
 	{
-		qboolean weapon_backpack = CL_VRIsBackpack( dominant );
-		qboolean offhand_backpack = CL_VRIsBackpack( offhand );
+		/* variant 2 has the flashlight on the weapon hand: keep its zone narrow too */
+		qboolean weapon_backpack = CL_VRIsBackpack( dominant, variant == 2 ? VR_BACKPACK_BEHIND : VR_BACKPACK_BEHIND_WEAPON );
+		qboolean offhand_backpack = CL_VRIsBackpack( offhand, VR_BACKPACK_BEHIND );
 
 		if( vr_controller_tracking_haptic.value && weapon_backpack && !vr_weapon_in_backpack && !vr_backpack_weapon_active )
 			CL_VRHaptic( dominant, 0.04f, 0.0f, 0.5f );
