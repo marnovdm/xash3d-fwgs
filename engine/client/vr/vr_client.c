@@ -47,6 +47,8 @@ static CVAR_DEFINE_AUTO( vr_scope_lens, "1", FCVAR_ARCHIVE,
 	"zoomed weapons (crossbow, sniper rifle) show the zoom on a round lens in front of the gun; 0 = darkened view" );
 static CVAR_DEFINE_AUTO( vr_lean_resume_center, "1", FCVAR_ARCHIVE,
 	"vr_lean: put the body point back under the head (position only) when the game resumes from the menu or a load" );
+static CVAR_DEFINE_AUTO( vr_brightlight_scale, "1.5", FCVAR_ARCHIVE,
+	"VR: radius scale of the player's own bright light (Opposing Force night vision; stock 400 units)" );
 static CVAR_DEFINE_AUTO( vr_quick_crouchjump, "0", FCVAR_ARCHIVE, "double-tap jump to perform a crouch jump" );
 static CVAR_DEFINE_AUTO( vr_gesture_triggered_use, "0", FCVAR_ARCHIVE, "reach away from the body to use with the off hand (fires mid-reach; touch use replaced it)" );
 static CVAR_DEFINE_AUTO( vr_use_gesture_boundary, "0.25", FCVAR_ARCHIVE, "horizontal use-gesture boundary in metres" );
@@ -224,6 +226,7 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_lean );
 	Cvar_RegisterVariable( &vr_lean_radius );
 	Cvar_RegisterVariable( &vr_lean_resume_center );
+	Cvar_RegisterVariable( &vr_brightlight_scale );
 	Cvar_RegisterVariable( &vr_scope_lens );
 	Cvar_RegisterVariable( &vr_scope_mount );
 	Cvar_RegisterVariable( &vr_quick_crouchjump );
@@ -1816,6 +1819,11 @@ qboolean CL_VRHaptic( int hand, float duration, float frequency, float amplitude
 const ref_vr_frame_t *CL_VRGetFrame( void )
 {
 	return &vr_frame;
+}
+
+float CL_VRBrightlightScale( void )
+{
+	return CL_VRIsActive( ) ? bound( 0.25f, vr_brightlight_scale.value, 4.0f ) : 1.0f;
 }
 
 qboolean CL_VRIsActive( void )

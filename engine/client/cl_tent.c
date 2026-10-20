@@ -2698,7 +2698,7 @@ static void R_EntityBrightlight( cl_entity_t *ent, int key, int radius )
 	dl->color.r = dl->color.g = dl->color.b = 250;
 	if( !radius )
 		dl->radius = COM_RandomFloat( 400.0f, 431.0f );
-	else dl->radius = 400;
+	else dl->radius = radius * CL_VRBrightlightScale( ); // own light (night vision), larger in VR
 	dl->die = cl.time + 0.001;
 }
 

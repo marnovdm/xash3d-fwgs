@@ -21,6 +21,7 @@ void CL_VRBuildUsercmdSidecar( const usercmd_t *cmd, vr_usercmd_sidecar_t *sampl
 qboolean CL_VRHaptic( int hand, float duration, float frequency, float amplitude );
 const ref_vr_frame_t *CL_VRGetFrame( void );
 qboolean CL_VRIsActive( void );
+float CL_VRBrightlightScale( void );
 qboolean CL_VRScopeLensActive( void );
 void CL_VRScopeView( ref_viewpass_t *rvp );
 qboolean CL_VRGetRecenter( ref_vr_pose_t *center );
