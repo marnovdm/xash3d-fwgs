@@ -30,7 +30,9 @@ static CVAR_DEFINE_AUTO( vr_weapon_stick_up_next, "0", FCVAR_ARCHIVE, "weapon me
 static CVAR_DEFINE_AUTO( vr_weapon_stick_menu, "0", FCVAR_ARCHIVE, "pushing the weapon-hand stick up/down opens the HUD weapon menu; 0 = off (use the Triangle weapon grid)" );
 static CVAR_DEFINE_AUTO( vr_weapon_stick_hold, "0.15", FCVAR_ARCHIVE, "seconds the stick must be held up/down to OPEN the weapon menu (steps inside it are immediate)" );
 static CVAR_DEFINE_AUTO( vr_weapon_pointer, "1", FCVAR_ARCHIVE, "left Triangle (Y) shows the weapon grid on the off hand while held: point at a weapon with the weapon hand and release to switch; 0 = Triangle is the previous weapon" );
-static CVAR_DEFINE_AUTO( vr_laser_doubleclick, "0.35", FCVAR_ARCHIVE, "max seconds between the two off-hand stick clicks that cycle the laser sight (or scope smoothing); one click is use" );
+static CVAR_DEFINE_AUTO( vr_laser_doubleclick, "0.35", FCVAR_ARCHIVE, "max seconds between the two off-hand stick clicks that cycle the laser sight (or scope smoothing) with vr_laser_cycle 1; one click is use" );
+static CVAR_DEFINE_AUTO( vr_laser_cycle, "2", FCVAR_ARCHIVE, "how the off-hand stick click cycles the laser sight (or scope smoothing): 2 = hold it vr_laser_holdtime, 1 = double click, 0 = never" );
+static CVAR_DEFINE_AUTO( vr_laser_holdtime, "0.6", FCVAR_ARCHIVE, "seconds the off-hand stick click is held to cycle the laser sight with vr_laser_cycle 2" );
 static CVAR_DEFINE_AUTO( vr_notify, "0", FCVAR_ARCHIVE, "show console notify lines (top left) over the VR HUD" );
 static CVAR_DEFINE_AUTO( vr_reloadtimeoutms, "200", FCVAR_ARCHIVE, "maximum squeeze tap duration used for reload" );
 static CVAR_DEFINE_AUTO( vr_enable_crouching, "0", FCVAR_ARCHIVE,
@@ -102,6 +104,7 @@ static qboolean vr_offhand_stick_chord; /* both sticks down during this off-hand
 static double vr_offhand_stick_since; /* when the current off-hand click went down, 0 when up */
 static double vr_offhand_stick_last; /* press time of the previous plain off-hand click, 0 = none */
 static qboolean vr_offhand_stick_second; /* the current click came within vr_laser_doubleclick of the last */
+static qboolean vr_offhand_stick_held; /* the current click was held long enough and cycled the laser */
 static double vr_screen_button_since; /* single player: when Triangle (Y) went down outside the backpack with the grid opened, 0 = not held */
 static qboolean vr_weapon_pointer_open; /* the hold opened the client's pointer weapon grid */
 static int vr_weapon_scroll_count;
@@ -244,6 +247,8 @@ void CL_VRRegisterCvars( void )
 	Cvar_RegisterVariable( &vr_weapon_stick_menu );
 	Cvar_RegisterVariable( &vr_weapon_stick_up_next );
 	Cvar_RegisterVariable( &vr_laser_doubleclick );
+	Cvar_RegisterVariable( &vr_laser_cycle );
+	Cvar_RegisterVariable( &vr_laser_holdtime );
 	Cvar_RegisterVariable( &vr_weapon_pointer );
 	Cvar_RegisterVariable( &vr_notify );
 	Cvar_RegisterVariable( &vr_weapon_stick_threshold );
@@ -273,6 +278,15 @@ static qboolean CL_VRHandPosition( int hand, vec3_t position )
 		return true;
 	}
 	return false;
+}
+
+/* Off-hand stick hold / double click: laser sight off -> beam -> dot, or scope smoothing while scoped */
+static void CL_VRCycleLaser( void )
+{
+	if( Cvar_VariableValue( "vr_scope_engaged" ) != 0.0f )
+		Cvar_SetValue( "vr_scope_stabilise", Cvar_VariableValue( "vr_scope_stabilise" ) == 0.0f ? 1.0f : 0.0f );
+	else
+		Cvar_SetValue( vr_lasersight.name, (int)( vr_lasersight.value + 1.0f ) % 3 );
 }
 
 /* Behind the head, within 40 cm: back of the hand at least `behind` times its sideways offset. The weapon
@@ -876,10 +890,11 @@ void CL_VRFrameBegin( void )
 		return;
 	}
 	/* The off-hand stick click is use from the off hand (like R3 for the dominant hand, see the
-	 * +use2 block below); a double click cycles the laser sight while unscoped, or scope smoothing
-	 * while scoped (Lambda1VR used a single click for that). The toggle is decided on the second
-	 * release and skipped if the dominant stick went down during either click: the two sticks of
-	 * the menu chord never go down in the same frame. */
+	 * +use2 block below); holding it (vr_laser_cycle 2, the default: a double click was too easy to
+	 * hit by accident, running pushes the move stick in) or a double click (1) cycles the laser sight
+	 * while unscoped, or scope smoothing while scoped (Lambda1VR used a single click for that). The
+	 * double click is decided on the second release; both are skipped if the dominant stick went
+	 * down during the click(s): the two sticks of the menu chord never go down in the same frame. */
 	if( FBitSet( vr_frame.hands[offhand].buttons, REF_VR_BUTTON_STICK ))
 	{
 		if( FBitSet( vr_frame.hands[dominant].buttons, REF_VR_BUTTON_STICK ))
@@ -890,24 +905,28 @@ void CL_VRFrameBegin( void )
 			vr_offhand_stick_second = vr_offhand_stick_last != 0.0 &&
 				host.realtime - vr_offhand_stick_last <= vr_laser_doubleclick.value;
 		}
+		else if( (int)vr_laser_cycle.value == 2 && !vr_offhand_stick_held && !vr_offhand_stick_chord &&
+			host.realtime - vr_offhand_stick_since >= vr_laser_holdtime.value )
+		{
+			vr_offhand_stick_held = true;
+			CL_VRCycleLaser( );
+			CL_VRHaptic( offhand, 0.06f, 0.0f, 0.6f );
+		}
 	}
 	else if( vr_offhand_stick_since != 0.0 )
 	{
-		if( vr_offhand_stick_chord )
+		if( vr_offhand_stick_chord || (int)vr_laser_cycle.value != 1 )
 			vr_offhand_stick_last = 0.0;
 		else if( vr_offhand_stick_second )
 		{
 			vr_offhand_stick_last = 0.0;
-			if( Cvar_VariableValue( "vr_scope_engaged" ) != 0.0f )
-				Cvar_SetValue( "vr_scope_stabilise",
-					Cvar_VariableValue( "vr_scope_stabilise" ) == 0.0f ? 1.0f : 0.0f );
-			else
-				Cvar_SetValue( vr_lasersight.name, (int)( vr_lasersight.value + 1.0f ) % 3 );
+			CL_VRCycleLaser( );
 		}
 		else vr_offhand_stick_last = vr_offhand_stick_since;
 		vr_offhand_stick_chord = false;
 		vr_offhand_stick_since = 0.0;
 		vr_offhand_stick_second = false;
+		vr_offhand_stick_held = false;
 	}
 	else vr_offhand_stick_chord = false; /* chord pressed and released while the menu was up */
 	if( vr_confirm_attack_release )
